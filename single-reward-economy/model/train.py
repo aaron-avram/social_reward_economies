@@ -164,11 +164,30 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
                       i_network_list[agn], adjustment_factor=adjustment_factor, dynamic_change=dynamic_change,
                       rho=arguments["rho"], kappa=arguments["kappa"]))
 
-        # agents_list[agn].reward_function = norm_env.generate_reward_table_procedural(agn)
-        # agents_list[agn].reward_function = norm_env.generate_reward_table_variance(agn, 1,
-        #                                                                            0.1)
-        agents_list[agn].reward_function = norm_env.generate_reward_table_polarized_variance(agn, arguments["top_reward"],
-                                                                                   arguments["bottom_reward"])
+        # Configure reward function based on reward_type argument
+        reward_type = arguments.get("reward_type", "unimodal_variance")
+        
+        if reward_type == "polarized_variance":
+            agents_list[agn].reward_function = norm_env.generate_reward_table_polarized_variance(
+                agn, arguments["top_reward"], arguments["bottom_reward"])
+        elif reward_type == "unimodal_variance":
+            agents_list[agn].reward_function = norm_env.generate_reward_table_variance(
+                agn, arguments["top_reward"], arguments["bottom_reward"])
+        elif reward_type == "procedural":
+            agents_list[agn].reward_function = norm_env.generate_reward_table_procedural(agn)
+        elif reward_type == "cmstyle":
+            agents_list[agn].reward_function = norm_env.generate_reward_table_cmstyle(
+                agn, arguments["top_reward"], arguments["bottom_reward"])
+        elif reward_type == "variance_separation":
+            agents_list[agn].reward_function = norm_env.generate_reward_table_variance_separation(
+                agn, arguments["top_reward"], arguments["bottom_reward"])
+        elif reward_type == "default":
+            agents_list[agn].reward_function = norm_env.generate_reward_table(agn)
+        else:
+            # Default to unimodal_variance if unknown type
+            agents_list[agn].reward_function = norm_env.generate_reward_table_variance(
+                agn, arguments["top_reward"], arguments["bottom_reward"])
+        
         if "threshold" in arguments: # Set threshold for switching to status optimization if provided
             agents_list[agn].threshold = arguments["threshold"]
 
