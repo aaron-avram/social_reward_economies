@@ -20,25 +20,25 @@ args = {"status_factor": 1,
         "b0": 7.5}
 class NormAgent:
     def __init__(self, num_agents, num, budget, k, th_factor, arguments, actornet: ActorNetwork, criticnet, copier: Copier, inflnet: ActorNetwork, adjustment_factor=1, dynamic_change=True, rho=1, kappa=1):
-        self.num = num
-        self.budget = budget
+        self.num = num # Unique identifier for the agent
+        self.budget = budget # NOT CURRENTLY USED
 
-        self.actor_network = actornet
-        self.critic_network = criticnet
-        self.copier_network = copier
-        self.influencer_network = inflnet
+        self.actor_network = actornet # Policy network for personal utility 
+        self.critic_network = criticnet # NOT USED
+        self.copier_network = copier # NOT USED
+        self.influencer_network = inflnet # Policy for status optimization
 
-        self.copier_network_static = None
+        self.copier_network_static = None # NOT USED
 
-        self.dynamic_change = dynamic_change
+        self.dynamic_change = dynamic_change  # True = asynchronous (agents update at different times), False = synchronous (all agents update simultaneously)
 
-        self.reward_function = None
+        self.reward_function = None # lookup table for rewards based on state and action
 
         self.threshold = 0
 
-        self.alpha = 0
-        self.rate = 0.2
-        self.status = 0
+        self.alpha = 0 # NOT USED 
+        self.rate = 0.2 # probability of being active in each timestep, updated by adjust_rate
+        self.status = 0 # Status value = followers × R[self.num] × reputation_factor × status_factor
 
         self.adjustment_factor = adjustment_factor
 
@@ -46,25 +46,25 @@ class NormAgent:
         self.beta_update_factor = 0.01 * self.adjustment_factor
 
         self.num_agents = num_agents
-        self.PR = np.zeros(num_agents)
-        self.R = np.zeros(num_agents)
-        self.S = np.zeros(num_agents)
+        self.PR = np.zeros(num_agents) # Agent's own estimate of other agents' reputation, updated through direct observation
+        self.R = np.zeros(num_agents) # Gossiped/Shared reputation, updated through gossiping + PR changes
+        self.S = np.zeros(num_agents) # Similarity scores between agents, used to determine gossiping eligibility
 
         self.is_follower = False
         self.target_influencer = -1
-        self.beta = 0
-        self.selfish_beta = 0
-        self.independent_beta = 0
-        self.k = k
-        self.th_factor = th_factor
+        self.beta = 0 # Running average of total rewards the agent expects to receive.
+        self.selfish_beta = 0 # Running average of rewards from the agent's own actions only
+        self.independent_beta = 0 # Expected reward when acting independently (not following anyone)
+        self.k = k # Utility Scaling Factor
+        self.th_factor = th_factor # Threshold for switching to optimizing for status
 
         self.followers = 0
 
-        self.selfless = 0
+        self.selfless = 0 
         self.counter = 0
-        self.b0 = arguments["b0"]
-        self.reputation_factor = arguments["reputation_factor"]
-        self.status_factor = arguments["status_factor"]
+        self.b0 = arguments["b0"] # Higher b0 → lower activity rate for the same utility.
+        self.reputation_factor = arguments["reputation_factor"] # Gamma
+        self.status_factor = arguments["status_factor"] # Kappa
 
         self.time_counter1 = 0
         self.time_counter2 = 0
@@ -75,24 +75,28 @@ class NormAgent:
         self.rate_counter = 3000 * rho + int(np.random.randint(0, self.cons * rho)) # int(np.random.normal(self.cons * rho, 30))
         self.infl_counter = 3000 * rho + int(np.random.randint(0, self.cons * rho))
         self.selfless_counter = 3000 * rho + int(np.random.randint(0, self.selfless_constant))
-        self.rho = rho
-        self.kappa = kappa
+        self.rho = rho # scaling factor for the update intervals (smaller = more frequent updates)
+        self.kappa = kappa 
 
         self.timestep = 0
-        self.selfless_times = []
+        self.selfless_times = [] # List of timesteps when the agent was selfless
 
-        self.group = self.num % 2
+        self.group = self.num % 2 # Group membership (0 or 1)
 
-        self.rep_threshold = 0.2
-        self.epsilon = 0.01
+        self.rep_threshold = 0.2 # NOT CURRENTLY USED; can likely be used to filter out very low reputation agents
+        self.epsilon = 0.01 # Used to decide which agents are "good enough" to be followed
 
-
+    # Returns agent's utility for state s and action a
     def get_utility(self, s, a):
         if self.reward_function is not None:
             state = sum(val*(2**idx) for idx, val in enumerate(reversed(s)))
             return self.reward_function[state][a]
-        return self.critic_network.get_function_output(s, a)
+        return self.critic_network.get_function_output(s, a) # NOT REACHED since all agents are given a reward function during training
 
+    # Returns the action the agent will take for state s, based on its policy:
+    # if selfless, uses influencer network policy
+    # if not selfless, uses actor network policy
+    # 5% chance of taking a random action (Exploration)
     def get_action(self, s, action_space):
         if self.selfless:
             random_var = np.random.random()
@@ -139,7 +143,7 @@ class NormAgent:
             self.selfless = 0
 
 
-
+    # Returns True if agent participates this timestep
     def get_active(self):
         val = random.random()
         return val < self.rate

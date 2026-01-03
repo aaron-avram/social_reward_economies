@@ -1,4 +1,3 @@
-import itertools
 import os
 import random
 import numpy as np
@@ -13,7 +12,7 @@ np.random.seed(34243)
 # torch.set_default_dtype(torch.float64)
 torch.backends.cudnn.benchmark = True
 
-from norm_actor import ActorNetwork, ACWrapper, Copier
+from norm_actor import ActorNetwork
 from norm_agent import NormAgent
 
 
@@ -30,7 +29,7 @@ def compute_overall_policy(max_state, agents_list, p_network_list, i_network_lis
     numbers = np.arange(max_state + 1)[:, np.newaxis]
     powers = np.arange(bits - 1, -1, -1)
     pos_states = list((numbers >> powers) & 1)
-    for statenum, statevec in enumerate(pos_states):
+    for _, statevec in enumerate(pos_states):
         if agents_list[top_agent].selfless:
             output = i_network_list[top_agent].get_function_output(np.array(statevec))
         else:
@@ -112,7 +111,7 @@ def get_arbitrary_state(state_size, max_state):
     bits = state_size
     state = np.array([int(d) for d in f'{state_num:0{bits}b}'])
 
-    action_space = np.array([0, 1, 2, 3, 4, 5])
+    action_space = np.array([0, 1, 2, 3, 4, 5]) 
     return state, action_space
 
 
@@ -138,22 +137,24 @@ def get_gossip_with_probability(agent1, agent2, epsilon):
 
 def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0.5, discount=0.99, adjustment_factor=1.0,
                   dynamic_change=True, timesteps=50000):
+    
+
     state_size = int(np.ceil(np.log2(max_state_num)))
     sample_state, sample_action_space = get_arbitrary_state(state_size, max_state_num)
     possible_action_size = len(sample_action_space)
 
-    p_network_list = []
-    f_network_list = []
-
-    i_network_list = []
+    
+    p_network_list = [] # Agents Optimising for Personal Utility
+    # f_network_list = []
+    i_network_list = [] # Agents Optimising for Status
 
     agents_list = []
     alpha = arguments["learning_rate"]  # 0.0001 #0.0008
-    alpha2 = arguments["learning_rate"]  # 0.0001
-    norm_env = NormEnv(state_size, possible_action_size)
+    # alpha2 = arguments["learning_rate"]  # 0.0001
+
+    norm_env = NormEnv(state_size, possible_action_size) # This is needed for reward functions
 
     for agn in range(num_agents):
-
         p_network_list.append(ActorNetwork(state_size, possible_action_size, alpha, num=agn))
         #i_network_list.append(ActorNetwork(state_size, possible_action_size, alpha, num=agn))
         i_network_list.append(p_network_list[agn])
@@ -168,11 +169,12 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
         #                                                                            0.1)
         agents_list[agn].reward_function = norm_env.generate_reward_table_polarized_variance(agn, arguments["top_reward"],
                                                                                    arguments["bottom_reward"])
-        if "threshold" in arguments:
+        if "threshold" in arguments: # Set threshold for switching to status optimization if provided
             agents_list[agn].threshold = arguments["threshold"]
 
     """ Setup for Variable Tracking """
     if True:
+        # Finds the action that maximizes total utility across all agents (used as a baseline for comparison).
         max_feedback = 0
         best_act = 0
         for act in sample_action_space:
@@ -183,15 +185,17 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
             if feedback > max_feedback:
                 max_feedback = feedback
                 best_act = act
-        sample_state_chance = []
+       
+       # Reward Tracking
+        sample_state_chance = [] # List of probabilities of the best action for the sample state
+        ma_epoch_reward = 0 # Moving average of epoch rewards
+        epoch_reward = 0 # Total reward for the current epoch
+        optimal_epoch_reward = 0 # Total reward for the best action for the sample state
+        epoch_rewards = [] # List of epoch rewards
+        optimal_epoch_rewards = [] # List of optimal epoch rewards
+        # random_rewards = [] # List of random rewards # NOT USED
 
-        ma_epoch_reward = 0
-        epoch_reward = 0
-        optimal_epoch_reward = 0
-        epoch_rewards = []
-        optimal_epoch_rewards = []
-        random_rewards = []
-
+        # Reputation Tracking
         reputations = []
         for ii in agents_list:
             reputations.append([])
@@ -216,11 +220,12 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
             for ii2 in agents_list:
                 all_similars[ii.num].append([])
 
-        real_actions = []
-        real_actions2 = []
-        b1_actions = 0
-        b2_actions = 0
-        all_actions = 1
+
+       real_actions = []     # Proportion of B1 actions
+       real_actions2 = []    # Proportion of B2 actions # NOT USED
+       b1_actions = 0        # Counter for actions [0,1,2]
+       b2_actions = 0        # Counter for actions [3,4,5]
+       all_actions = 1       # Total action counter
 
         all_personals = []
         for ii in agents_list:
@@ -228,6 +233,8 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
             for ii2 in agents_list:
                 all_personals[ii.num].append([])
 
+        # Example:
+        # behaviours[5][3][2] = list of probabilities that agent 5 takes action 2 in state 3 over time
         behaviours = []
         for whatever in agents_list:
             behaviours.append([])
@@ -236,11 +243,11 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
                 for ii2 in range(len(sample_action_space)):
                     behaviours[whatever.num][ii].append([])
 
-        roles = []
+        roles = []  # [0]=influencers, [1]=followers, [2]=actors
         for ii in range(3):
             roles.append([])
 
-        infl_roles = []
+        infl_roles = [] # [0]=status-based influencers (selfless), [1]=utility-based influencers (have followers but are not optimizing for status)
         for ii in range(2):
             infl_roles.append([])
 
@@ -294,8 +301,8 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
 
         self_overall_policy = []
 
-        cho_act = []
-        cho_self = []
+        # cho_act = [] # NOT USED
+        # cho_self = [] # NOT USED
         bes_act = []
         best_self = []
 
@@ -304,6 +311,7 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
         correct_infl = 0
         total_num = 0
     """ End Setup for Variable Tracking """
+
     update_interval = 250 #num_agents * 5
     print("Beginning Time Loop |", name)
     for i in range(timesteps):
@@ -355,7 +363,7 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
             for other in inactive_list:
                 agents_list[j].update_reputation(other, 0)
 
-        usable_feedback = feedback
+        usable_feedback = feedback # Used for training influencer networks
 
         """ Training Off Feedback """
         for agent in active_list:
@@ -413,7 +421,7 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
                 total_reputation_vector += j_agent.R.copy()
                 num_agents_found = 1
                 for k_agent in active_agents:
-                    if j_agent.S[k] < 3 and k_agent.S[k] < 3:
+                    if j_agent.S[k] < 3 and k_agent.S[j] < 3:
                         total_reputation_vector += k_agent.R.copy()
                         num_agents_found += 1
                 new_trc = total_reputation_vector / num_agents_found
@@ -919,69 +927,69 @@ def new_plot_embed_withx(agents_list, xseries, yseries, root, name, title, top_a
 
 
 #state_size = 3
-max_state_num = 9
-state_size = int(np.ceil(np.log2(max_state_num)))
-print(state_size)
-name = "test"
-agents_list = []
+# max_state_num = 9
+# state_size = int(np.ceil(np.log2(max_state_num)))
+# print(state_size)
+# name = "test"
+# agents_list = []
 
-base_rep = 1
-base_b0 = 10
-base_scale = 1
+# base_rep = 1
+# base_b0 = 10
+# base_scale = 1
 
 
-scale_factor = 1
-rep_factor = 1
-alpha = 0.00005
+# scale_factor = 1
+# rep_factor = 1
+# alpha = 0.00005
 
-kappa = 1
-rho = 1
+# kappa = 1
+# rho = 1
 
-"""
-"status_factor" and "reputation_factor" are kappa and gamma, respectively.
-"b0" is the outside utility (that governs rate allocation)
-"cons" is the update interval for infl switch / rate allocation
-"top_reward" and "bottom_reward" are the max/min reward for unimodal variance; they are the means for bimodal variance.
-"epsilon" is the epsilon chance that special gossiping interactions will happen at each check.
-"threshold" is the threshold at which an agent will consider optimizing for status.
+# """
+# "status_factor" and "reputation_factor" are kappa and gamma, respectively.
+# "b0" is the outside utility (that governs rate allocation)
+# "cons" is the update interval for infl switch / rate allocation
+# "top_reward" and "bottom_reward" are the max/min reward for unimodal variance; they are the means for bimodal variance.
+# "epsilon" is the epsilon chance that special gossiping interactions will happen at each check.
+# "threshold" is the threshold at which an agent will consider optimizing for status.
 
-"""
+# """
 
-args = {"status_factor": base_scale * scale_factor,
-        "reputation_factor": base_rep * rep_factor,
-        "b0": base_b0,
-        "learning_rate": alpha,
-        "kappa": kappa,
-        "rho": rho,
-        "cons": 3000}
+# args = {"status_factor": base_scale * scale_factor,
+#         "reputation_factor": base_rep * rep_factor,
+#         "b0": base_b0,
+#         "learning_rate": alpha,
+#         "kappa": kappa,
+#         "rho": rho,
+#         "cons": 3000}
 
-import gc
+# import gc
 
-for splits in [(-1.25, 2.25)]:  # , (-29, 30)]:
-        for rep_factor in [9]:  # , 3, 5, 999, 0, 0.5, 0.8, 0.3]:
-            for scale_factor in [0.1]:
-                for threshold in [48]:
-                    for epsilon in [1]:
-                        random.seed(5)
-                        np.random.seed(5)
-                        torch.manual_seed(5)
-                        args["status_factor"] = base_scale * scale_factor
-                        args["reputation_factor"] = base_rep * rep_factor
-                        args["top_reward"] = splits[1]
-                        args["bottom_reward"] = splits[0]
-                        args["threshold"] = threshold
-                        args["b0"] = base_b0 * splits[1] * 4
-                        args["cons"] = 3000
-                        args["epsilon"] = epsilon
-                        dyn_change = True
-                        timesteps1 = 15000 #int(cons * 3.5)
-                        sync_label = "static"
-                        if dyn_change:
-                            sync_label = "async"
-                        training_loop(100, max_state_num,
-                                      "sep5_" + sync_label + "_" + str(args["cons"]) + "_" + str(scale_factor) + "K_" + str(
-                                          rep_factor) + "G_" + str(
-                                          args["b0"]) + "_b0_" + str(splits[1]-splits[0]) + "_sep_" + str(epsilon),
-                                      arguments=args, k=0, th_factor=0.6, adjustment_factor=3, dynamic_change=dyn_change,
-                                      timesteps=timesteps1)
-                        gc.collect()
+# for splits in [(-1.25, 2.25)]:  # , (-29, 30)]:
+#         for rep_factor in [9]:  # , 3, 5, 999, 0, 0.5, 0.8, 0.3]:
+#             for scale_factor in [0.1]:
+#                 for threshold in [48]:
+#                     for epsilon in [1]:
+#                         random.seed(5)
+#                         np.random.seed(5)
+#                         torch.manual_seed(5)
+#                         args["status_factor"] = base_scale * scale_factor
+#                         args["reputation_factor"] = base_rep * rep_factor
+#                         args["top_reward"] = splits[1]
+#                         args["bottom_reward"] = splits[0]
+#                         args["threshold"] = threshold
+#                         args["b0"] = base_b0 * splits[1] * 4
+#                         args["cons"] = 3000
+#                         args["epsilon"] = epsilon
+#                         dyn_change = True
+#                         timesteps1 = 15000 #int(cons * 3.5)
+#                         sync_label = "static"
+#                         if dyn_change:
+#                             sync_label = "async"
+#                         training_loop(100, max_state_num,
+#                                       "sep5_" + sync_label + "_" + str(args["cons"]) + "_" + str(scale_factor) + "K_" + str(
+#                                           rep_factor) + "G_" + str(
+#                                           args["b0"]) + "_b0_" + str(splits[1]-splits[0]) + "_sep_" + str(epsilon),
+#                                       arguments=args, k=0, th_factor=0.6, adjustment_factor=3, dynamic_change=dyn_change,
+#                                       timesteps=timesteps1)
+#                         gc.collect()
