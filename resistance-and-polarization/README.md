@@ -1,1 +1,1 @@
-# Resistance and Polarization Silmuations
+# Resistance and Polarization Simulations
