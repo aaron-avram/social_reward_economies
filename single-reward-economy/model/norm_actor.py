@@ -54,7 +54,9 @@ class ACWrapper():
 
         return self.function(ten(s), ten(aa)).detach().cpu().numpy()
 
-
+"""
+Not currently used
+"""
 class CopierNetwork(nn.Module):
     def __init__(self, oned_size, action_space):  # we work with 1-d size here.
         super(CopierNetwork, self).__init__()
@@ -77,6 +79,9 @@ class CopierNetwork(nn.Module):
         x = F.leaky_relu(self.layer3(x))
         return self.layer4(x)
 
+"""
+Not currently used
+"""
 class Copier():
     def __init__(self, oned_size, action_space, alpha, discount=0.99, beta=None, avg_alpha=None, num=0):
         self.function = CopierNetwork(oned_size, action_space)
@@ -161,6 +166,8 @@ class SimpleConnectedMultiple(nn.Module):
 
 counter = 0
 total_reward = 0
+
+# Policy network that learns which actions to take in different states.
 class ActorNetwork():
     def __init__(self, oned_size, action_space, alpha, discount=0.99, beta=None, avg_alpha=None, num=0):
         self.function = SimpleConnectedMultiple(oned_size, action_space)
@@ -178,9 +185,11 @@ class ActorNetwork():
 
         self.beta = 0
 
+    # Returns the probability of each action in the action space for a given state.
     def get_function_output(self, s):
         return F.softmax(self.function(ten(s)), dim=0).detach().cpu().numpy()
 
+    # Returns the action with the highest probability for a given state.    
     def get_learned_action(self, s, action_space):
         output = self.get_function_output(s)
 
@@ -195,6 +204,7 @@ class ActorNetwork():
     def get_function_output_v(self, s):
         return self.function(ten(s)).detach().cpu().numpy()
 
+    # Updates network to increase probability of actions with positive advantage
     def train(self, state, reward, action):
         actions = self.function(ten(state))
 

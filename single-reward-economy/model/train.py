@@ -440,7 +440,7 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
                 total_reputation_vector += j_agent.R.copy()
                 num_agents_found = 1
                 for k_agent in active_agents:
-                    if j_agent.S[k] < 3 and k_agent.S[j] < 3:
+                    if j_agent.S[k_agent.num] < 3 and k_agent.S[j_agent.num] < 3:
                         total_reputation_vector += k_agent.R.copy()
                         num_agents_found += 1
                 new_trc = total_reputation_vector / num_agents_found

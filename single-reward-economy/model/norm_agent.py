@@ -76,7 +76,7 @@ class NormAgent:
         self.infl_counter = 3000 * rho + int(np.random.randint(0, self.cons * rho))
         self.selfless_counter = 3000 * rho + int(np.random.randint(0, self.selfless_constant))
         self.rho = rho # scaling factor for the update intervals (smaller = more frequent updates)
-        self.kappa = kappa 
+        self.kappa = kappa # how often the agent updates its influencer (higher = more frequent updates)
 
         self.timestep = 0
         self.selfless_times = [] # List of timesteps when the agent was selfless
@@ -84,7 +84,7 @@ class NormAgent:
         self.group = self.num % 2 # Group membership (0 or 1)
 
         self.rep_threshold = 0.2 # NOT CURRENTLY USED; can likely be used to filter out very low reputation agents
-        self.epsilon = 0.01 # Used to decide which agents are "good enough" to be followed
+        self.epsilon = arguments.get("follower_epsilon", 0.01) # Used to decide which agents are "good enough" to be followed
 
     # Returns agent's utility for state s and action a
     def get_utility(self, s, a):
