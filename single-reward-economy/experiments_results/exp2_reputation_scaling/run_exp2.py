@@ -37,7 +37,7 @@ TIMESTEPS = 50000
 RANDOM_SEED = 5
 
 # Gamma values to test (from the PDF images)
-GAMMA_VALUES = [1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 5.0]
+GAMMA_VALUES = [10]
 
 # Experiment 2 Parameters (from PDF)
 KAPPA = 0.0  # No influencer benefits
