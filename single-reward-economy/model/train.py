@@ -205,7 +205,7 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
                 max_feedback = feedback
                 best_act = act
        
-       # Reward Tracking
+        # Reward Tracking
         sample_state_chance = [] # List of probabilities of the best action for the sample state
         ma_epoch_reward = 0 # Moving average of epoch rewards
         epoch_reward = 0 # Total reward for the current epoch
@@ -240,11 +240,11 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
                 all_similars[ii.num].append([])
 
 
-       real_actions = []     # Proportion of B1 actions
-       real_actions2 = []    # Proportion of B2 actions # NOT USED
-       b1_actions = 0        # Counter for actions [0,1,2]
-       b2_actions = 0        # Counter for actions [3,4,5]
-       all_actions = 1       # Total action counter
+        real_actions = []    
+        real_actions2 = [] 
+        b1_actions = 0        
+        b2_actions = 0        
+        all_actions = 1    
 
         all_personals = []
         for ii in agents_list:
@@ -489,6 +489,27 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
         if i % update_interval == 0 and i > 0:
             infl = -1
             print("Epoch Reward:", epoch_reward, "/", optimal_epoch_reward)
+            
+            # # Print reputation values for all agents
+            # print("\n--- Reputation Values (R) at timestep", i, "---")
+            # max_rep_agent = -1
+            # max_rep_value = -1
+            # for agent in agents_list:
+            #     # Find the maximum reputation this agent has from others
+            #     max_rep_from_others = np.max(agent.R) if len(agent.R) > 0 else 0
+            #     # Find which agent gives this agent the highest reputation
+            #     max_rep_giver = np.argmax(agent.R) if len(agent.R) > 0 else -1
+            #     print(f"Agent {agent.num}: Max reputation received = {max_rep_from_others:.4f} (from Agent {max_rep_giver})")
+            #     print(f"  Full R vector: {[f'{r:.4f}' for r in agent.R]}")
+                
+            #     # Track overall max reputation
+            #     if max_rep_from_others > max_rep_value:
+            #         max_rep_value = max_rep_from_others
+            #         max_rep_agent = agent.num
+            
+            # print(f"Overall: Agent {max_rep_agent} has the highest reputation ({max_rep_value:.4f})")
+            # print("--- End Reputation Values ---\n")
+            
             epoch_rewards.append(epoch_reward)
             ma_epoch_rewards_tracker.append(ma_epoch_reward)
             optimal_epoch_rewards.append(optimal_epoch_reward)
@@ -945,70 +966,72 @@ def new_plot_embed_withx(agents_list, xseries, yseries, root, name, title, top_a
     plt.close()
 
 
-#state_size = 3
-# max_state_num = 9
-# state_size = int(np.ceil(np.log2(max_state_num)))
-# print(state_size)
-# name = "test"
-# agents_list = []
+state_size = 3
+max_state_num = 9
+state_size = int(np.ceil(np.log2(max_state_num)))
+print(state_size)
+name = "test"
+agents_list = []
 
-# base_rep = 1
-# base_b0 = 10
-# base_scale = 1
+base_rep = 1
+base_b0 = 10
+base_scale = 1
 
 
-# scale_factor = 1
-# rep_factor = 1
-# alpha = 0.00005
+scale_factor = 1
+rep_factor = 1
+alpha = 0.00005
 
-# kappa = 1
-# rho = 1
+kappa = 1
+rho = 1
 
-# """
-# "status_factor" and "reputation_factor" are kappa and gamma, respectively.
-# "b0" is the outside utility (that governs rate allocation)
-# "cons" is the update interval for infl switch / rate allocation
-# "top_reward" and "bottom_reward" are the max/min reward for unimodal variance; they are the means for bimodal variance.
-# "epsilon" is the epsilon chance that special gossiping interactions will happen at each check.
-# "threshold" is the threshold at which an agent will consider optimizing for status.
+"""
+"status_factor" and "reputation_factor" are kappa and gamma, respectively.
+"b0" is the outside utility (that governs rate allocation)
+"cons" is the update interval for infl switch / rate allocation
+"top_reward" and "bottom_reward" are the max/min reward for unimodal variance; they are the means for bimodal variance.
+"epsilon" is the epsilon chance that special gossiping interactions will happen at each check.
+"threshold" is the threshold at which an agent will consider optimizing for status.
 
-# """
+"""
 
-# args = {"status_factor": base_scale * scale_factor,
-#         "reputation_factor": base_rep * rep_factor,
-#         "b0": base_b0,
-#         "learning_rate": alpha,
-#         "kappa": kappa,
-#         "rho": rho,
-#         "cons": 3000}
+args = {"status_factor": base_scale * scale_factor,
+        "reputation_factor": base_rep * rep_factor,
+        "b0": base_b0,
+        "learning_rate": alpha,
+        "kappa": kappa,
+        "rho": rho,
+        "cons": 3000}
 
-# import gc
+import gc
 
-# for splits in [(-1.25, 2.25)]:  # , (-29, 30)]:
-#         for rep_factor in [9]:  # , 3, 5, 999, 0, 0.5, 0.8, 0.3]:
-#             for scale_factor in [0.1]:
-#                 for threshold in [48]:
-#                     for epsilon in [1]:
-#                         random.seed(5)
-#                         np.random.seed(5)
-#                         torch.manual_seed(5)
-#                         args["status_factor"] = base_scale * scale_factor
-#                         args["reputation_factor"] = base_rep * rep_factor
-#                         args["top_reward"] = splits[1]
-#                         args["bottom_reward"] = splits[0]
-#                         args["threshold"] = threshold
-#                         args["b0"] = base_b0 * splits[1] * 4
-#                         args["cons"] = 3000
-#                         args["epsilon"] = epsilon
-#                         dyn_change = True
-#                         timesteps1 = 15000 #int(cons * 3.5)
-#                         sync_label = "static"
-#                         if dyn_change:
-#                             sync_label = "async"
-#                         training_loop(100, max_state_num,
-#                                       "sep5_" + sync_label + "_" + str(args["cons"]) + "_" + str(scale_factor) + "K_" + str(
-#                                           rep_factor) + "G_" + str(
-#                                           args["b0"]) + "_b0_" + str(splits[1]-splits[0]) + "_sep_" + str(epsilon),
-#                                       arguments=args, k=0, th_factor=0.6, adjustment_factor=3, dynamic_change=dyn_change,
-#                                       timesteps=timesteps1)
-#                         gc.collect()
+for splits in [(-1.25, 2.25)]:  # , (-29, 30)]:
+        for rep_factor in [9]:  # , 3, 5, 999, 0, 0.5, 0.8, 0.3]:
+            for scale_factor in [0.1]:
+                for threshold in [48]:
+                    for epsilon in [1]:
+                        random.seed(5)
+                        np.random.seed(5)
+                        torch.manual_seed(5)
+                        args["status_factor"] = base_scale * scale_factor
+                        args["reputation_factor"] = base_rep * rep_factor
+                        args["top_reward"] = splits[1]
+                        args["bottom_reward"] = splits[0]
+                        args["threshold"] = threshold
+                        args["b0"] = base_b0 * splits[1] * 4
+                        args["cons"] = 3000
+                        args["epsilon"] = epsilon
+                        args["reward_type"] = 'unimodal_variance'
+
+                        dyn_change = True
+                        timesteps1 = 15000 #int(cons * 3.5)
+                        sync_label = "static"
+                        if dyn_change:
+                            sync_label = "async"
+                        training_loop(100, max_state_num,
+                                      "sep5_" + sync_label + "_" + str(args["cons"]) + "_" + str(scale_factor) + "K_" + str(
+                                          rep_factor) + "G_" + str(
+                                          args["b0"]) + "_b0_" + str(splits[1]-splits[0]) + "_sep_" + str(epsilon),
+                                      arguments=args, k=0, th_factor=0.6, adjustment_factor=3, dynamic_change=dyn_change,
+                                      timesteps=timesteps1)
+                        gc.collect()
