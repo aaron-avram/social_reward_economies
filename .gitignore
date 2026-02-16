@@ -8,3 +8,4 @@ __pycache__/
 
 # NumPy output
 *.npy
+*.npz
