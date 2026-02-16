@@ -1,0 +1,10 @@
+# Images
+*.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# NumPy output
+*.npy
