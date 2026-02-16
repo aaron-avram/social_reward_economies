@@ -42,8 +42,8 @@ class NormAgent:
 
         self.adjustment_factor = adjustment_factor
 
-        self.update_factor = 0.001 * self.adjustment_factor
-        self.beta_update_factor = 0.01 * self.adjustment_factor
+        self.update_factor = 0.1 * self.adjustment_factor  # Increased from 0.001 to 0.1 for faster convergence
+        self.beta_update_factor = 0.1 * self.adjustment_factor  # Increased from 0.01 to 0.1
 
         self.num_agents = num_agents
         self.PR = np.zeros(num_agents)
@@ -150,6 +150,8 @@ class NormAgent:
         old_PR = self.PR[agent]
         self.PR[agent] = update_with_discount(self.PR[agent], reward, self.update_factor)
 
+        # REVERTED: Per paper Eq 12, gamma is NOT in the incremental update
+        # Gamma is applied during influencer selection (switch_influencer method)
         self.R[agent] += self.PR[agent] - old_PR
 
     def update_generic(self, old, reward):

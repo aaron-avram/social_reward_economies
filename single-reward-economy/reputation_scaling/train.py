@@ -271,6 +271,7 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
             followers.append([])
 
         delta_followers = []
+        max_followers_over_time = []   # max follower count across all agents at each checkpoint
         for ii in agents_list:
             delta_followers.append([])
 
@@ -620,6 +621,7 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
                         old_followers = followers[ag.num][-1]
                     delta_followers[ag.num].append(folls[ag.num] - old_followers)
                     followers[ag.num].append(folls[ag.num])
+                max_followers_over_time.append(float(np.max(folls)))
 
                 """ Record Self Utility """
                 for ag in agents_list:
@@ -751,6 +753,17 @@ def training_loop(num_agents, max_state_num, name, arguments, k=1.0, th_factor=0
 
         new_plot_embed_withx(agents_list, self_update_timesteps, delta_followers, root, "delta_followers.png",
                              "Change in Followers Over Time", top_agent=top_agent)
+
+        plt.figure(name + "max followers")
+        plt.plot(self_update_timesteps, max_followers_over_time, color='black', linewidth=1.5)
+        plt.axhline(y=num_agents - 1, color='red', linestyle='--', linewidth=0.8, label='Max possible (n-1)')
+        plt.title("Max Followers Held by Any Single Agent Over Time")
+        plt.xlabel("Timestep")
+        plt.ylabel("Followers")
+        plt.legend()
+        plt.savefig(root + "_max_followers.png")
+        np.save(root + "_max_followers.npy", np.array(max_followers_over_time))
+        plt.close()
 
         new_plot_embed_withx(agents_list, self_update_timesteps, self_util, root, "self_utility_overall.png",
                              "Self-Utility Over Time", top_agent=top_agent)
