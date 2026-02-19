@@ -89,10 +89,55 @@ Passed checks:
 - Impact:
   - Suppresses follower formation and can prevent the expected leader-follower emergence needed for reproducing `Norm__Working_Copy__2_-16.pdf` dynamics.
 
+### 5) BUG 1 (from code comments): non-followers cannot bootstrap reputation-role entry
+
+- Severity: **High**
+- Commented location:
+  - `doc/code_old.py:571`
+- Issue in code:
+  - Step-1 uses `est_rep_weighted = gamma * estimated_reward_rep`.
+  - For non-followers, `estimated_reward_rep` is never seeded from observed reputation in Step-1 and remains zero.
+- Evidence:
+  - `test_existing_bug_comments.py::test_bug1_non_followers_do_not_switch_even_with_high_reputation_signal`
+  - Output in `test_bug_comments_run_2026-02-19.txt`: test fails because agent remains `PERSONAL_UTILITY` despite strong reputation signal.
+- Impact:
+  - Blocks or delays follower emergence unless other pathways accidentally raise `estimated_reward_rep`.
+  - Distorts Section 7.3 role dynamics and equilibrium trajectory.
+
+### 6) BUG 4 (from code comments): extra pairwise gossip update in Phase 5
+
+- Severity: **Medium**
+- Commented location:
+  - `doc/code_old.py:481`
+- Issue in code:
+  - Phase 4 already applies gossip/estimate updates for active participants.
+  - Phase 5 applies an additional pairwise averaging gossip step in the same timestep.
+- Evidence:
+  - `test_existing_bug_comments.py::test_bug4_step_contains_extra_pairwise_gossip_after_participant_updates`
+  - Output in `test_bug_comments_run_2026-02-19.txt`: even after monkeypatching Phase-4 reputation update to no-op, `system.step()` changes estimates (`0 -> 5`, `10 -> 5`) due to Phase 5.
+- Impact:
+  - Applies more gossip than specified per step and changes convergence speed/shape.
+  - Can mask or amplify other reputation-learning errors during debugging.
+
+### 7) BUG 5 (from code comments): indirect-follow redirect logic is not applied correctly
+
+- Severity: **Medium**
+- Commented location:
+  - `doc/code_old.py:587`
+- Issue in code:
+  - Intended behavior in Section 7.3 Step (2): if selected `best_k` is already a follower, redirect to `best_k`'s leader.
+  - Implemented condition checks membership against follower-set containers, so redirect is effectively not triggered in relevant cases.
+- Evidence:
+  - `test_existing_bug_comments.py::test_bug5_indirect_following_redirect_not_applied`
+  - Output in `test_bug_comments_run_2026-02-19.txt`: follower stays on agent `1` instead of redirecting to leader `2`.
+- Impact:
+  - Allows indirect follower chains that violate intended sequential consistency.
+  - Can produce incorrect follower topology and downstream status/reputation updates.
+
 ## Replication Risk for `Norm__Working_Copy__2_-16.pdf`
 
 These issues directly affect reputation formation, role transitions, and interaction exposure rates. Together they are likely to prevent qualitative replication of expected phenomena such as follower emergence, influencer concentration, and stable consensus trajectories.
 
 ## Recommended Next Step
 
-Patch the four high-severity issues above first, then rerun this test package before attempting full-trajectory replication against `doc/Norm__Working_Copy__2_-16.pdf`.
+Patch the high-severity issues first (Findings 1, 2, 3, 4, 5), then address the medium-severity structural issues (Findings 6, 7), and rerun this test package before attempting full-trajectory replication against `doc/Norm__Working_Copy__2_-16.pdf`.

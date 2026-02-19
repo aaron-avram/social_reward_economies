@@ -191,86 +191,93 @@ class Agent:
     # ==================== Section 6.4: Reputation Learning ====================
     
     def update_personal_benefit_estimates(self, observed_payoffs: Dict[int, float], 
-                                          eta_v_t: float):
+                                          eta_v_t: float) -> Dict[int, float]:
         """
         Section 6.4.2: Learn personal benefit from each agent's actions
         v_i(k, t+1) = v_i(k, t) + η_v(t) [u_i(s(t), x_k(t)) - v_i(k, t)]
         
         observed_payoffs[k] is u_i(s(t), x_k(t)) if k is active, else 0
+
+        Returns:
+            Dictionary of deltas Δv_i(k,t) = v_i(k,t+1) - v_i(k,t), used by Eq. (9).
         """
+        personal_benefit_deltas = {}
         for agent_k, payoff in observed_payoffs.items():
-            if agent_k not in self.state.personal_benefit_estimates:
-                self.state.personal_benefit_estimates[agent_k] = 0.0
-            
-            # Only update if payoff is non-zero (agent k was active)
+            prev_val = self.state.personal_benefit_estimates.get(agent_k, 0.0)
+
+            # Update if active; otherwise decay for inactive agents.
             if payoff != 0.0:
-                self.state.personal_benefit_estimates[agent_k] += eta_v_t * \
-                    (payoff - self.state.personal_benefit_estimates[agent_k])
-            # else: decay estimates for inactive agents
+                new_val = prev_val + eta_v_t * (payoff - prev_val)
             else:
-                self.state.personal_benefit_estimates[agent_k] *= (1.0 - eta_v_t)
+                new_val = prev_val * (1.0 - eta_v_t)
+
+            self.state.personal_benefit_estimates[agent_k] = new_val
+            personal_benefit_deltas[agent_k] = new_val - prev_val
+
+        return personal_benefit_deltas
     
-    def update_reputation_estimates_gossip(self, observed_payoffs: Dict[int, float],
+    def update_reputation_estimates_gossip(self, personal_benefit_deltas: Dict[int, float],
                                           other_agents_list: List['Agent'],
                                           eta_s_t: float):
         """
         Section 6.4.3: Update reputation estimates via gossip
         s_i(k, t+1) = (Σ_j s_j(k, t)) / |A_p(t)| + v_i(k, t+1) - v_i(k, t)
-        
-        Implemented as: participants average their reputation estimates,
-        then incorporate fresh observations from personal benefits
         """
-        # Average reputation estimates from other agents (gossip)
-        if len(other_agents_list) > 0:
-            for agent_k in range(self.config.num_agents):
-                estimates_from_others = []
-                for other_agent in other_agents_list:
-                    if agent_k in other_agent.state.reputation_estimates:
-                        estimates_from_others.append(
-                            other_agent.state.reputation_estimates[agent_k]
-                        )
-                
-                if estimates_from_others:
-                    avg_estimate = np.mean(estimates_from_others)
-                    # Average in the estimates from others
-                    if agent_k not in self.state.reputation_estimates:
-                        self.state.reputation_estimates[agent_k] = 0.0
-                    
-                    self.state.reputation_estimates[agent_k] += eta_s_t * \
-                        (avg_estimate - self.state.reputation_estimates[agent_k])
-        
-        # Incorporate fresh personal benefit observations
-        for agent_k, payoff in observed_payoffs.items():
-            if payoff != 0.0:  # Fresh observation from agent k
-                if agent_k not in self.state.reputation_estimates:
-                    self.state.reputation_estimates[agent_k] = 0.0
-                
-                self.state.reputation_estimates[agent_k] += eta_s_t * \
-                    (payoff - self.state.reputation_estimates[agent_k])
+        for agent_k in range(self.config.num_agents):
+            estimates = [
+                other_agent.state.reputation_estimates.get(agent_k, 0.0)
+                for other_agent in other_agents_list
+            ]
+
+            if estimates:
+                avg_estimate = float(np.mean(estimates))
+            else:
+                avg_estimate = self.state.reputation_estimates.get(agent_k, 0.0)
+
+            delta_v = personal_benefit_deltas.get(agent_k, 0.0)
+            self.state.reputation_estimates[agent_k] = avg_estimate + delta_v
     
     def identify_highest_reputation_agent(self):
         """
         Section 6.4.4: Identify agent with highest reputation using tie threshold Δ
         
-        K_i(t) = {k ∈ C\{i} : s_i(k, t) ≥ max_k' s_i(k', t) - Δ}
+        K_i(t) = {k ∈ C\\{i} : s_i(k, t) ≥ max_k' s_i(k', t) - Δ}
         Select uniformly at random from K_i(t)
         """
         if not self.state.reputation_estimates:
             self.state.highest_rep_agent_estimate = np.random.randint(self.config.num_agents)
             return
         
-        max_rep = max(self.state.reputation_estimates.values())
+        # Section 6.4.4 requires selecting from C\{i}; never select self.
+        non_self_estimates = {
+            k: rep
+            for k, rep in self.state.reputation_estimates.items()
+            if k != self.agent_id
+        }
+        if not non_self_estimates:
+            all_other_ids = [i for i in range(self.config.num_agents) if i != self.agent_id]
+            if all_other_ids:
+                self.state.highest_rep_agent_estimate = np.random.choice(all_other_ids)
+            else:
+                self.state.highest_rep_agent_estimate = self.agent_id
+            return
+
+        max_rep = max(non_self_estimates.values())
         
         # Find all agents within delta of the maximum
         candidates = [
-            k for k, rep in self.state.reputation_estimates.items()
+            k for k, rep in non_self_estimates.items()
             if rep >= max_rep - self.config.delta
         ]
         
         if candidates:
             self.state.highest_rep_agent_estimate = np.random.choice(candidates)
         else:
-            self.state.highest_rep_agent_estimate = np.random.randint(self.config.num_agents)
+            all_other_ids = [i for i in range(self.config.num_agents) if i != self.agent_id]
+            if all_other_ids:
+                self.state.highest_rep_agent_estimate = np.random.choice(all_other_ids)
+            else:
+                self.state.highest_rep_agent_estimate = self.agent_id
     
     # ==================== Section 6.5: Status Optimization ====================
     
@@ -394,16 +401,18 @@ class MultiAgentSystem:
         
         # === PHASE 1: Sample Active Actors and Participants (Section 6.2) ===
         
-        # A_a(t): Active actors (based on learned actor_interaction_rate)
+        # A_a(t): Active actors (Section 6.2) sampled using θ(μ)=1-exp(-μ)
         active_actors = set()
         for agent in self.agents:
-            if np.random.random() < agent.state.actor_interaction_rate:
+            actor_prob = 1.0 - np.exp(-agent.state.actor_interaction_rate)
+            if np.random.random() < actor_prob:
                 active_actors.add(agent.agent_id)
         
-        # A_p(t): Active participants (based on fixed participant_interaction_rate)
+        # A_p(t): Active participants (Section 6.2) sampled using θ(μ)=1-exp(-μ)
         active_participants = []
         for agent in self.agents:
-            if np.random.random() < agent.state.participant_interaction_rate:
+            participant_prob = 1.0 - np.exp(-agent.state.participant_interaction_rate)
+            if np.random.random() < participant_prob:
                 active_participants.append(agent)
         
         active_participant_ids = {a.agent_id for a in active_participants}
@@ -458,11 +467,13 @@ class MultiAgentSystem:
         
         for agent in active_participants:
             # Section 6.4.2: Update personal benefit estimates v_i(k,t)
-            agent.update_personal_benefit_estimates(observed_payoffs, eta_v_t)
+            personal_benefit_deltas = agent.update_personal_benefit_estimates(
+                observed_payoffs, eta_v_t
+            )
             
             # Section 6.4.3: Update reputation estimates s_i(k,t) via gossip
             agent.update_reputation_estimates_gossip(
-                observed_payoffs, active_participants, eta_s_t
+                personal_benefit_deltas, active_participants, eta_s_t
             )
             
             # Section 6.4.4: Identify highest reputation agent
@@ -471,37 +482,13 @@ class MultiAgentSystem:
             # Section 6.7: Update actor interaction rates
             agent.update_actor_interaction_rate(alpha_rate_t)
         
-        # === PHASE 5: Gossip Among Participants (Section 6.4) ===
-        
-        if np.random.random() < self.config.gossip_rate and len(active_participants) >= 2:
-            # Random pairwise gossip
-            indices = np.random.choice(len(active_participants), 2, replace=False)
-            agent1 = active_participants[indices[0]]
-            agent2 = active_participants[indices[1]]
-            
-            # Pairwise averaging of reputation estimates
-            alpha = self.config.gossip_alpha
-            for k in range(self.config.num_agents):
-                if k not in agent1.state.reputation_estimates:
-                    agent1.state.reputation_estimates[k] = 0.0
-                if k not in agent2.state.reputation_estimates:
-                    agent2.state.reputation_estimates[k] = 0.0
-                
-                # Average: both move toward their mutual mean
-                rep1 = agent1.state.reputation_estimates[k]
-                rep2 = agent2.state.reputation_estimates[k]
-                mean = (rep1 + rep2) / 2.0
-                
-                agent1.state.reputation_estimates[k] += alpha * (mean - rep1)
-                agent2.state.reputation_estimates[k] += alpha * (mean - rep2)
-        
-        # === PHASE 6: Adoption of Leader Behavior (Section 6.4.5) ===
+        # === PHASE 5: Adoption of Leader Behavior (Section 6.4.5) ===
         
         for agent in self.agents:
             if agent.state.role == AgentRole.REPUTATION:
                 agent.adopt_leader_behavior()
         
-        # === PHASE 7: Periodic Role Updates (Section 7) ===
+        # === PHASE 6: Periodic Role Updates (Section 7) ===
         
         # Increasing update interval: T_n → ∞ as per Assumption 6
         current_interval = max(
@@ -513,7 +500,7 @@ class MultiAgentSystem:
             self._update_roles_sequential()  # Sequential procedure from Section 7
             self.role_update_epoch += 1
         
-        # === PHASE 8: Tracking ===
+        # === PHASE 7: Tracking ===
         
         self._track_results(this_step_payoffs, len(active_actors), len(active_participants))
     
