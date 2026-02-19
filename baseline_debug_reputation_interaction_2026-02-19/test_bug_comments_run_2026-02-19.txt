@@ -1,0 +1,146 @@
+FFF                                                                      [100%]
+=================================== FAILURES ===================================
+____ test_bug1_non_followers_do_not_switch_even_with_high_reputation_signal ____
+
+baseline_module = <module 'baseline_code_old' from '/Users/xia/social_reward_economies/doc/code_old.py'>
+
+    def test_bug1_non_followers_do_not_switch_even_with_high_reputation_signal(baseline_module):
+        """BUG 1 check: Step-1 uses estimated_reward_rep (stuck at 0 for non-followers)."""
+        system = make_system(
+            baseline_module,
+            num_agents=2,
+            extra_config=dict(gamma=2.0, kappa=0.0, B_R=0.8, B_F=0.6, c_threshold=1.0),
+        )
+        AgentRole = baseline_module.AgentRole
+    
+        candidate = system.agents[0]
+        leader = system.agents[1]
+    
+        # Keep C={0} to remove update-order effects.
+        candidate.state.followers = set()
+        leader.state.followers = {0}
+    
+        candidate.state.role = AgentRole.PERSONAL_UTILITY
+        candidate.state.following = None
+        candidate.state.estimated_reward_pu = 0.0
+        candidate.state.estimated_reward_rep = 0.0
+    
+        # Reputation evidence is strong and above B_R.
+        candidate.state.reputation_estimates = {1: 2.0}
+        candidate.state.highest_rep_agent_estimate = 1
+    
+        np.random.seed(7)
+        system._update_roles_sequential()
+    
+        # If reputation reward were derived from observed reputation in Step-1,
+        # this would switch to REPUTATION. Current code stays PERSONAL_UTILITY.
+>       assert candidate.state.role == AgentRole.REPUTATION
+E       AssertionError: assert <AgentRole.PERSONAL_UTILITY: 'personal_utility'> == <AgentRole.REPUTATION: 'reputation'>
+E        +  where <AgentRole.PERSONAL_UTILITY: 'personal_utility'> = AgentState(weights_pu=array([[-0.03503172,  0.07177064],\n       [ 0.11397596, -0.01387066],\n       [-0.09290361, -0.04...eward_status=0.0, actor_interaction_rate=0.7, participant_interaction_rate=0.7, payoff_history=[], was_following=False).role
+E        +    where AgentState(weights_pu=array([[-0.03503172,  0.07177064],\n       [ 0.11397596, -0.01387066],\n       [-0.09290361, -0.04...eward_status=0.0, actor_interaction_rate=0.7, participant_interaction_rate=0.7, payoff_history=[], was_following=False) = <baseline_code_old.Agent object at 0x113511890>.state
+E        +  and   <AgentRole.REPUTATION: 'reputation'> = <enum 'AgentRole'>.REPUTATION
+
+baseline_debug_reputation_interaction_2026-02-19/test_existing_bug_comments.py:76: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+
+Fontconfig error: No writable cache directories
+	/opt/homebrew/var/cache/fontconfig
+	/Users/xia/.cache/fontconfig
+	/Users/xia/.fontconfig
+------------------------------ Captured log setup ------------------------------
+WARNING  matplotlib:__init__.py:541 /Users/xia/.matplotlib is not a writable directory
+WARNING  matplotlib:__init__.py:554 Matplotlib created a temporary cache directory at /var/folders/p9/byxhc90j5rn817zsm7hzxwk80000gp/T/matplotlib-hx94482p because there was an issue with the default path (/Users/xia/.matplotlib); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+WARNING  matplotlib.font_manager:font_manager.py:1095 Matplotlib is building the font cache; this may take a moment.
+___ test_bug4_step_contains_extra_pairwise_gossip_after_participant_updates ____
+
+baseline_module = <module 'baseline_code_old' from '/Users/xia/social_reward_economies/doc/code_old.py'>
+
+    def test_bug4_step_contains_extra_pairwise_gossip_after_participant_updates(
+        baseline_module,
+    ):
+        """BUG 4 check: even with participant gossip update disabled, Phase 5 still mutates estimates."""
+        system = make_system(
+            baseline_module,
+            num_agents=2,
+            extra_config=dict(gossip_rate=1.0, gossip_alpha=1.0, u_0=0.0),
+        )
+    
+        a0, a1 = system.agents
+    
+        # Force participant activity and no actors, to isolate gossip phases.
+        for a in (a0, a1):
+            a.state.actor_interaction_rate = 0.0
+            a.state.participant_interaction_rate = 1.0
+    
+        # Distinct estimates so pairwise gossip creates a visible change.
+        a0.state.reputation_estimates = {0: 0.0, 1: 0.0}
+        a1.state.reputation_estimates = {0: 10.0, 1: 10.0}
+    
+        # Disable Phase-4 reputation-update method to isolate Phase 5 effect.
+        def _noop(self, observed_payoffs, other_agents_list, eta_s_t):
+            return None
+    
+        a0.update_reputation_estimates_gossip = types.MethodType(_noop, a0)
+        a1.update_reputation_estimates_gossip = types.MethodType(_noop, a1)
+    
+        np.random.seed(0)
+        system.step()
+    
+        # Without Phase 5, these would remain unchanged.
+>       assert a0.state.reputation_estimates[0] == pytest.approx(0.0, abs=1e-12)
+E       assert 5.0 == 0.0 ± 1.0e-12
+E         comparison failed
+E         Obtained: 5.0
+E         Expected: 0.0 ± 1.0e-12
+
+baseline_debug_reputation_interaction_2026-02-19/test_existing_bug_comments.py:112: AssertionError
+______________ test_bug5_indirect_following_redirect_not_applied _______________
+
+baseline_module = <module 'baseline_code_old' from '/Users/xia/social_reward_economies/doc/code_old.py'>
+
+    def test_bug5_indirect_following_redirect_not_applied(baseline_module):
+        """BUG 5 check: when best_k is already a follower, follower should redirect to best_k's leader."""
+        system = make_system(
+            baseline_module,
+            num_agents=4,
+            extra_config=dict(gamma=2.0, kappa=0.0, B_R=0.8, B_F=0.6, c_threshold=1.0),
+        )
+        AgentRole = baseline_module.AgentRole
+    
+        i = system.agents[0]  # candidate to become follower
+        k_hat = system.agents[1]  # chosen best_k, but already follower of k_prime
+        k_prime = system.agents[2]  # should be followed instead
+        filler = system.agents[3]
+    
+        # Ensure only agent 0 is in C (agents without followers).
+        i.state.followers = set()
+        k_hat.state.followers = {3}
+        k_prime.state.followers = {1}
+        filler.state.followers = {2}
+    
+        # Relationship: k_hat follows k_prime.
+        k_hat.state.role = AgentRole.REPUTATION
+        k_hat.state.following = 2
+    
+        i.state.role = AgentRole.PERSONAL_UTILITY
+        i.state.following = None
+        i.state.estimated_reward_pu = 0.0
+        i.state.estimated_reward_rep = 1.0  # gamma*J_r = 2.0 > B_R
+        i.state.reputation_estimates = {1: 2.0, 2: 1.5, 3: 0.1}
+        i.state.highest_rep_agent_estimate = 1
+    
+        np.random.seed(1)
+        system._update_roles_sequential()
+    
+        assert i.state.role == AgentRole.REPUTATION
+>       assert i.state.following == 2
+E       assert 1 == 2
+E        +  where 1 = AgentState(weights_pu=array([[-0.0291394 , -0.01330903],\n       [-0.01730696, -0.17616517],\n       [-0.00876731,  0.13...reward_status=0.0, actor_interaction_rate=0.7, participant_interaction_rate=0.7, payoff_history=[], was_following=True).following
+E        +    where AgentState(weights_pu=array([[-0.0291394 , -0.01330903],\n       [-0.01730696, -0.17616517],\n       [-0.00876731,  0.13...reward_status=0.0, actor_interaction_rate=0.7, participant_interaction_rate=0.7, payoff_history=[], was_following=True) = <baseline_code_old.Agent object at 0x11356b850>.state
+
+baseline_debug_reputation_interaction_2026-02-19/test_existing_bug_comments.py:151: AssertionError
+=========================== short test summary info ============================
+FAILED baseline_debug_reputation_interaction_2026-02-19/test_existing_bug_comments.py::test_bug1_non_followers_do_not_switch_even_with_high_reputation_signal
+FAILED baseline_debug_reputation_interaction_2026-02-19/test_existing_bug_comments.py::test_bug4_step_contains_extra_pairwise_gossip_after_participant_updates
+FAILED baseline_debug_reputation_interaction_2026-02-19/test_existing_bug_comments.py::test_bug5_indirect_following_redirect_not_applied
+3 failed in 9.34s
