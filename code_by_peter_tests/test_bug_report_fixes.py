@@ -1,6 +1,13 @@
-"""Regression tests for bug-report fixes in doc/code_by_peter.py.
+"""Regression tests for bug fixes in doc/code_debugged.py.
 
-Covers all findings listed in baseline_debug_reputation_interaction_2026-02-19/BUG_REPORT.md.
+Organized by canonical bug IDs:
+- IR-1  : activation sampling must use theta(mu)=1-exp(-mu)
+- REP-1 : highest-reputation selection excludes self
+- REP-2 : reputation update matches Eq. (9): avg + delta_v
+- REP-3 : no extra pairwise gossip pass in same timestep
+- ROLE-1: reputation-role entry can bootstrap from observed signal
+- ROLE-2: no extra max_rep >= B_i gate
+- ROLE-3: indirect-follow target redirects to leader
 """
 
 from __future__ import annotations
@@ -14,12 +21,12 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET_PATH = ROOT / "doc" / "code_by_peter.py"
+TARGET_PATH = ROOT / "doc" / "code_debugged.py"
 
 
 @pytest.fixture(scope="module")
 def model_module():
-    spec = importlib.util.spec_from_file_location("code_by_peter_module", TARGET_PATH)
+    spec = importlib.util.spec_from_file_location("code_debugged_module", TARGET_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -52,7 +59,9 @@ def _estimate_activation_frequency(system, *, steps: int, seed: int):
     return actor_empirical, participant_empirical
 
 
-def test_actor_activation_uses_theta_mu(model_module):
+# ==================== IR-1 ====================
+
+def test_ir1_actor_activation_uses_theta_mu(model_module):
     system = make_system(model_module, num_agents=1, extra_config=dict(u_0=0.0))
     agent = system.agents[0]
     agent.state.actor_interaction_rate = 0.8
@@ -66,7 +75,7 @@ def test_actor_activation_uses_theta_mu(model_module):
     assert abs(actor_empirical - expected) < 0.03
 
 
-def test_participant_activation_uses_theta_mu(model_module):
+def test_ir1_participant_activation_uses_theta_mu(model_module):
     system = make_system(model_module, num_agents=1, extra_config=dict(u_0=0.0))
     agent = system.agents[0]
     agent.state.actor_interaction_rate = 0.0
@@ -80,7 +89,9 @@ def test_participant_activation_uses_theta_mu(model_module):
     assert abs(participant_empirical - expected) < 0.03
 
 
-def test_highest_reputation_selection_excludes_self(model_module):
+# ==================== REP-1 ====================
+
+def test_rep1_highest_reputation_selection_excludes_self(model_module):
     system = make_system(model_module, num_agents=3)
     agent = system.agents[0]
 
@@ -93,7 +104,9 @@ def test_highest_reputation_selection_excludes_self(model_module):
     assert agent.state.highest_rep_agent_estimate != 0
 
 
-def test_reputation_update_matches_eq9_additive_structure(model_module):
+# ==================== REP-2 ====================
+
+def test_rep2_reputation_update_matches_eq9_additive_structure(model_module):
     system = make_system(model_module, num_agents=2)
     agent_i = system.agents[0]
     agent_j = system.agents[1]
@@ -116,7 +129,135 @@ def test_reputation_update_matches_eq9_additive_structure(model_module):
     assert agent_i.state.reputation_estimates[k] == pytest.approx(expected, abs=1e-9)
 
 
-def test_step1_reputation_switch_does_not_use_extra_max_rep_gate(model_module):
+# ==================== REP-3 ====================
+
+def test_rep3_no_extra_phase5_pairwise_gossip_strict_noop_phase4(model_module):
+    """Primary REP-3 check: if Phase-4 is forced to no-op, step should not mutate estimates."""
+    system = make_system(
+        model_module,
+        num_agents=2,
+        extra_config=dict(gossip_rate=1.0, gossip_alpha=1.0, u_0=0.0),
+    )
+    a0, a1 = system.agents
+
+    # Force no actors and near-certain participant activity under theta(mu).
+    for a in (a0, a1):
+        a.state.actor_interaction_rate = 0.0
+        a.state.participant_interaction_rate = 100.0
+
+    a0.state.reputation_estimates = {0: 0.0, 1: 0.0}
+    a1.state.reputation_estimates = {0: 10.0, 1: 10.0}
+
+    def _noop_personal_benefit(self, observed_payoffs, eta_v_t):
+        return {k: 0.0 for k in observed_payoffs}
+
+    def _noop_gossip(self, personal_benefit_deltas, other_agents_list, eta_s_t):
+        return None
+
+    # Disable Phase-4 estimate changes so any mutation would indicate extra gossip pass.
+    a0.update_personal_benefit_estimates = types.MethodType(_noop_personal_benefit, a0)
+    a1.update_personal_benefit_estimates = types.MethodType(_noop_personal_benefit, a1)
+    a0.update_reputation_estimates_gossip = types.MethodType(_noop_gossip, a0)
+    a1.update_reputation_estimates_gossip = types.MethodType(_noop_gossip, a1)
+
+    np.random.seed(0)
+    system.step()
+
+    assert a0.state.reputation_estimates[0] == pytest.approx(0.0, abs=1e-12)
+    assert a1.state.reputation_estimates[0] == pytest.approx(10.0, abs=1e-12)
+
+
+def test_rep3_no_extra_phase5_pairwise_gossip_legacy_scenario(model_module):
+    """Legacy scenario from old bug-comment test, now under canonical REP-3 grouping."""
+    system = make_system(
+        model_module,
+        num_agents=2,
+        extra_config=dict(gossip_rate=1.0, gossip_alpha=1.0, u_0=0.0),
+    )
+    a0, a1 = system.agents
+
+    for a in (a0, a1):
+        a.state.actor_interaction_rate = 0.0
+        a.state.participant_interaction_rate = 1.0
+
+    a0.state.reputation_estimates = {0: 0.0, 1: 0.0}
+    a1.state.reputation_estimates = {0: 10.0, 1: 10.0}
+
+    def _noop_gossip(self, personal_benefit_deltas, other_agents_list, eta_s_t):
+        return None
+
+    a0.update_reputation_estimates_gossip = types.MethodType(_noop_gossip, a0)
+    a1.update_reputation_estimates_gossip = types.MethodType(_noop_gossip, a1)
+
+    np.random.seed(0)
+    system.step()
+
+    assert a0.state.reputation_estimates[0] == pytest.approx(0.0, abs=1e-12)
+    assert a1.state.reputation_estimates[0] == pytest.approx(10.0, abs=1e-12)
+
+
+# ==================== ROLE-1 ====================
+
+def test_role1_bootstrap_non_follower_from_reputation_signal(model_module):
+    system = make_system(
+        model_module,
+        num_agents=2,
+        extra_config=dict(gamma=2.0, kappa=0.0, B_R=0.8, B_F=0.6, c_threshold=1.0),
+    )
+    AgentRole = model_module.AgentRole
+
+    candidate = system.agents[0]
+    leader = system.agents[1]
+
+    candidate.state.followers = set()
+    leader.state.followers = {0}  # Keep C={0}
+
+    candidate.state.role = AgentRole.PERSONAL_UTILITY
+    candidate.state.following = None
+    candidate.state.estimated_reward_pu = 0.0
+    candidate.state.estimated_reward_rep = 0.0
+    candidate.state.reputation_estimates = {1: 2.0}
+    candidate.state.highest_rep_agent_estimate = 1
+
+    np.random.seed(7)
+    system._update_roles_sequential()
+
+    assert candidate.state.role == AgentRole.REPUTATION
+    assert candidate.state.following == 1
+
+
+def test_role1_bootstrap_non_follower_legacy_scenario(model_module):
+    """Legacy scenario from old bug-comment test, now under canonical ROLE-1 grouping."""
+    system = make_system(
+        model_module,
+        num_agents=2,
+        extra_config=dict(gamma=2.0, kappa=0.0, B_R=0.8, B_F=0.6, c_threshold=1.0),
+    )
+    AgentRole = model_module.AgentRole
+
+    candidate = system.agents[0]
+    leader = system.agents[1]
+
+    candidate.state.followers = set()
+    leader.state.followers = {0}
+
+    candidate.state.role = AgentRole.PERSONAL_UTILITY
+    candidate.state.following = None
+    candidate.state.estimated_reward_pu = 0.0
+    candidate.state.estimated_reward_rep = 0.0
+    candidate.state.reputation_estimates = {1: 2.0}
+    candidate.state.highest_rep_agent_estimate = 1
+
+    np.random.seed(7)
+    system._update_roles_sequential()
+
+    assert candidate.state.role == AgentRole.REPUTATION
+    assert candidate.state.following == 1
+
+
+# ==================== ROLE-2 ====================
+
+def test_role2_step1_reputation_switch_does_not_use_extra_max_rep_gate(model_module):
     system = make_system(
         model_module,
         num_agents=2,
@@ -147,35 +288,9 @@ def test_step1_reputation_switch_does_not_use_extra_max_rep_gate(model_module):
     assert follower.state.following == 1
 
 
-def test_bug1_bootstrap_non_follower_from_reputation_signal(model_module):
-    system = make_system(
-        model_module,
-        num_agents=2,
-        extra_config=dict(gamma=2.0, kappa=0.0, B_R=0.8, B_F=0.6, c_threshold=1.0),
-    )
-    AgentRole = model_module.AgentRole
+# ==================== ROLE-3 ====================
 
-    candidate = system.agents[0]
-    leader = system.agents[1]
-
-    candidate.state.followers = set()
-    leader.state.followers = {0}  # Keep C={0}
-
-    candidate.state.role = AgentRole.PERSONAL_UTILITY
-    candidate.state.following = None
-    candidate.state.estimated_reward_pu = 0.0
-    candidate.state.estimated_reward_rep = 0.0
-    candidate.state.reputation_estimates = {1: 2.0}
-    candidate.state.highest_rep_agent_estimate = 1
-
-    np.random.seed(7)
-    system._update_roles_sequential()
-
-    assert candidate.state.role == AgentRole.REPUTATION
-    assert candidate.state.following == 1
-
-
-def test_bug5_redirects_if_best_agent_is_already_follower(model_module):
+def test_role3_redirects_if_best_agent_is_already_follower(model_module):
     system = make_system(
         model_module,
         num_agents=4,
@@ -210,36 +325,37 @@ def test_bug5_redirects_if_best_agent_is_already_follower(model_module):
     assert i.state.following == 2
 
 
-def test_bug4_no_extra_phase5_pairwise_gossip(model_module):
+def test_role3_redirect_legacy_scenario(model_module):
+    """Legacy scenario from old bug-comment test, now under canonical ROLE-3 grouping."""
     system = make_system(
         model_module,
-        num_agents=2,
-        extra_config=dict(gossip_rate=1.0, gossip_alpha=1.0, u_0=0.0),
+        num_agents=4,
+        extra_config=dict(gamma=2.0, kappa=0.0, B_R=0.8, B_F=0.6, c_threshold=1.0),
     )
-    a0, a1 = system.agents
+    AgentRole = model_module.AgentRole
 
-    # Force no actors and near-certain participant activity under theta(mu).
-    for a in (a0, a1):
-        a.state.actor_interaction_rate = 0.0
-        a.state.participant_interaction_rate = 100.0
+    i = system.agents[0]
+    k_hat = system.agents[1]
+    k_prime = system.agents[2]
+    filler = system.agents[3]
 
-    a0.state.reputation_estimates = {0: 0.0, 1: 0.0}
-    a1.state.reputation_estimates = {0: 10.0, 1: 10.0}
+    i.state.followers = set()
+    k_hat.state.followers = {3}
+    k_prime.state.followers = {1}
+    filler.state.followers = {2}
 
-    def _noop_personal_benefit(self, observed_payoffs, eta_v_t):
-        return {k: 0.0 for k in observed_payoffs}
+    k_hat.state.role = AgentRole.REPUTATION
+    k_hat.state.following = 2
 
-    def _noop_gossip(self, personal_benefit_deltas, other_agents_list, eta_s_t):
-        return None
+    i.state.role = AgentRole.PERSONAL_UTILITY
+    i.state.following = None
+    i.state.estimated_reward_pu = 0.0
+    i.state.estimated_reward_rep = 1.0
+    i.state.reputation_estimates = {1: 2.0, 2: 1.5, 3: 0.1}
+    i.state.highest_rep_agent_estimate = 1
 
-    # Disable Phase-4 estimate changes so any mutation would indicate extra gossip pass.
-    a0.update_personal_benefit_estimates = types.MethodType(_noop_personal_benefit, a0)
-    a1.update_personal_benefit_estimates = types.MethodType(_noop_personal_benefit, a1)
-    a0.update_reputation_estimates_gossip = types.MethodType(_noop_gossip, a0)
-    a1.update_reputation_estimates_gossip = types.MethodType(_noop_gossip, a1)
+    np.random.seed(1)
+    system._update_roles_sequential()
 
-    np.random.seed(0)
-    system.step()
-
-    assert a0.state.reputation_estimates[0] == pytest.approx(0.0, abs=1e-12)
-    assert a1.state.reputation_estimates[0] == pytest.approx(10.0, abs=1e-12)
+    assert i.state.role == AgentRole.REPUTATION
+    assert i.state.following == 2

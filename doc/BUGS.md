@@ -1,136 +1,54 @@
-# Bugs in `code_by_peter.py`
+# Bug Catalog (Canonical IDs)
 
-Audit against `learning_paper_newest_ver_transcription.md`.
+This catalog uses grouped, stable IDs for the bugs originally identified in `doc/code_old.py`.
 
----
+## Canonical IDs
 
-## Bug 1 (Critical): Wrong `Ĵ^r_i` in Follow Condition
+- `IR-1`: Active-set sampling must use `theta(mu)=1-exp(-mu)`
+- `REP-1`: Highest-reputation selection must exclude self (`C\\{i}`)
+- `REP-2`: Reputation update must follow Eq. (9) additive form (`avg + delta_v`)
+- `REP-3`: Remove extra pairwise gossip pass in the same timestep
+- `ROLE-1`: Non-followers must bootstrap reputation-role entry from observed reputation signal
+- `ROLE-2`: Remove extra `max_rep >= B_i` gate from Step-1 follow condition
+- `ROLE-3`: Redirect if selected follow target is itself a follower
 
-**File/Line**: `_update_roles_sequential()`, line 561
+Legacy mapping from old inline labels:
 
-**Paper (Section 7.3)**:
-> If `γ·Ĵ^r_i(s_n) > max{B_i, Ĵ^{pu}_i(s_n)}`: agent i follows L_i(s_n).
+- old `Bug 1` -> `ROLE-1`
+- old `Bug 2` -> `ROLE-2`
+- old `Bug 3` -> `REP-2`
+- old `Bug 4` -> `REP-3`
+- old `Bug 5` -> `ROLE-3`
 
-**Section 6.6** defines:
-> `Ĵ^r_i`: set equal to `s_i(k, t)` for the agent k being followed
+## By Group
 
-At the role-update decision point for a **non-follower**, there is no "agent being followed" yet. The correct interpretation is: `Ĵ^r_i = s_i(L_i(s_n), s_n)` — the current reputation estimate of the highest-reputation candidate `L_i`. This is `max_rep` in Peter's code.
+### Interaction Rates
 
-**What Peter's code does**:
-```python
-est_rep_weighted = self.config.gamma * agent.state.estimated_reward_rep
-```
-`estimated_reward_rep` is only updated via EMA when an agent is *already* in REPUTATION role (following someone). For all non-followers it stays at its initial value of 0.0.
+#### IR-1 (High)
+Active actor/participant sampling used raw `mu` instead of `theta(mu)=1-exp(-mu)`.
 
-**Effect**: `est_rep_weighted = 0` for every non-follower. The follow condition `0 > max(0.8, est_pu)` is never true. **No agent ever transitions to REPUTATION role.**
+### Reputation Learning
 
-**Fix**:
-```python
-est_rep_weighted = self.config.gamma * max_rep  # s_i(L_i, t) per Section 6.6
-```
+#### REP-1 (High)
+Highest-reputation selection allowed self as candidate.
 
----
+#### REP-2 (High)
+Reputation update deviated from Eq. (9): implementation used EMA-style updates instead of `avg + delta_v`.
 
-## Bug 2 (Critical): Extra `max_rep >= B_i` Check Not in Paper
+#### REP-3 (Medium)
+A second pairwise gossip update occurred in Phase 5 after Phase 4 already applied gossip updates.
 
-**File/Line**: `_update_roles_sequential()`, line 565
+### Role Updates
 
-**Paper (Section 7.3)** condition (complete):
-> `γ·Ĵ^r_i(s_n) > max{B_i, Ĵ^{pu}_i(s_n)}`
+#### ROLE-1 (High)
+Step-1 follow decision used `estimated_reward_rep` for non-followers, preventing reputation-role bootstrap.
 
-There is only **one inequality**. `B_i` appears on the RHS inside the `max{}`.
+#### ROLE-2 (High)
+Step-1 follow condition added extra gate `max_rep >= B_i`, which is not in Section 7.3.
 
-**What Peter's code does**:
-```python
-if est_rep_weighted > max(B_i, est_pu) and max_rep >= B_i:
-```
-Adds a second condition `max_rep >= B_i`. With `B_R = 0.8` and payoffs in [0,1] (meaning reputation estimates converge toward ~0.5), `max_rep >= 0.8` is essentially never true.
+#### ROLE-3 (Medium)
+Indirect-follow redirect logic failed to redirect to the leader of a follower target.
 
-**Effect**: Even if Bug 1 were fixed (so `est_rep_weighted = gamma * max_rep ~1.0 > 0.8`), the extra check `max_rep >= 0.8` still blocks all following. Combined with Bug 1, no leader ever emerges.
+## Note on Fixed Code
 
-**Fix**: Remove the `and max_rep >= B_i` clause:
-```python
-if est_rep_weighted > max(B_i, est_pu):
-```
-
----
-
-## Bug 3 (Minor): Gossip Formula Deviates from Eq. 9
-
-**File/Line**: `update_reputation_estimates_gossip()`, lines ~210–240
-
-**Paper (Eq. 9)**:
-```
-s_i(k, t+1) = [Σ_{j∈B(t)\{k}} s_j(k,t) / |A(t)|] + v_i(k, t+1) − v_i(k, t)
-```
-The formula is: **all active agents' average** of `s_j` PLUS the **fresh delta** `Δv_i = v_i(k,t+1) - v_i(k,t)`.
-
-**What Peter's code does**:
-1. EMA toward the average of other active participants' estimates: `s_i[k] += eta * (avg - s_i[k])`
-2. Then separately, EMA toward the raw payoff: `s_i[k] += eta * (payoff - s_i[k])`
-
-This is EMA-toward-payoff, not `avg + fresh_delta`. The `fresh_delta` (`v_i(k,t+1) - v_i(k,t)`) is never computed and added.
-
-**Effect**: Reputation estimates converge more slowly and don't incorporate the incremental local observation correctly. This is a functional deviation but not a showstopper — the system still learns reputations, just less efficiently.
-
-**Note**: Implementing Eq. 9 exactly requires saving `v_i(k,t)` before the update step, computing the delta, and adding it directly (not via EMA). Peter's implementation in Phase 4 overwrites estimates without the clean additive-delta structure.
-
-**Partial Fix** (to exactly match Eq. 9): save `old_v` before `update_personal_benefit_estimates`, compute `delta_v = new_v - old_v`, then set `s_i(k) = avg_of_active + delta_v` (not EMA).
-
----
-
-## Bug 4 (Minor): Double Gossip Per Step
-
-**File/Line**: `step()` — Phase 4 (lines ~460–472) and Phase 5 (lines ~476–496)
-
-Phase 4 already does gossip averaging in `update_reputation_estimates_gossip()` (all active participants). Phase 5 then does an additional pairwise gossip step. This is redundant and not matching the paper's single gossip update per timestep.
-
-**Fix**: Either remove Phase 5 or remove the gossip averaging from Phase 4 (keep only Phase 5 pairwise gossip, which is simpler to implement correctly).
-
----
-
-## Bug 5 (Minor): Indirect Follower Check is Broken
-
-**File/Line**: `_update_roles_sequential()`, lines 570–573
-
-**Paper (Section 7.3)**: "If `L_i(s_n)` is already a follower, follow the influencer of `L_i(s_n)` instead."
-
-**What Peter's code does**:
-```python
-if best_k in [followers[f] for f in range(self.config.num_agents) if i in followers[f]]:
-```
-This checks if `best_k` is in the follower sets of agents who follow `i` — which makes no sense. It should check if `best_k` is itself a follower (i.e., `best_k in R`, or `self.agents[best_k].state.following is not None`).
-
-**Fix**:
-```python
-if best_k in R:  # best_k is already following someone
-    # Follow best_k's leader instead
-    best_k = self.agents[best_k].state.following or best_k
-```
-
----
-
-## Bug 6 (Non-Bug): Plot Save Path
-
-**File/Line**: `__main__`, line 915
-
-```python
-system.plot_results("/mnt/user-data/outputs/sections_6_7_corrected.png")
-```
-
-This path is a cloud storage path that doesn't exist locally. When running locally, this raises `FileNotFoundError`. Change to a local path like `"results_6_7.png"`.
-
----
-
-## Summary
-
-| # | Severity | Location | Description |
-|---|----------|----------|-------------|
-| 1 | **Critical** | `_update_roles_sequential` line 561 | Uses `estimated_reward_rep=0` instead of `max_rep` as `Ĵ^r_i` |
-| 2 | **Critical** | `_update_roles_sequential` line 565 | Extra `max_rep >= B_i` gate not in paper |
-| 3 | Minor | `update_reputation_estimates_gossip` | Not exactly Eq. 9: EMA-toward-payoff, not avg+fresh_delta |
-| 4 | Minor | `step()` phases 4+5 | Double gossip per timestep |
-| 5 | Minor | `_update_roles_sequential` line 570 | Indirect follower check logic is wrong |
-| 6 | Env issue | `__main__` line 915 | Plot save path doesn't exist locally |
-
-Bugs 1 and 2 together completely prevent leader emergence. All other bugs are secondary. Fixing Bugs 1 and 2 is sufficient to make the system produce meaningful results.
+`doc/code_debugged.py` uses these canonical IDs in inline comments (e.g., `[IR-1]`, `[REP-2]`, `[ROLE-3]`) so each fix point maps back to this catalog unambiguously.
