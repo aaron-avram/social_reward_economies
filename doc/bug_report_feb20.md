@@ -97,13 +97,15 @@ After participant updates, the baseline applied an additional pairwise gossip ph
 
 In the debugged code, the extra pairwise pass is removed, so gossip is applied once per step through participant updates.
 
-This prevents double-counting the same social signal and keeps convergence behaviour consistent with the single-step design.
+This prevents double-counting the same social signal and keeps convergence behaviour more tractable.
 
 ---
 
 ## Role Updates
 
-### Non-followers could not enter the reputation role from observed reputation
+### Reputation-role entry for non-followers was blocked
+
+Agents not already following someone could not switch into the reputation role, even when another agent had high observed reputation. In Step-1, the baseline used `estimated_reward_rep`, which typically stayed at 0 for non-followers, instead of using a signal derived from observed reputation.
 
 The baseline used `estimated_reward_rep` in Step-1, which is typically zero for non-followers:
 
