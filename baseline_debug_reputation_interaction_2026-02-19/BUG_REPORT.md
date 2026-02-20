@@ -1,4 +1,4 @@
-# Bug Report: `doc/code_old.py` (Grouped + Canonical IDs)
+# Bug Report: `src/code_old.py` (Grouped + Canonical IDs)
 
 Date: 2026-02-19
 
@@ -56,8 +56,8 @@ Legacy mapping from old inline labels:
 
 - Severity: **High**
 - Code:
-  - `doc/code_old.py:406` actor inclusion uses `random < actor_interaction_rate`
-  - `doc/code_old.py:412` participant inclusion uses `random < participant_interaction_rate`
+  - `src/code_old.py:406` actor inclusion uses `random < actor_interaction_rate`
+  - `src/code_old.py:412` participant inclusion uses `random < participant_interaction_rate`
 - Evidence:
   - `test_actor_activation_probability_uses_theta_of_mu`
   - `test_participant_activation_probability_uses_theta_of_mu`
@@ -71,7 +71,7 @@ Legacy mapping from old inline labels:
 
 - Severity: **High**
 - Code:
-  - `doc/code_old.py:271`–`doc/code_old.py:273` build candidates without self-filtering
+  - `src/code_old.py:271`–`src/code_old.py:273` build candidates without self-filtering
 - Evidence:
   - `test_identify_highest_reputation_excludes_self`
 - Impact:
@@ -83,8 +83,8 @@ Legacy mapping from old inline labels:
 - Spec (Section 6.4.3 Eq. 9):
   - `s_i(k,t+1) = avg_j s_j(k,t) + v_i(k,t+1)-v_i(k,t)`
 - Code:
-  - `doc/code_old.py:245`–`doc/code_old.py:246` EMA toward average
-  - `doc/code_old.py:254`–`doc/code_old.py:255` EMA toward raw payoff
+  - `src/code_old.py:245`–`src/code_old.py:246` EMA toward average
+  - `src/code_old.py:254`–`src/code_old.py:255` EMA toward raw payoff
 - Evidence:
   - `test_reputation_update_matches_eq9_additive_delta_structure` (`expected 0.8`, got `1.0`)
 - Impact:
@@ -94,7 +94,7 @@ Legacy mapping from old inline labels:
 
 - Severity: **Medium**
 - Code:
-  - `doc/code_old.py:481` onward
+  - `src/code_old.py:481` onward
 - Evidence:
   - `test_bug4_step_contains_extra_pairwise_gossip_after_participant_updates`
   - `test_bug_comments_run_2026-02-19.txt` shows estimates changed by Phase 5 even when Phase 4 reputation update is monkeypatched to no-op
@@ -107,7 +107,7 @@ Legacy mapping from old inline labels:
 
 - Severity: **High**
 - Code:
-  - `doc/code_old.py:571` uses `gamma * estimated_reward_rep` in Step-1
+  - `src/code_old.py:571` uses `gamma * estimated_reward_rep` in Step-1
 - Evidence:
   - `test_bug1_non_followers_do_not_switch_even_with_high_reputation_signal`
 - Impact:
@@ -117,7 +117,7 @@ Legacy mapping from old inline labels:
 
 - Severity: **High**
 - Code:
-  - `doc/code_old.py:583` requires
+  - `src/code_old.py:583` requires
   - `est_rep_weighted > max(B_i, est_pu) and max_rep >= B_i`
 - Evidence:
   - `test_step1_reputation_switch_uses_role_criterion_without_extra_rep_gate`
@@ -128,7 +128,7 @@ Legacy mapping from old inline labels:
 
 - Severity: **Medium**
 - Code:
-  - `doc/code_old.py:587`
+  - `src/code_old.py:587`
 - Evidence:
   - `test_bug5_indirect_following_redirect_not_applied`
 - Impact:

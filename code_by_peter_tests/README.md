@@ -2,7 +2,7 @@
 
 This suite validates bug-report fixes implemented in:
 
-- `/Users/xia/social_reward_economies/doc/code_by_peter.py`
+- `/Users/xia/social_reward_economies/src/code_debugged.py`
 
 ## Coverage
 

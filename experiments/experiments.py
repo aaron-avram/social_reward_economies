@@ -1,8 +1,8 @@
 """
 Four experiments (A–D) using Peter's MultiAgentSystem after bug fixes.
 
-Run from the doc/ directory:
-    python3 experiments.py
+Run from the project root:
+    python3 experiments/experiments.py
 
 Experiments:
   A: γ=0, κ=0 — Pure personal utility. Expect: no leader, all independent.
@@ -12,15 +12,20 @@ Experiments:
 """
 
 import sys
-import os
+from pathlib import Path
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Import from code_by_peter (same directory)
-sys.path.insert(0, os.path.dirname(__file__))
-from code_by_peter import SystemConfig, MultiAgentSystem, AgentRole
+# Make project root importable, then import debugged implementation from src/.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from src.code_debugged import SystemConfig, MultiAgentSystem, AgentRole
+
+OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ─── Shared helper ───────────────────────────────────────────────────────────
@@ -125,7 +130,7 @@ def experiment_A():
 
     summarize(results, "Experiment A: γ=0, κ=0")
     plot_follower_timeseries(results, "Experiment A: γ=0 κ=0 (No leader expected)",
-                             "exp_A_no_leader.png")
+                             str(OUTPUT_DIR / "exp_A_no_leader.png"))
     return results
 
 
@@ -147,7 +152,7 @@ def experiment_B():
 
     summarize(results, "Experiment B: γ=2.0, κ=0")
     plot_follower_timeseries(results, "Experiment B: γ=2.0 κ=0 (Leader expected)",
-                             "exp_B_reputation_only.png")
+                             str(OUTPUT_DIR / "exp_B_reputation_only.png"))
     return results
 
 
@@ -170,7 +175,7 @@ def experiment_C():
 
     summarize(results, "Experiment C: γ=2.0, κ=2.0")
     plot_follower_timeseries(results, "Experiment C: γ=2.0 κ=2.0 (Welfare-optimal norm expected)",
-                             "exp_C_full_algorithm.png")
+                             str(OUTPUT_DIR / "exp_C_full_algorithm.png"))
     return results
 
 
@@ -285,9 +290,10 @@ def experiment_D():
 
     plt.suptitle("Experiment D: Perturbation Test", fontsize=11, fontweight="bold")
     plt.tight_layout()
-    plt.savefig("exp_D_perturbation.png", dpi=120, bbox_inches="tight")
+    output_file = OUTPUT_DIR / "exp_D_perturbation.png"
+    plt.savefig(str(output_file), dpi=120, bbox_inches="tight")
     plt.close()
-    print("  Plot saved → exp_D_perturbation.png")
+    print(f"  Plot saved → {output_file}")
 
     return results_phase1, results_phase2
 

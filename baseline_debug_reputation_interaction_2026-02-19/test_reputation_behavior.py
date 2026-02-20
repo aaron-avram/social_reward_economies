@@ -1,4 +1,4 @@
-"""Reputation-focused regression tests for doc/code_old.py baseline.
+"""Reputation-focused regression tests for src/code_old.py baseline.
 
 These tests are derived from Sections 6.4 and 7.3 in
 learning_paper_newest_ver_transcription.md and inspired by the style in
@@ -15,7 +15,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE_PATH = ROOT / "doc" / "code_old.py"
+BASELINE_PATH = ROOT / "src" / "code_old.py"
 
 
 @pytest.fixture(scope="module")

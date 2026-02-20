@@ -1,4 +1,4 @@
-"""Interaction-rate-focused tests for doc/code_old.py baseline.
+"""Interaction-rate-focused tests for src/code_old.py baseline.
 
 Covers Section 6.2 activation probabilities and Section 6.7 Eq. (13).
 """
@@ -13,7 +13,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE_PATH = ROOT / "doc" / "code_old.py"
+BASELINE_PATH = ROOT / "src" / "code_old.py"
 
 
 @pytest.fixture(scope="module")

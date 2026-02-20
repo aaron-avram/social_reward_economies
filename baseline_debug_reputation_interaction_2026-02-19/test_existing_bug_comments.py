@@ -1,4 +1,4 @@
-"""Targeted checks for BUG 1, BUG 4, BUG 5 comments in doc/code_old.py.
+"""Targeted checks for BUG 1, BUG 4, BUG 5 comments in src/code_old.py.
 
 These tests are designed to verify whether the commented bug behaviors are
 indeed present in the current baseline implementation.
@@ -15,7 +15,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE_PATH = ROOT / "doc" / "code_old.py"
+BASELINE_PATH = ROOT / "src" / "code_old.py"
 
 
 @pytest.fixture(scope="module")

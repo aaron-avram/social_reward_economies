@@ -1,4 +1,4 @@
-"""Regression tests for bug fixes in doc/code_debugged.py.
+"""Regression tests for bug fixes in src/code_debugged.py.
 
 Organized by canonical bug IDs:
 - IR-1  : activation sampling must use theta(mu)=1-exp(-mu)
@@ -21,7 +21,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET_PATH = ROOT / "doc" / "code_debugged.py"
+TARGET_PATH = ROOT / "src" / "code_debugged.py"
 
 
 @pytest.fixture(scope="module")

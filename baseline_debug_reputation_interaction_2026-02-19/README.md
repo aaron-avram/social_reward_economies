@@ -1,6 +1,6 @@
 # Baseline Debug Package (Reputation + Interaction Rates)
 
-This directory contains a focused debug package for `doc/code_old.py`, centered on:
+This directory contains a focused debug package for `src/code_old.py`, centered on:
 
 - Reputation learning and role-switching logic
 - Interaction-rate sampling and update dynamics

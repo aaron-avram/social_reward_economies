@@ -1,6 +1,6 @@
 # Bug Catalog (Canonical IDs)
 
-This catalog uses grouped, stable IDs for the bugs originally identified in `doc/code_old.py`.
+This catalog uses grouped, stable IDs for the bugs originally identified in `src/code_old.py`.
 
 ## Canonical IDs
 
@@ -51,4 +51,4 @@ Indirect-follow redirect logic failed to redirect to the leader of a follower ta
 
 ## Note on Fixed Code
 
-`doc/code_debugged.py` uses these canonical IDs in inline comments (e.g., `[IR-1]`, `[REP-2]`, `[ROLE-3]`) so each fix point maps back to this catalog unambiguously.
+`src/code_debugged.py` uses these canonical IDs in inline comments (e.g., `[IR-1]`, `[REP-2]`, `[ROLE-3]`) so each fix point maps back to this catalog unambiguously.
