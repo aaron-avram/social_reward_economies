@@ -486,24 +486,34 @@ class MultiAgentSystem:
                     )
         
         # === PHASE 4: Updates for Active Participants (Section 6.4) ===
-        
+
+        # (4.1)
+        delta_v_by_agent = {}
         for agent in active_participants:
-            # Section 6.4.2: Update personal benefit estimates v_i(k,t)
-            personal_benefit_deltas = agent.update_personal_benefit_estimates(
+            delta_v_by_agent[agent.agent_id] = agent.update_personal_benefit_estimates(
                 observed_payoffs, eta_v_t
             )
-            
-            # Section 6.4.3: Update reputation estimates s_i(k,t) via gossip
-            agent.update_reputation_estimates_gossip(
-                personal_benefit_deltas, active_participants, eta_s_t
-            )
-            
-            # Section 6.4.4: Identify highest reputation agent
+
+        # (4.2) snapshot
+        snapshot_s = {}
+        for k in range(self.config.num_agents):
+            snapshot_s[k] = [
+                p.state.reputation_estimates.get(k, 0.0)
+                for p in active_participants
+            ]
+        avg_s = {k: float(np.mean(vals)) if len(vals) > 0 else 0.0 for k, vals in snapshot_s.items()}
+
+        # (4.3) s_i(k,t+1) = avg_s[k] + delta_v_i(k)
+        for agent in active_participants:
+            deltas = delta_v_by_agent[agent.agent_id]
+            for k in range(self.config.num_agents):
+                agent.state.reputation_estimates[k] = avg_s[k] + deltas.get(k, 0.0)
+
+        for agent in active_participants:
             agent.identify_highest_reputation_agent()
-            
-            # Section 6.7: Update actor interaction rates
             agent.update_actor_interaction_rate(alpha_rate_t)
-        
+
+
         # [REP-3] No second gossip pass here.
         # Reputation averaging already happens in Phase 4; a second pass per step
         # would double-count gossip and distort convergence behavior.
