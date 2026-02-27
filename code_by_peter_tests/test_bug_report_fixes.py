@@ -132,7 +132,7 @@ def test_rep2_reputation_update_matches_eq9_additive_structure(model_module):
 # ==================== REP-3 ====================
 
 def test_rep3_no_extra_phase5_pairwise_gossip_strict_noop_phase4(model_module):
-    """Primary REP-3 check: if Phase-4 is forced to no-op, step should not mutate estimates."""
+    """Primary REP-3 check under current code path: only one reputation-averaging pass."""
     system = make_system(
         model_module,
         num_agents=2,
@@ -148,52 +148,58 @@ def test_rep3_no_extra_phase5_pairwise_gossip_strict_noop_phase4(model_module):
     a0.state.reputation_estimates = {0: 0.0, 1: 0.0}
     a1.state.reputation_estimates = {0: 10.0, 1: 10.0}
 
-    def _noop_personal_benefit(self, observed_payoffs, eta_v_t):
-        return {k: 0.0 for k in observed_payoffs}
+    # Force distinct per-agent deltas so a second gossip pass would be visible.
+    def _deltas_a0(self, observed_payoffs, eta_v_t):
+        return {0: 1.0, 1: 0.0}
 
-    def _noop_gossip(self, personal_benefit_deltas, other_agents_list, eta_s_t):
-        return None
+    def _deltas_a1(self, observed_payoffs, eta_v_t):
+        return {0: -1.0, 1: 0.0}
 
-    # Disable Phase-4 estimate changes so any mutation would indicate extra gossip pass.
-    a0.update_personal_benefit_estimates = types.MethodType(_noop_personal_benefit, a0)
-    a1.update_personal_benefit_estimates = types.MethodType(_noop_personal_benefit, a1)
-    a0.update_reputation_estimates_gossip = types.MethodType(_noop_gossip, a0)
-    a1.update_reputation_estimates_gossip = types.MethodType(_noop_gossip, a1)
+    a0.update_personal_benefit_estimates = types.MethodType(_deltas_a0, a0)
+    a1.update_personal_benefit_estimates = types.MethodType(_deltas_a1, a1)
 
     np.random.seed(0)
     system.step()
 
-    assert a0.state.reputation_estimates[0] == pytest.approx(0.0, abs=1e-12)
-    assert a1.state.reputation_estimates[0] == pytest.approx(10.0, abs=1e-12)
+    # Single pass expectation:
+    # avg_s[0] = (0 + 10)/2 = 5 -> a0: 5 + 1 = 6, a1: 5 - 1 = 4
+    # With an extra pairwise gossip pass (alpha=1), both would collapse to 5.
+    assert a0.state.reputation_estimates[0] == pytest.approx(6.0, abs=1e-12)
+    assert a1.state.reputation_estimates[0] == pytest.approx(4.0, abs=1e-12)
 
 
 def test_rep3_no_extra_phase5_pairwise_gossip_legacy_scenario(model_module):
-    """Legacy scenario from old bug-comment test, now under canonical REP-3 grouping."""
+    """Secondary REP-3 check with partial gossip alpha; still should reflect single-pass values."""
     system = make_system(
         model_module,
         num_agents=2,
-        extra_config=dict(gossip_rate=1.0, gossip_alpha=1.0, u_0=0.0),
+        extra_config=dict(gossip_rate=1.0, gossip_alpha=0.5, u_0=0.0),
     )
     a0, a1 = system.agents
 
     for a in (a0, a1):
         a.state.actor_interaction_rate = 0.0
-        a.state.participant_interaction_rate = 1.0
+        a.state.participant_interaction_rate = 100.0
 
     a0.state.reputation_estimates = {0: 0.0, 1: 0.0}
     a1.state.reputation_estimates = {0: 10.0, 1: 10.0}
 
-    def _noop_gossip(self, personal_benefit_deltas, other_agents_list, eta_s_t):
-        return None
+    def _deltas_a0(self, observed_payoffs, eta_v_t):
+        return {0: 1.0, 1: 0.0}
 
-    a0.update_reputation_estimates_gossip = types.MethodType(_noop_gossip, a0)
-    a1.update_reputation_estimates_gossip = types.MethodType(_noop_gossip, a1)
+    def _deltas_a1(self, observed_payoffs, eta_v_t):
+        return {0: -1.0, 1: 0.0}
+
+    a0.update_personal_benefit_estimates = types.MethodType(_deltas_a0, a0)
+    a1.update_personal_benefit_estimates = types.MethodType(_deltas_a1, a1)
 
     np.random.seed(0)
     system.step()
 
-    assert a0.state.reputation_estimates[0] == pytest.approx(0.0, abs=1e-12)
-    assert a1.state.reputation_estimates[0] == pytest.approx(10.0, abs=1e-12)
+    # Without a second pass: 6 and 4.
+    # With an extra pass at alpha=0.5: 5.5 and 4.5.
+    assert a0.state.reputation_estimates[0] == pytest.approx(6.0, abs=1e-12)
+    assert a1.state.reputation_estimates[0] == pytest.approx(4.0, abs=1e-12)
 
 
 # ==================== ROLE-1 ====================
@@ -359,3 +365,161 @@ def test_role3_redirect_legacy_scenario(model_module):
 
     assert i.state.role == AgentRole.REPUTATION
     assert i.state.following == 2
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# ROLE-4: Prevent self-following after redirect
+# ───────────────────────────────────────────────────────────────────────────
+
+def test_role_4_no_self_following_after_redirect(model_module):
+    """
+    [ROLE-4] Ensure agent cannot follow itself after redirect chain.
+
+    Scenario: Agent 0 selects Agent 1 as highest reputation.
+              Agent 1 is a follower, following Agent 0.
+              Redirect would set Agent 0 to follow itself.
+              Fix: Agent 0 should stay in PERSONAL_UTILITY instead.
+    """
+    config = model_module.SystemConfig(
+        num_agents=3,
+        num_states=2,
+        num_actions=2,
+        gamma=2.0,
+        kappa=0.0,
+        B_R=0.1,
+        B_F=0.05
+    )
+    system = model_module.MultiAgentSystem(config)
+
+    # Setup: Agent 0 selects Agent 1 (highest rep)
+    # Agent 1 is following Agent 0 (would create self-loop via redirect)
+    agent_0 = system.agents[0]
+    agent_1 = system.agents[1]
+
+    # Agent 0 starts in PU role, sees Agent 1 as highest reputation
+    agent_0.state.role = model_module.AgentRole.PERSONAL_UTILITY
+    agent_0.state.following = None
+    agent_0.state.estimated_reward_pu = 0.1
+    agent_0.state.estimated_reward_rep = 1.0  # High enough for role switch
+    agent_0.state.reputation_estimates = {1: 2.0, 2: 0.5}
+    agent_0.state.highest_rep_agent_estimate = 1
+    agent_0.state.followers = set()
+
+    # Agent 1 is already following Agent 0
+    agent_1.state.role = model_module.AgentRole.REPUTATION
+    agent_1.state.following = 0
+    agent_1.state.followers = set()
+
+    # Simulate role update
+    system._update_roles_sequential()
+
+    # ROLE-4 fix: Agent 0 should NOT follow itself
+    # After redirect: best_k = 1's leader = 0 (self), so skip following
+    assert agent_0.state.following != 0, "Agent 0 should not follow itself"
+    assert agent_0.state.role == model_module.AgentRole.PERSONAL_UTILITY, "Agent 0 should stay in PU role"
+    assert 0 not in agent_0.state.followers, "Agent 0 should not be in its own followers"
+    assert len(agent_0.state.followers) < config.num_agents, "Follower count should be < num_agents"
+
+
+def test_role_5_redirect_followers_when_leader_becomes_follower(model_module):
+    """
+    [ROLE-5] When an agent becomes a follower, redirect its existing followers.
+
+    Scenario: Agent 1 has NO followers initially, decides to follow Agent 3.
+              During the same update, Agent 0 (processed earlier) decides to follow Agent 1.
+              Without ROLE-5 fix: Agent 0 follows Agent 1, Agent 1 follows Agent 3 (multi-level).
+              With ROLE-5 fix: Agent 0 gets redirected to Agent 3 when Agent 1 becomes follower.
+    """
+    config = model_module.SystemConfig(
+        num_agents=4,
+        num_states=2,
+        num_actions=2,
+        gamma=2.0,
+        kappa=0.0,
+        B_R=0.1,
+        B_F=0.05
+    )
+    system = model_module.MultiAgentSystem(config)
+
+    agent_0 = system.agents[0]
+    agent_1 = system.agents[1]
+    agent_2 = system.agents[2]
+    agent_3 = system.agents[3]
+
+    # Setup: All agents start with no followers (qualify for STEP 1)
+    # Agent 0 will select Agent 1 as highest rep
+    # Agent 1 will select Agent 3 as highest rep
+    # Processing order matters: if 0 processed before 1, we get multi-level chain
+
+    agent_0.state.role = model_module.AgentRole.PERSONAL_UTILITY
+    agent_0.state.following = None
+    agent_0.state.followers = set()
+    agent_0.state.estimated_reward_pu = 0.05
+    agent_0.state.reputation_estimates = {1: 3.0, 2: 1.0, 3: 1.0}
+    agent_0.state.highest_rep_agent_estimate = 1  # Wants to follow Agent 1
+
+    agent_1.state.role = model_module.AgentRole.PERSONAL_UTILITY
+    agent_1.state.following = None
+    agent_1.state.followers = set()  # NO followers initially
+    agent_1.state.estimated_reward_pu = 0.05
+    agent_1.state.reputation_estimates = {0: 1.0, 2: 1.0, 3: 5.0}
+    agent_1.state.highest_rep_agent_estimate = 3  # Wants to follow Agent 3
+
+    agent_2.state.role = model_module.AgentRole.PERSONAL_UTILITY
+    agent_2.state.following = None
+    agent_2.state.followers = set()
+
+    agent_3.state.role = model_module.AgentRole.PERSONAL_UTILITY
+    agent_3.state.following = None
+    agent_3.state.followers = set()
+
+    # Force processing order: Agent 0, then Agent 1 (simulates worst case)
+    np.random.seed(42)  # Seed for deterministic shuffle
+
+    # Run role update
+    system._update_roles_sequential()
+
+    # ROLE-5 fix: When Agent 1 becomes follower, Agent 0 should be redirected
+    # Expected final state: Agent 0 → Agent 3, Agent 1 → Agent 3 (NO multi-level chain)
+    assert agent_1.state.following == 3, "Agent 1 should follow Agent 3"
+    assert len(agent_1.state.followers) == 0, "Agent 1 should have no followers"
+
+    # Agent 0 should follow Agent 3 (redirected from Agent 1)
+    assert agent_0.state.following == 3, "Agent 0 should be redirected to Agent 3 (not Agent 1)"
+    assert agent_0.state.following != 1, "Agent 0 should NOT follow Agent 1 (would create multi-level chain)"
+
+
+# ==================== STATUS ENTRY ====================
+
+def test_status_entry_can_occur_after_status_reward_learning(model_module):
+    """
+    Status-role entry regression:
+    estimated_reward_status must be learnable before STATUS entry so Step-2 can fire.
+    """
+    system = make_system(
+        model_module,
+        num_agents=8,
+        extra_config=dict(
+            gamma=2.0,
+            kappa=2.0,
+            c_threshold=0.1,
+            role_update_base_interval=1,
+            u_0=0.0,
+        ),
+    )
+    AgentRole = model_module.AgentRole
+
+    np.random.seed(123)
+    for _ in range(2000):
+        system.step()
+
+    min_followers = max(1, int(system.config.c_threshold * system.config.num_agents))
+    max_follower_seen = max(max(step_counts) for step_counts in system.results["follower_counts"])
+    max_status_seen = max(
+        sum(1 for role in roles if role == AgentRole.STATUS)
+        for roles in system.results["roles_history"]
+    )
+
+    # Ensure Step-2 eligibility is reached and STATUS becomes reachable in practice.
+    assert max_follower_seen >= min_followers
+    assert max_status_seen >= 1

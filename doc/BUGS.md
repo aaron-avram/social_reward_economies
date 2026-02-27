@@ -11,6 +11,9 @@ This catalog uses grouped, stable IDs for the bugs originally identified in `src
 - `ROLE-1`: Non-followers must bootstrap reputation-role entry from observed reputation signal
 - `ROLE-2`: Remove extra `max_rep >= B_i` gate from Step-1 follow condition
 - `ROLE-3`: Redirect if selected follow target is itself a follower
+- `ROLE-4`: Prevent self-following when redirect chain points back to agent itself
+- `ROLE-5`: Clear and redirect followers when agent becomes a follower
+- `STATUS-1`: Status entry gate used `estimated_reward_status`, but this signal was only updated while already in STATUS
 
 Legacy mapping from old inline labels:
 
@@ -49,6 +52,17 @@ Step-1 follow condition added extra gate `max_rep >= B_i`, which is not in Secti
 #### ROLE-3 (Medium)
 Indirect-follow redirect logic failed to redirect to the leader of a follower target.
 
+#### ROLE-4 (High)
+After ROLE-3 redirect, no check prevented `best_k == i` (agent following itself). Redirect chains could point back to the agent, causing impossible follower counts (n followers with only n agents).
+
+#### ROLE-5 (High)
+When agent becomes a follower, existing followers were not redirected. Caused multi-level chains (A→B→C) and invalid states (agent following someone but still having followers). ROLE-3 alone insufficient due to processing order dependency.
+
+### Status Updates
+
+#### STATUS-1 (High)
+Step-2 status entry checks `kappa * estimated_reward_status > estimated_reward_pu`, but `estimated_reward_status` was only updated inside the STATUS-actor branch. In practice, agents could reach follower eligibility yet never accumulate enough status-reward signal to enter STATUS. Fix: update `estimated_reward_status` for follower-holding active actors before role-specific branching so Step-2 can evaluate a meaningful signal.
+
 ## Note on Fixed Code
 
-`src/code_debugged.py` uses these canonical IDs in inline comments (e.g., `[IR-1]`, `[REP-2]`, `[ROLE-3]`) so each fix point maps back to this catalog unambiguously.
+`src/code_debugged.py` uses these canonical IDs in inline comments (e.g., `[IR-1]`, `[REP-2]`, `[ROLE-3]`, `[STATUS-1]`) so each fix point maps back to this catalog unambiguously.

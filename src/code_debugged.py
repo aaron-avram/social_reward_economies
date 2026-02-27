@@ -16,6 +16,9 @@ BUG FIX ID MAP (grouped):
 - ROLE-1: Non-followers bootstrap reputation-role entry via γ*s_i(L_i,t)
 - ROLE-2: Remove extra gate `max_rep >= B_i` in Step-1 follow decision
 - ROLE-3: Redirect if selected leader is itself a follower
+- ROLE-4: Prevent self-following when redirect chain points back to agent
+- ROLE-5: Redirect existing followers when an agent becomes a follower
+- STATUS-1: Update status reward signal before Step-2 gate so STATUS entry is reachable
 """
 
 import numpy as np
@@ -461,6 +464,21 @@ class MultiAgentSystem:
             agent = self.agents[agent_id]
             state, action = actions[agent_id]
             payoff = this_step_payoffs[agent_id]
+
+            # [STATUS-1] Keep status-reward estimates current for any agent that currently has
+            # followers. Step-2 role selection compares kappa * J^s_i against J^pu_i,
+            # so J^s_i must be learned even before the agent enters STATUS role.
+            social_support_sum = 0.0
+            if len(agent.state.followers) > 0:
+                followers_payoffs = [
+                    this_step_payoffs.get(f, 0.0) for f in agent.state.followers
+                    if f in active_participant_ids  # Only active participants provide support
+                ]
+                social_support_sum = sum(followers_payoffs)
+                if agent.state.role != AgentRole.STATUS:
+                    agent.state.estimated_reward_status += eta_J_t * (
+                        social_support_sum - agent.state.estimated_reward_status
+                    )
             
             if agent.state.role == AgentRole.PERSONAL_UTILITY:
                 # Section 6.3: Update personal utility
@@ -475,12 +493,6 @@ class MultiAgentSystem:
             elif agent.state.role == AgentRole.STATUS:
                 # Section 6.5: Status agent receives social support from followers
                 if len(agent.state.followers) > 0:
-                    # Sum of follower payoffs (NOT average!) - Eq. (11)
-                    followers_payoffs = [
-                        this_step_payoffs.get(f, 0.0) for f in agent.state.followers
-                        if f in active_participant_ids  # Only active participants provide support
-                    ]
-                    social_support_sum = sum(followers_payoffs)
                     agent.update_status_optimization(
                         state, action, social_support_sum, beta_status_t, eta_J_t
                     )
@@ -602,14 +614,30 @@ class MultiAgentSystem:
                 # best_k's leader instead to prevent indirect follower chains.
                 if best_k in R and self.agents[best_k].state.following is not None:
                     best_k = self.agents[best_k].state.following
-                
+
+                # [ROLE-4] After redirect, ensure we don't follow ourselves
+                # (can happen if redirect chain points back to i)
+                if best_k == i:
+                    # Skip following - stay in personal utility instead
+                    continue
+
                 # Update role and follower relationships
                 if i in R:
                     # Was already following, change to new leader
                     old_leader = agent.state.following
                     if old_leader is not None:
                         followers[old_leader].discard(i)
-                
+
+                # [ROLE-5] When agent i becomes a follower, redirect i's own followers
+                # to i's new leader (best_k) to prevent multi-level chains.
+                # This handles the case where i was previously a leader (e.g., from STATUS
+                # role) and now switches to REPUTATION role following best_k.
+                if len(followers[i]) > 0:
+                    for follower_id in list(followers[i]):
+                        self.agents[follower_id].state.following = best_k
+                        followers[best_k].add(follower_id)
+                    followers[i].clear()
+
                 agent.state.role = AgentRole.REPUTATION
                 agent.state.following = best_k
                 followers[best_k].add(i)
@@ -628,6 +656,8 @@ class MultiAgentSystem:
                 agent = self.agents[i]
                 
                 # Decision: should optimize status?
+                # [STATUS-1] This gate relies on estimated_reward_status being updated
+                # before role assignment (handled in Phase 3 for follower-holding actors).
                 if self.config.kappa * agent.state.estimated_reward_status > agent.state.estimated_reward_pu:
                     agent.state.role = AgentRole.STATUS
                     if agent.state.following is not None:
