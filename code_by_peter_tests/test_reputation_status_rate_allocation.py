@@ -81,6 +81,195 @@ def test_interaction_rate_direction_and_bounds(model_module):
     assert 0.0 <= agent.state.actor_interaction_rate <= system.config.M
 
 
+def test_ir_eq13_exact_one_step_value(model_module):
+    """Section 6.7 Eq. (13): one-step actor-rate update matches the exact formula."""
+    system = make_system(
+        model_module,
+        num_agents=1,
+        extra_config=dict(M=1.0, u_0=0.1, gamma=2.0, kappa=3.0),
+    )
+    agent = system.agents[0]
+
+    agent.state.actor_interaction_rate = 0.3
+    agent.state.estimated_reward_pu = 0.4
+    agent.state.estimated_reward_rep = 0.1
+    agent.state.estimated_reward_status = 0.2
+
+    alpha_rate = 0.05
+    mu_prev = 0.3
+
+    h_hat = max(
+        agent.state.estimated_reward_pu,
+        system.config.gamma * agent.state.estimated_reward_rep,
+        system.config.kappa * agent.state.estimated_reward_status,
+    )
+    expected = np.clip(
+        mu_prev
+        + alpha_rate
+        * (
+            -np.exp(-(system.config.M - mu_prev)) * system.config.u_0
+            + np.exp(-mu_prev) * h_hat
+        ),
+        0.0,
+        system.config.M,
+    )
+
+    agent.update_actor_interaction_rate(alpha_rate)
+    assert agent.state.actor_interaction_rate == pytest.approx(expected, abs=1e-12)
+
+
+def test_ir_eq13_uses_weighted_max_gamma_kappa(model_module):
+    """Eq. (13) must use max{Jpu, gamma*Jr, kappa*Js}, not unweighted reward max."""
+    system = make_system(
+        model_module,
+        num_agents=1,
+        extra_config=dict(M=1.0, u_0=0.1, gamma=2.0, kappa=0.1),
+    )
+    agent = system.agents[0]
+
+    mu_prev = 0.4
+    alpha_rate = 0.3
+    agent.state.actor_interaction_rate = mu_prev
+
+    # Weighted max should be gamma*Jr = 0.8.
+    # Unweighted max would be Jpu = 0.55.
+    agent.state.estimated_reward_pu = 0.55
+    agent.state.estimated_reward_rep = 0.4
+    agent.state.estimated_reward_status = 0.1
+
+    weighted_h = max(
+        agent.state.estimated_reward_pu,
+        system.config.gamma * agent.state.estimated_reward_rep,
+        system.config.kappa * agent.state.estimated_reward_status,
+    )
+    unweighted_h = max(
+        agent.state.estimated_reward_pu,
+        agent.state.estimated_reward_rep,
+        agent.state.estimated_reward_status,
+    )
+    assert weighted_h != unweighted_h
+
+    expected_weighted = np.clip(
+        mu_prev
+        + alpha_rate
+        * (
+            -np.exp(-(system.config.M - mu_prev)) * system.config.u_0
+            + np.exp(-mu_prev) * weighted_h
+        ),
+        0.0,
+        system.config.M,
+    )
+    expected_unweighted = np.clip(
+        mu_prev
+        + alpha_rate
+        * (
+            -np.exp(-(system.config.M - mu_prev)) * system.config.u_0
+            + np.exp(-mu_prev) * unweighted_h
+        ),
+        0.0,
+        system.config.M,
+    )
+
+    agent.update_actor_interaction_rate(alpha_rate)
+
+    assert agent.state.actor_interaction_rate == pytest.approx(expected_weighted, abs=1e-12)
+    assert agent.state.actor_interaction_rate != pytest.approx(expected_unweighted, abs=1e-6)
+
+
+def test_ir_participant_rate_remains_constant_over_steps(model_module):
+    """Section 6.2/6.1.2 assumption: participant rates mu_p,i are fixed over time."""
+    system = make_system(
+        model_module,
+        num_agents=5,
+        extra_config=dict(role_update_base_interval=10**9, u_0=0.0),
+    )
+
+    initial_participant_rates = [a.state.participant_interaction_rate for a in system.agents]
+
+    np.random.seed(101)
+    for _ in range(300):
+        system.step()
+
+    final_participant_rates = [a.state.participant_interaction_rate for a in system.agents]
+    assert final_participant_rates == initial_participant_rates
+
+
+def test_ir_actor_participant_sampling_are_independent(model_module):
+    """Section 6.2: actor and participant inclusion are sampled independently."""
+    system = make_system(
+        model_module,
+        num_agents=1,
+        extra_config=dict(role_update_base_interval=10**9, u_0=0.0),
+    )
+    agent = system.agents[0]
+    agent.state.actor_interaction_rate = 0.8
+    agent.state.participant_interaction_rate = 0.6
+
+    # Keep mu_a fixed through the run so frequencies are stationary.
+    agent.state.estimated_reward_pu = 0.0
+    agent.state.estimated_reward_rep = 0.0
+    agent.state.estimated_reward_status = 0.0
+
+    np.random.seed(202)
+    for _ in range(20000):
+        system.step()
+
+    actor_active = np.array(system.results["actor_counts"], dtype=float)  # 0/1 for num_agents=1
+    participant_active = np.array(system.results["participant_counts"], dtype=float)  # 0/1
+
+    p_actor = float(np.mean(actor_active))
+    p_participant = float(np.mean(participant_active))
+    p_joint = float(np.mean((actor_active == 1.0) & (participant_active == 1.0)))
+
+    assert abs(p_joint - p_actor * p_participant) < 0.02
+
+
+def test_ir_alpha_rate_schedule_decreases_with_time(model_module):
+    """Assumption 5 style schedule: actor-rate stepsize alpha_rate_t should decrease over time."""
+    system = make_system(model_module, num_agents=1)
+    agent = system.agents[0]
+
+    # Choose state so update_delta > 0 and clipping does not activate.
+    agent.state.estimated_reward_pu = 1.0
+    agent.state.estimated_reward_rep = 0.0
+    agent.state.estimated_reward_status = 0.0
+
+    mu_prev = 0.5
+    alpha_t1 = 0.01 / (1.0 + 1 * 0.005)
+    alpha_t1000 = 0.01 / (1.0 + 1000 * 0.005)
+
+    assert alpha_t1 > alpha_t1000 > 0.0
+
+    agent.state.actor_interaction_rate = mu_prev
+    agent.update_actor_interaction_rate(alpha_t1)
+    delta_early = agent.state.actor_interaction_rate - mu_prev
+
+    agent.state.actor_interaction_rate = mu_prev
+    agent.update_actor_interaction_rate(alpha_t1000)
+    delta_late = agent.state.actor_interaction_rate - mu_prev
+
+    assert abs(delta_early) > abs(delta_late)
+
+
+def test_ir_u0_effect_when_h_zero(model_module):
+    """With H_hat=0 and u0>0, Eq. (13) should reduce in-group actor rate."""
+    system = make_system(
+        model_module,
+        num_agents=1,
+        extra_config=dict(M=1.0, u_0=0.3, gamma=2.0, kappa=2.0),
+    )
+    agent = system.agents[0]
+
+    agent.state.actor_interaction_rate = 0.6
+    agent.state.estimated_reward_pu = 0.0
+    agent.state.estimated_reward_rep = 0.0
+    agent.state.estimated_reward_status = 0.0
+
+    old_mu = agent.state.actor_interaction_rate
+    agent.update_actor_interaction_rate(alpha_rate=0.1)
+    assert agent.state.actor_interaction_rate < old_mu
+
+
 # ==================== REPUTATION LEARNING ====================
 
 def test_rep1_highest_reputation_selection_excludes_self(model_module):
@@ -380,29 +569,55 @@ def test_status_reward_uses_sum_not_average(model_module):
 
 
 def test_status_entry_can_occur_after_status_reward_learning(model_module):
+    """
+    Deterministic STATUS-1 check:
+    1) A non-STATUS agent with followers gets pre-STATUS reward-signal update in Phase 3.
+    2) Step-2 role update uses that updated signal to switch the agent to STATUS.
+    """
     system = make_system(
         model_module,
-        num_agents=8,
+        num_agents=3,
         extra_config=dict(
+            num_states=3,
+            num_actions=2,
             gamma=2.0,
-            kappa=2.0,
-            c_threshold=0.1,
+            kappa=50.0,
+            c_threshold=0.1,  # min_followers = 1
             role_update_base_interval=1,
             u_0=0.0,
         ),
     )
     AgentRole = model_module.AgentRole
 
+    leader = system.agents[0]
+    follower = system.agents[1]
+
+    # Leader starts as non-STATUS with one follower, so Step-2 eligibility is guaranteed.
+    leader.state.role = AgentRole.PERSONAL_UTILITY
+    leader.state.followers = {1}
+    leader.state.estimated_reward_pu = 0.0
+    leader.state.estimated_reward_status = 0.0
+
+    # Force leader action to 1 (leader preferred action is 0), so PU reward stays low.
+    leader.state.weights_pu[:] = np.array([[-10.0, 10.0], [-10.0, 10.0], [-10.0, 10.0]])
+
+    # Follower is active and follows leader policy; follower preferred action is 1, so support payoff is high.
+    follower.state.role = AgentRole.REPUTATION
+    follower.state.following = 0
+    follower.state.followers = set()
+
+    # Ensure both leader and follower participate in actor/participant sets at this step.
+    leader.state.actor_interaction_rate = 100.0
+    leader.state.participant_interaction_rate = 100.0
+    follower.state.actor_interaction_rate = 100.0
+    follower.state.participant_interaction_rate = 100.0
+
+    # Keep third agent effectively inactive to isolate the transition.
+    system.agents[2].state.actor_interaction_rate = 0.0
+    system.agents[2].state.participant_interaction_rate = 0.0
+
     np.random.seed(123)
-    for _ in range(2000):
-        system.step()
+    system.step()
 
-    min_followers = max(1, int(system.config.c_threshold * system.config.num_agents))
-    max_follower_seen = max(max(step_counts) for step_counts in system.results["follower_counts"])
-    max_status_seen = max(
-        sum(1 for role in roles if role == AgentRole.STATUS)
-        for roles in system.results["roles_history"]
-    )
-
-    assert max_follower_seen >= min_followers
-    assert max_status_seen >= 1
+    assert leader.state.estimated_reward_status > 0.0
+    assert leader.state.role == AgentRole.STATUS

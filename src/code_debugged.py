@@ -13,6 +13,9 @@ BUG FIX ID MAP (grouped):
 - REP-1: Highest-reputation selection must exclude self (C\{i})
 - REP-2: Reputation update must follow Eq. (9): avg reputation + Δv
 - REP-3: Remove extra per-step pairwise gossip pass
+- REP-4: Personal-benefit estimates v_i(k,t) must update for all agents each step
+- REP-5: Reputation followers must emulate leader's active-role policy (PU vs STATUS)
+- REP-6: Reputation reward estimate must match followed-agent reputation s_i(k,t)
 - ROLE-1: Non-followers bootstrap reputation-role entry via γ*s_i(L_i,t)
 - ROLE-2: Remove extra gate `max_rep >= B_i` in Step-1 follow decision
 - ROLE-3: Redirect if selected leader is itself a follower
@@ -149,14 +152,21 @@ class Agent:
         logits = weights[state, :]
         exp_logits = np.exp(logits - np.max(logits))
         return exp_logits / (np.sum(exp_logits) + 1e-8)
+
+    def get_behavior_weights(self) -> np.ndarray:
+        """Return role-consistent behavior weights w_i(t) used for imitation."""
+        if self.state.role == AgentRole.STATUS:
+            return self.state.weights_status
+        return self.state.weights_pu
     
     def select_action(self, state: int) -> int:
         """Select action based on current role"""
         self.last_state = state
         
         if self.state.role == AgentRole.REPUTATION and self.state.following is not None:
-            # Follow leader's policy (Section 6.4.5)
-            leader_weights = self.system.agents[self.state.following].state.weights_pu
+            # [REP-5] Followers emulate the leader's active-role policy w_k(t):
+            # status weights for STATUS leaders, PU weights otherwise.
+            leader_weights = self.system.agents[self.state.following].get_behavior_weights()
             policy = self.get_softmax_policy(state, leader_weights)
         elif self.state.role == AgentRole.STATUS:
             # Use status-optimized policy
@@ -329,13 +339,16 @@ class Agent:
         """
         if self.state.following is not None and self.state.following != self.agent_id:
             leader = self.system.agents[self.state.following]
-            self.state.weights_pu = np.copy(leader.state.weights_pu)
+            # [REP-5] Copy role-consistent leader behavior w_k(t), not always w_k^pu.
+            self.state.weights_pu = np.copy(leader.get_behavior_weights())
     
-    def update_reputation_reward_estimate(self, leader_payoff: float, eta_J_t: float):
+    def update_reputation_reward_estimate(self, followed_rep_estimate: float, eta_J_t: float = None):
         """
-        Update estimated reward from reputation optimization
+        [REP-6] Section 6.6:
+        For active reputation optimizers, J^r_i(t) is the current reputation
+        estimate of followed agent k, i.e., s_i(k,t), not an EMA of leader payoff.
         """
-        self.state.estimated_reward_rep += eta_J_t * (leader_payoff - self.state.estimated_reward_rep)
+        self.state.estimated_reward_rep = followed_rep_estimate
     
     # ==================== Section 6.7: Actor Interaction Rates ====================
     
@@ -487,8 +500,12 @@ class MultiAgentSystem:
             elif agent.state.role == AgentRole.REPUTATION:
                 # Section 6.4.5: Reputation agent gets social support from leader
                 if agent.state.following is not None:
-                    leader_payoff = this_step_payoffs.get(agent.state.following, 0.0)
-                    agent.update_reputation_reward_estimate(leader_payoff, eta_J_t)
+                    # [REP-6] Use current followed-agent reputation estimate s_i(k,t).
+                    followed_rep_estimate = agent.state.reputation_estimates.get(
+                        agent.state.following,
+                        0.0,
+                    )
+                    agent.update_reputation_reward_estimate(followed_rep_estimate, eta_J_t)
             
             elif agent.state.role == AgentRole.STATUS:
                 # Section 6.5: Status agent receives social support from followers
@@ -500,8 +517,10 @@ class MultiAgentSystem:
         # === PHASE 4: Updates for Active Participants (Section 6.4) ===
 
         # (4.1)
+        # [REP-4] Section 6.4.2 updates v_i(k,t) for every agent i each step
+        # (active k use observed payoff, inactive k decay via zero payoff).
         delta_v_by_agent = {}
-        for agent in active_participants:
+        for agent in self.agents:
             delta_v_by_agent[agent.agent_id] = agent.update_personal_benefit_estimates(
                 observed_payoffs, eta_v_t
             )
