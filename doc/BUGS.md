@@ -8,6 +8,9 @@ This catalog uses grouped, stable IDs for the bugs originally identified in `src
 - `REP-1`: Highest-reputation selection must exclude self (`C\\{i}`)
 - `REP-2`: Reputation update must follow Eq. (9) additive form (`avg + delta_v`)
 - `REP-3`: Remove extra pairwise gossip pass in the same timestep
+- `REP-4`: Personal-benefit estimates `v_i(k,t)` must update for all agents each step (not only active participants)
+- `REP-5`: Reputation followers must emulate the leader's active-role policy (`w_k(t)`, PU vs STATUS), not always `w_k^pu`
+- `REP-6`: Reputation reward estimate `\hat J_i^r(t)` must match `s_i(k,t)` for followed agent `k` (Section 6.6)
 - `ROLE-1`: Non-followers must bootstrap reputation-role entry from observed reputation signal
 - `ROLE-2`: Remove extra `max_rep >= B_i` gate from Step-1 follow condition
 - `ROLE-3`: Redirect if selected follow target is itself a follower
@@ -41,6 +44,15 @@ Reputation update deviated from Eq. (9): implementation used EMA-style updates i
 #### REP-3 (Medium)
 A second pairwise gossip update occurred in Phase 5 after Phase 4 already applied gossip updates.
 
+#### REP-4 (High)
+Section 6.4.2 specifies that each agent updates personal-benefit estimates `v_i(k,t)` for all agents every step (active agents via observed payoff; inactive agents via zero-payoff decay). Current `src/code_debugged.py` updates `v_i` only for agents active as participants.
+
+#### REP-5 (High)
+Section 6.4.5 specifies followers emulate leader behavior using `w_k(t)`, which is `w_k^pu(t)` if leader is in `P(t)` and `w_k^s(t)` otherwise. Current implementation routes reputation followers through leader `weights_pu` only, so they do not follow a STATUS leader's status policy.
+
+#### REP-6 (High)
+Section 6.6 specifies that active reputation-optimizing agents update reward estimate as `\hat J_i^r(t)=s_i(k,t)` for the followed agent `k`. Current implementation updates `estimated_reward_rep` as an EMA of the followed agent's realized payoff instead.
+
 ### Role Updates
 
 #### ROLE-1 (High)
@@ -62,6 +74,15 @@ When agent becomes a follower, existing followers were not redirected. Caused mu
 
 #### STATUS-1 (High)
 Step-2 status entry checks `kappa * estimated_reward_status > estimated_reward_pu`, but `estimated_reward_status` was only updated inside the STATUS-actor branch. In practice, agents could reach follower eligibility yet never accumulate enough status-reward signal to enter STATUS. Fix: update `estimated_reward_status` for follower-holding active actors before role-specific branching so Step-2 can evaluate a meaningful signal.
+
+## Newly Found Bugs (2026-03-05)
+
+The following bugs were identified on **March 5, 2026** from new reputation-coverage tests in
+`code_by_peter_tests/test_bug_report_fixes.py`:
+
+- `REP-4` via `test_rep642_all_agents_update_personal_benefit_each_step`
+- `REP-5` via `test_rep645_follower_tracks_status_policy_of_status_leader`
+- `REP-6` via `test_rep66_reputation_reward_estimate_matches_followed_agent_reputation`
 
 ## Note on Fixed Code
 
