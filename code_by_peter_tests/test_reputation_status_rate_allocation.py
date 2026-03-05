@@ -621,3 +621,221 @@ def test_status_entry_can_occur_after_status_reward_learning(model_module):
 
     assert leader.state.estimated_reward_status > 0.0
     assert leader.state.role == AgentRole.STATUS
+
+
+def test_status_select_action_uses_status_policy_directly(model_module):
+    """STATUS agents should sample from weights_status, not weights_pu."""
+    system = make_system(model_module, num_agents=1, extra_config=dict(num_states=1, num_actions=2))
+    AgentRole = model_module.AgentRole
+    agent = system.agents[0]
+
+    agent.state.role = AgentRole.STATUS
+    agent.state.weights_pu[:] = np.array([[10.0, -10.0]])      # strongly action 0
+    agent.state.weights_status[:] = np.array([[-10.0, 10.0]])  # strongly action 1
+
+    counts = [0, 0]
+    np.random.seed(321)
+    for _ in range(3000):
+        action = agent.select_action(0)
+        counts[action] += 1
+
+    p_action1 = counts[1] / sum(counts)
+    assert p_action1 > 0.95
+
+
+def test_status_phase3_status_actor_updates_via_step(model_module):
+    """STATUS actor with followers should update status weights and status reward in Phase 3."""
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(role_update_base_interval=10**9, u_0=0.0),
+    )
+    AgentRole = model_module.AgentRole
+    leader = system.agents[0]
+    follower = system.agents[1]
+    filler = system.agents[2]
+
+    leader.state.role = AgentRole.STATUS
+    leader.state.followers = {1}
+    leader.state.estimated_reward_status = 0.0
+
+    follower.state.role = AgentRole.PERSONAL_UTILITY
+    follower.state.following = None
+    follower.state.followers = set()
+    follower.state.weights_pu[:] = np.array([[-20.0, 20.0], [-20.0, 20.0], [-20.0, 20.0]])  # id=1 prefers action 1
+
+    leader.state.actor_interaction_rate = 100.0
+    leader.state.participant_interaction_rate = 100.0
+    follower.state.actor_interaction_rate = 100.0
+    follower.state.participant_interaction_rate = 100.0
+    filler.state.actor_interaction_rate = 0.0
+    filler.state.participant_interaction_rate = 0.0
+
+    weights_before = leader.state.weights_status.copy()
+    np.random.seed(11)
+    system.step()
+
+    assert leader.state.estimated_reward_status > 0.0
+    assert not np.allclose(leader.state.weights_status, weights_before)
+
+
+def test_status_phase3_already_status_skips_preupdate_branch(model_module):
+    """STATUS role should receive one status EMA update (not double-counted preupdate+status update)."""
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(role_update_base_interval=10**9, u_0=0.0),
+    )
+    AgentRole = model_module.AgentRole
+    leader = system.agents[0]
+    follower = system.agents[1]
+    filler = system.agents[2]
+
+    leader.state.role = AgentRole.STATUS
+    leader.state.followers = {1}
+    leader.state.estimated_reward_status = 0.0
+
+    follower.state.role = AgentRole.PERSONAL_UTILITY
+    follower.state.weights_pu[:] = np.array([[-20.0, 20.0], [-20.0, 20.0], [-20.0, 20.0]])  # id=1 prefers action 1
+
+    leader.state.actor_interaction_rate = 100.0
+    leader.state.participant_interaction_rate = 100.0
+    follower.state.actor_interaction_rate = 100.0
+    follower.state.participant_interaction_rate = 100.0
+    filler.state.actor_interaction_rate = 0.0
+    filler.state.participant_interaction_rate = 0.0
+
+    eta_j_t = system.config.eta_J_base / (1.0 + 1.0 * 0.01)  # first step
+    expected_single = eta_j_t * 1.0
+    expected_double = eta_j_t * (2.0 - eta_j_t)
+
+    np.random.seed(12)
+    system.step()
+
+    assert leader.state.estimated_reward_status == pytest.approx(expected_single, abs=1e-12)
+    assert leader.state.estimated_reward_status != pytest.approx(expected_double, abs=1e-6)
+
+
+def test_status_support_counts_only_active_participant_followers(model_module):
+    """Eq. (11): only followers active as participants contribute to social support."""
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(role_update_base_interval=10**9, u_0=0.0),
+    )
+    AgentRole = model_module.AgentRole
+    leader = system.agents[0]
+    f1 = system.agents[1]
+    f2 = system.agents[2]
+
+    leader.state.role = AgentRole.STATUS
+    leader.state.followers = {1, 2}
+    leader.state.estimated_reward_status = 0.0
+
+    # Make both followers active actors with deterministic payoff 1.
+    # id=1 prefers action 1, id=2 prefers action 0.
+    f1.state.weights_pu[:] = np.array([[-20.0, 20.0], [-20.0, 20.0], [-20.0, 20.0]])
+    f2.state.weights_pu[:] = np.array([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]])
+
+    leader.state.actor_interaction_rate = 100.0
+    leader.state.participant_interaction_rate = 100.0
+    f1.state.actor_interaction_rate = 100.0
+    f1.state.participant_interaction_rate = 100.0  # included in support
+    f2.state.actor_interaction_rate = 100.0
+    f2.state.participant_interaction_rate = 0.0    # excluded from support
+
+    eta_j_t = system.config.eta_J_base / (1.0 + 1.0 * 0.01)  # first step
+    expected_from_one_active_participant = eta_j_t * 1.0
+    expected_if_both_counted = eta_j_t * 2.0
+
+    np.random.seed(13)
+    system.step()
+
+    assert leader.state.estimated_reward_status == pytest.approx(
+        expected_from_one_active_participant,
+        abs=1e-12,
+    )
+    assert leader.state.estimated_reward_status != pytest.approx(expected_if_both_counted, abs=1e-6)
+
+
+def test_status_estimate_unchanged_when_preconditions_not_met_reachable(model_module):
+    """
+    Reachable unchanged-estimate checks:
+    1) status agent loses followers -> no status estimate update thereafter.
+    2) status agent has followers but is inactive actor -> no status estimate update.
+    """
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(role_update_base_interval=10**9, u_0=0.0),
+    )
+    AgentRole = model_module.AgentRole
+    leader = system.agents[0]
+    follower = system.agents[1]
+    filler = system.agents[2]
+
+    leader.state.role = AgentRole.STATUS
+    leader.state.followers = {1}
+    leader.state.estimated_reward_status = 0.0
+
+    follower.state.role = AgentRole.PERSONAL_UTILITY
+    follower.state.following = None
+    follower.state.followers = set()
+    follower.state.weights_pu[:] = np.array([[-20.0, 20.0], [-20.0, 20.0], [-20.0, 20.0]])  # id=1 prefers action 1
+
+    leader.state.actor_interaction_rate = 100.0
+    leader.state.participant_interaction_rate = 100.0
+    follower.state.actor_interaction_rate = 100.0
+    follower.state.participant_interaction_rate = 100.0
+    filler.state.actor_interaction_rate = 0.0
+    filler.state.participant_interaction_rate = 0.0
+
+    # First step: valid status-update conditions hold.
+    np.random.seed(14)
+    system.step()
+    after_valid_update = leader.state.estimated_reward_status
+    assert after_valid_update > 0.0
+
+    # Scenario 1 (reachable): follower relation can disappear over time.
+    leader.state.followers = set()
+    follower.state.following = None
+    np.random.seed(15)
+    system.step()
+    assert leader.state.estimated_reward_status == pytest.approx(after_valid_update, abs=1e-12)
+
+    # Scenario 2: agent has followers but is not an active actor.
+    leader.state.followers = {1}
+    follower.state.following = 0
+    leader.state.actor_interaction_rate = 0.0
+    np.random.seed(16)
+    system.step()
+    assert leader.state.estimated_reward_status == pytest.approx(after_valid_update, abs=1e-12)
+
+
+def test_status_step3_fallback_clears_following(model_module):
+    """Step-3 PU fallback should clear stale following links when neither R nor S conditions hold."""
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(gamma=1.0, kappa=1.0, c_threshold=1.0, B_R=0.8, B_F=0.6),
+    )
+    AgentRole = model_module.AgentRole
+
+    leader = system.agents[0]
+    agent = system.agents[1]
+
+    leader.state.followers = {1}
+
+    # Construct a stale-but-reachable cleanup case: PU role with lingering following link.
+    agent.state.role = AgentRole.PERSONAL_UTILITY
+    agent.state.following = 0
+    agent.state.followers = set()
+    agent.state.estimated_reward_pu = 1.0
+    agent.state.reputation_estimates = {0: 0.0, 1: 0.0, 2: 0.0}
+    agent.state.highest_rep_agent_estimate = 0
+
+    system._update_roles_sequential()
+
+    assert agent.state.role == AgentRole.PERSONAL_UTILITY
+    assert agent.state.following is None
+    assert 1 not in system.agents[0].state.followers
