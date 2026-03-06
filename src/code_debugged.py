@@ -408,6 +408,8 @@ class MultiAgentSystem:
         self.agents = [Agent(i, config, self) for i in range(config.num_agents)]
         self.time_step = 0
         self.role_update_epoch = 0  # Track which role update epoch we're in
+        self.last_active_actor_ids: Set[int] = set()
+        self.last_active_participant_ids: Set[int] = set()
         self._role_update_epochs = self._build_role_update_epochs()
         self._next_role_update_epoch_idx = 0
         
@@ -579,6 +581,8 @@ class MultiAgentSystem:
                 active_participants.append(agent)
         
         active_participant_ids = {a.agent_id for a in active_participants}
+        self.last_active_actor_ids = set(active_actors)
+        self.last_active_participant_ids = set(active_participant_ids)
         
         # === PHASE 2: Actors Take Actions (Section 6, Step 1) ===
         
@@ -726,12 +730,17 @@ class MultiAgentSystem:
         
         self._track_results(this_step_payoffs, len(active_actors), len(active_participants))
     
-    def _update_roles_sequential(self):
+    def _update_roles_sequential(self, update_candidates=None):
         """
         Section 7: Sequential 3-step role update procedure
         
         This is critical: updates must occur in order to properly handle
-        indirect follower relationships (Section 7.2)
+        indirect follower relationships (Section 7.2).
+
+        Args:
+            update_candidates: Optional iterable of agent ids allowed to reevaluate
+                roles in this call. If None, all agents reevaluate (synchronous mode).
+                Used by asynchronous experiments where agents update on independent clocks.
         """
         if self.config.use_numpy_fast_path and self._s_matrix is not None:
             # Step-1 uses agent.state.reputation_estimates; sync dense cache before role logic.
@@ -745,6 +754,13 @@ class MultiAgentSystem:
         # Maintain follower relationships during update
         followers = {i: set(self.agents[i].state.followers) for i in range(self.config.num_agents)}
         
+        if update_candidates is None:
+            updatable = set(range(self.config.num_agents))
+        else:
+            updatable = {int(i) for i in update_candidates if 0 <= int(i) < self.config.num_agents}
+            if not updatable:
+                return
+
         # === STEP 1: Reputation Optimization (Section 7.3) ===
         # Agents without followers decide if they want to follow someone
         
@@ -756,7 +772,7 @@ class MultiAgentSystem:
         C_pu = C & P  # Not yet following
         
         # Process in random order to avoid bias
-        update_order = list(C)
+        update_order = list(C & updatable)
         np.random.shuffle(update_order)
         
         for i in update_order:
@@ -829,7 +845,7 @@ class MultiAgentSystem:
         
         min_followers = max(1, int(self.config.c_threshold * self.config.num_agents))
         
-        for i in range(self.config.num_agents):
+        for i in updatable:
             if len(followers[i]) >= min_followers:
                 agent = self.agents[i]
                 
@@ -849,7 +865,7 @@ class MultiAgentSystem:
         # === STEP 3: Personal Utility (Section 7.5) ===
         # All remaining agents optimize personal utility
         
-        for i in range(self.config.num_agents):
+        for i in updatable:
             agent = self.agents[i]
             
             if i not in R and i not in S:

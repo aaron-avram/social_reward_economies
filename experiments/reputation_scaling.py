@@ -95,7 +95,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Paper notation interval sequence T_n as comma-separated positive ints "
-             "(e.g., \"2000,3000,6000\"); epochs are s_n = s_{n-1}+T_n.",
+             "(e.g., \"2000,3000,6000\"); epochs are s_n = s_{n-1}+T_n. "
+             "In async mode this is used as each agent's local interval progression.",
     )
     parser.add_argument("--role-update-base-interval", type=int, default=3000)
     parser.add_argument(
@@ -130,8 +131,9 @@ def parse_args() -> argparse.Namespace:
         "--async-role-update-prob",
         type=float,
         default=None,
-        help="Optional per-step probability for role update in async mode. "
-             "If omitted, uses 1 / role_update_base_interval.",
+        help="Optional per-step Bernoulli probability for role updates in async mode. "
+             "If omitted, async uses independent per-agent clocks driven by "
+             "role_update_T_seq/role_update_epochs (or role_update_base_interval as fallback).",
     )
     return parser.parse_args()
 
@@ -155,6 +157,43 @@ def parse_role_update_T_seq(t_text: str) -> List[int]:
     parts = [p.strip() for p in t_text.split(",") if p.strip()]
     seq = [int(x) for x in parts]
     return [t for t in seq if t > 0]
+
+
+def _interval_seq_from_epochs(s0: int, epochs: Sequence[int]) -> List[int]:
+    """
+    Convert epoch list s_n into interval sequence T_n, using paper relation:
+    s_n = s_{n-1} + T_n with provided s_0.
+    """
+    prev = max(0, int(s0))
+    intervals: List[int] = []
+    for epoch in sorted(set(int(e) for e in epochs if int(e) > 0)):
+        if epoch > prev:
+            intervals.append(int(epoch - prev))
+            prev = int(epoch)
+    return intervals
+
+
+def _build_async_interval_sequence(args: argparse.Namespace) -> Tuple[List[int], int, str]:
+    """
+    Build async per-agent interval sequence.
+
+    Priority:
+    1) --role-update-T-seq (paper T_n),
+    2) --role-update-epochs converted to T_n from s_0,
+    3) constant interval from --role-update-base-interval.
+    """
+    s0 = max(0, int(args.role_update_s0))
+    t_seq = parse_role_update_T_seq(args.role_update_T_seq)
+    if t_seq:
+        return t_seq, s0, "T_sequence"
+
+    epochs = parse_role_update_epochs(args.role_update_epochs)
+    if epochs:
+        from_epochs = _interval_seq_from_epochs(s0=s0, epochs=epochs)
+        if from_epochs:
+            return from_epochs, s0, "epochs"
+
+    return [max(1, int(args.role_update_base_interval))], s0, "base_interval"
 
 
 def make_config(args: argparse.Namespace, gamma: float, mode: str) -> SystemConfig:
@@ -249,17 +288,49 @@ def run_single(
     system = MultiAgentSystem(config)
 
     if mode == "async":
-        if args.async_role_update_prob is None:
-            async_update_prob = 1.0 / float(args.role_update_base_interval)
-        else:
-            async_update_prob = float(args.async_role_update_prob)
-
         with redirect_stdout(io.StringIO()):
+            if args.async_role_update_prob is None:
+                # Paper-faithful async relaxation:
+                # independent per-agent role clocks with random phase and per-agent T_n progression.
+                interval_seq, async_s0, _ = _build_async_interval_sequence(args)
+                first_interval = int(interval_seq[0])
+                role_timers = np.random.randint(1, first_interval + 1, size=args.num_agents, dtype=int)
+                if async_s0 > 0:
+                    role_timers = role_timers + async_s0
+                interval_indices = np.zeros(args.num_agents, dtype=int)
+            else:
+                # Optional Bernoulli async mode: each agent independently reevaluates
+                # with probability p each step.
+                async_update_prob = float(args.async_role_update_prob)
+
             for _ in range(args.num_steps):
                 system.step()
-                if np.random.random() < async_update_prob:
-                    system._update_roles_sequential()
-                    system.role_update_epoch += 1
+                if args.async_role_update_prob is None:
+                    role_timers -= 1
+                    update_ids = np.where(role_timers <= 0)[0]
+                    if update_ids.size > 0:
+                        update_list = update_ids.tolist()
+                        system._update_roles_sequential(update_list)
+
+                        if len(interval_seq) == 1:
+                            role_timers[update_ids] += int(interval_seq[0])
+                        else:
+                            # Each agent advances independently through the provided T_n sequence.
+                            # Once the sequence is exhausted, keep using the final interval.
+                            for agent_id in update_list:
+                                idx = int(interval_indices[agent_id])
+                                next_interval = int(interval_seq[idx if idx < len(interval_seq) else -1])
+                                role_timers[agent_id] += next_interval
+                                if idx < len(interval_seq) - 1:
+                                    interval_indices[agent_id] = idx + 1
+                        system.role_update_epoch += 1
+                else:
+                    update_mask = np.random.random(args.num_agents) < async_update_prob
+                    update_ids = np.where(update_mask)[0]
+                    if update_ids.size > 0:
+                        system._update_roles_sequential(update_ids.tolist())
+                        # Track async update events for diagnostics.
+                        system.role_update_epoch += 1
             results = _finalize_results(system)
     else:
         with redirect_stdout(io.StringIO()):
@@ -547,22 +618,24 @@ def main() -> None:
         f"fixed_role_update_interval={args.fixed_role_update_interval}",
         flush=True,
     )
-    if args.mode == "async" and (args.role_update_epochs.strip() or args.role_update_T_seq.strip()):
-        print("role_update schedule inputs ignored in async mode.", flush=True)
-    elif role_t_seq:
+    if args.mode != "async" and role_t_seq:
         print(f"role_update_schedule: s0={int(args.role_update_s0)}, T_n={role_t_seq}", flush=True)
-    elif role_epochs:
+    elif args.mode != "async" and role_epochs:
         print(f"role_update_epochs={role_epochs}", flush=True)
-    elif args.role_update_T_seq.strip():
+    elif args.mode != "async" and args.role_update_T_seq.strip():
         print("role_update_T_seq parsed empty (check values).", flush=True)
     print(f"initial_rates=(actor={args.initial_actor_rate}, participant={args.initial_participant_rate})", flush=True)
     print(f"plot_sample_interval={args.plot_sample_interval}", flush=True)
     print(f"tracking_mode={args.tracking_mode}, numpy_fast_path={args.numpy_fast_path}", flush=True)
     if args.mode == "async":
-        p = args.async_role_update_prob
-        if p is None:
-            p = 1.0 / float(args.role_update_base_interval)
-        print(f"async_role_update_prob={p:.6f}", flush=True)
+        if args.async_role_update_prob is None:
+            async_t_seq, async_s0, async_src = _build_async_interval_sequence(args)
+            print(
+                f"async_mode=independent_agent_clocks(source={async_src}, s0={async_s0}, T_n={async_t_seq}, random_phase_in=[1,{int(async_t_seq[0])}], activity_coupled=False)",
+                flush=True,
+            )
+        else:
+            print(f"async_mode=bernoulli_per_agent(p={float(args.async_role_update_prob):.6f})", flush=True)
     print("#" * 72, flush=True)
 
     all_records: List[RunRecord] = []
