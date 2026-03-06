@@ -91,6 +91,12 @@ class SystemConfig:
     use_numpy_fast_path: bool = False  # Enable vectorized reputation updates for large-N sweeps
     initial_actor_interaction_rate: float = 0.7
     initial_participant_interaction_rate: float = 0.7
+    reward_model: str = "simple_preferred_action"  # "simple_preferred_action" or "shared_base_gaussian"
+    reward_base_mu: float = 0.5
+    reward_base_sigma: float = 0.08
+    reward_agent_sigma: float = 0.1
+    reward_clip_min: float = 0.01
+    reward_clip_max: float = 2.5
 
 
 @dataclass
@@ -140,6 +146,11 @@ class Agent:
         self.config = config
         self.system = system
         self.state = AgentState()
+
+        # Ensure policy parameter shapes follow runtime config (num_states, num_actions).
+        # AgentState defaults are placeholders and may not match experiment overrides.
+        self.state.weights_pu = np.random.randn(config.num_states, config.num_actions) * 0.1
+        self.state.weights_status = np.random.randn(config.num_states, config.num_actions) * 0.1
         
         # Random preference for personal utility (base payoff)
         self.preferred_action = agent_id % config.num_actions
@@ -405,6 +416,11 @@ class MultiAgentSystem:
     
     def __init__(self, config: SystemConfig):
         self.config = config
+        if self.config.reward_model not in {"simple_preferred_action", "shared_base_gaussian"}:
+            raise ValueError(
+                f"Unsupported reward_model='{self.config.reward_model}'. "
+                "Use 'simple_preferred_action' or 'shared_base_gaussian'."
+            )
         self.agents = [Agent(i, config, self) for i in range(config.num_agents)]
         self.time_step = 0
         self.role_update_epoch = 0  # Track which role update epoch we're in
@@ -426,6 +442,11 @@ class MultiAgentSystem:
             'social_welfare': [],
         }
 
+        # Optional reward table r_i(s,a) for richer state/action-dependent experiments.
+        self._reward_tables = None
+        if self.config.reward_model == "shared_base_gaussian":
+            self._initialize_shared_base_gaussian_rewards()
+
         # Optional vectorized caches used by the large-scale experiment harness.
         self._v_matrix = None
         self._s_matrix = None
@@ -441,6 +462,27 @@ class MultiAgentSystem:
             for k in range(num_agents):
                 self._v_matrix[i, k] = float(agent.state.personal_benefit_estimates.get(k, 0.0))
                 self._s_matrix[i, k] = float(agent.state.reputation_estimates.get(k, 0.0))
+
+    def _initialize_shared_base_gaussian_rewards(self):
+        """
+        Build reward table r_i(s,a) with shared base means:
+        - Draw base means m(s,a) once.
+        - For each agent i, draw r_i(s,a) ~ Normal(m(s,a), sigma_agent).
+        - Clip to a positive range to avoid sign-related artifacts in PU baselines.
+        """
+        base = np.random.normal(
+            loc=self.config.reward_base_mu,
+            scale=self.config.reward_base_sigma,
+            size=(self.config.num_states, self.config.num_actions),
+        )
+        base = np.clip(base, self.config.reward_clip_min, self.config.reward_clip_max)
+
+        tables = np.random.normal(
+            loc=base[np.newaxis, :, :],
+            scale=self.config.reward_agent_sigma,
+            size=(self.config.num_agents, self.config.num_states, self.config.num_actions),
+        )
+        self._reward_tables = np.clip(tables, self.config.reward_clip_min, self.config.reward_clip_max)
 
     def _build_role_update_epochs(self) -> List[int]:
         """
@@ -539,6 +581,9 @@ class MultiAgentSystem:
         Compute actual payoff for agent taking action in state
         Includes base preference bonus and follower bonus for status agents
         """
+        if self.config.reward_model == "shared_base_gaussian":
+            return float(self._reward_tables[agent_id, state, action])
+
         agent = self.agents[agent_id]
         preference_bonus = 1.0 if action == agent.preferred_action else 0.0
         follower_bonus = 0.0  # Followers get social support, not direct bonus

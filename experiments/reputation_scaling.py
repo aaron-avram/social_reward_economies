@@ -122,6 +122,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-actor-rate", type=float, default=0.2)
     parser.add_argument("--initial-participant-rate", type=float, default=0.2)
     parser.add_argument(
+        "--reward-model",
+        choices=["simple_preferred_action", "shared_base_gaussian"],
+        default="simple_preferred_action",
+        help="Reward model for payoff generation.",
+    )
+    parser.add_argument("--reward-base-mu", type=float, default=0.5)
+    parser.add_argument("--reward-base-sigma", type=float, default=0.08)
+    parser.add_argument("--reward-agent-sigma", type=float, default=0.1)
+    parser.add_argument("--reward-clip-min", type=float, default=0.01)
+    parser.add_argument("--reward-clip-max", type=float, default=2.5)
+    parser.add_argument(
         "--numpy-fast-path",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -239,6 +250,12 @@ def make_config(args: argparse.Namespace, gamma: float, mode: str) -> SystemConf
         use_numpy_fast_path=args.numpy_fast_path,
         initial_actor_interaction_rate=args.initial_actor_rate,
         initial_participant_interaction_rate=args.initial_participant_rate,
+        reward_model=args.reward_model,
+        reward_base_mu=args.reward_base_mu,
+        reward_base_sigma=args.reward_base_sigma,
+        reward_agent_sigma=args.reward_agent_sigma,
+        reward_clip_min=args.reward_clip_min,
+        reward_clip_max=args.reward_clip_max,
     )
 
 
@@ -625,6 +642,15 @@ def main() -> None:
     elif args.mode != "async" and args.role_update_T_seq.strip():
         print("role_update_T_seq parsed empty (check values).", flush=True)
     print(f"initial_rates=(actor={args.initial_actor_rate}, participant={args.initial_participant_rate})", flush=True)
+    if args.reward_model == "shared_base_gaussian":
+        print(
+            "reward_model=shared_base_gaussian "
+            f"(base_mu={args.reward_base_mu}, base_sigma={args.reward_base_sigma}, "
+            f"agent_sigma={args.reward_agent_sigma}, clip=[{args.reward_clip_min},{args.reward_clip_max}])",
+            flush=True,
+        )
+    else:
+        print("reward_model=simple_preferred_action", flush=True)
     print(f"plot_sample_interval={args.plot_sample_interval}", flush=True)
     print(f"tracking_mode={args.tracking_mode}, numpy_fast_path={args.numpy_fast_path}", flush=True)
     if args.mode == "async":
