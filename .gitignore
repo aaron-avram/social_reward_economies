@@ -9,3 +9,9 @@ __pycache__/
 # NumPy output
 *.npy
 *.npz
+
+# Experiment artifacts
+.coverage
+experiments/outputs/
+**/outputs/
+**/results/

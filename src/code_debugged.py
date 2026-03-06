@@ -74,8 +74,13 @@ class SystemConfig:
     eta_s_base: float = 0.1          # Reputation estimates s_i(k,t)
     eta_J_base: float = 0.05         # Reward estimate updates
     
-    # --- Section 7.1.4: Update Intervals (increasing T_n) ---
-    role_update_base_interval: int = 50  # Base interval, increases over time
+    # --- Section 7.1.4: Update Epochs ---
+    # Paper notation: s_0 and interval sequence {T_n}, with s_n = s_{n-1} + T_n.
+    role_update_s0: int = 0
+    role_update_T_sequence: List[int] = field(default_factory=list)
+    role_update_base_interval: int = 50  # Base interval for constant/increasing schedules
+    fixed_role_update_interval: bool = False  # If True, use constant spacing T_n = const
+    role_update_epochs: List[int] = field(default_factory=list)  # Optional direct s_n list (alternative input)
     
     # --- Gossip (Section 6.4) ---
     gossip_rate: float = 0.5  # Probability of gossip at each step
@@ -403,6 +408,8 @@ class MultiAgentSystem:
         self.agents = [Agent(i, config, self) for i in range(config.num_agents)]
         self.time_step = 0
         self.role_update_epoch = 0  # Track which role update epoch we're in
+        self._role_update_epochs = self._build_role_update_epochs()
+        self._next_role_update_epoch_idx = 0
         
         # Results tracking
         self.results = {
@@ -432,6 +439,28 @@ class MultiAgentSystem:
             for k in range(num_agents):
                 self._v_matrix[i, k] = float(agent.state.personal_benefit_estimates.get(k, 0.0))
                 self._s_matrix[i, k] = float(agent.state.reputation_estimates.get(k, 0.0))
+
+    def _build_role_update_epochs(self) -> List[int]:
+        """
+        Build explicit update epochs s_n for Step-6 role updates.
+
+        Priority:
+        1) Paper notation schedule from (s_0, T_n sequence):
+           s_n = s_{n-1} + T_n.
+        2) Direct epoch list s_n from config.role_update_epochs.
+        3) Empty list -> fall back to interval-based schedules.
+        """
+        t_seq = [int(t) for t in self.config.role_update_T_sequence if int(t) > 0]
+        if t_seq:
+            s_prev = max(0, int(self.config.role_update_s0))
+            epochs = []
+            for t_n in t_seq:
+                s_prev += t_n
+                if s_prev > 0:
+                    epochs.append(int(s_prev))
+            return sorted(set(epochs))
+
+        return sorted(set(int(t) for t in self.config.role_update_epochs if int(t) > 0))
 
     def _sync_s_matrix_to_state_dicts(self, agent_ids=None):
         """Materialize dense s_i(k,t) rows into per-agent dicts when needed."""
@@ -668,16 +697,30 @@ class MultiAgentSystem:
                 agent.adopt_leader_behavior()
         
         # === PHASE 6: Periodic Role Updates (Section 7) ===
-        
-        # Increasing update interval: T_n → ∞ as per Assumption 6
-        current_interval = max(
-            self.config.role_update_base_interval,
-            int(self.config.role_update_base_interval * (1.0 + self.role_update_epoch * 0.1))
-        )
-        
-        if self.time_step % current_interval == 0:
-            self._update_roles_sequential()  # Sequential procedure from Section 7
-            self.role_update_epoch += 1
+
+        if self._role_update_epochs:
+            # Explicit epoch sequence s_n supplied by caller (e.g., 2000,3000,6000,...).
+            while (
+                self._next_role_update_epoch_idx < len(self._role_update_epochs)
+                and self.time_step >= self._role_update_epochs[self._next_role_update_epoch_idx]
+            ):
+                self._update_roles_sequential()
+                self.role_update_epoch += 1
+                self._next_role_update_epoch_idx += 1
+        else:
+            if self.config.fixed_role_update_interval:
+                # Fixed global epoch spacing (static schedule): s_n = n * T.
+                current_interval = max(1, int(self.config.role_update_base_interval))
+            else:
+                # Increasing update interval: T_n → ∞ as per Assumption 6
+                current_interval = max(
+                    self.config.role_update_base_interval,
+                    int(self.config.role_update_base_interval * (1.0 + self.role_update_epoch * 0.1))
+                )
+
+            if self.time_step % current_interval == 0:
+                self._update_roles_sequential()  # Sequential procedure from Section 7
+                self.role_update_epoch += 1
         
         # === PHASE 7: Tracking ===
         
