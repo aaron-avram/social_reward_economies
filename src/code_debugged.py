@@ -428,6 +428,7 @@ class MultiAgentSystem:
         self.last_active_participant_ids: Set[int] = set()
         self._role_update_epochs = self._build_role_update_epochs()
         self._next_role_update_epoch_idx = 0
+        self._next_role_update_time = max(1, int(self.config.role_update_base_interval))
         
         # Results tracking
         self.results = {
@@ -767,9 +768,23 @@ class MultiAgentSystem:
                     int(self.config.role_update_base_interval * (1.0 + self.role_update_epoch * 0.1))
                 )
 
-            if self.time_step % current_interval == 0:
-                self._update_roles_sequential()  # Sequential procedure from Section 7
+            if self.time_step >= self._next_role_update_time:
+                self._update_roles_sequential()
                 self.role_update_epoch += 1
+
+                if self.config.fixed_role_update_interval:
+                    next_interval = max(1, int(self.config.role_update_base_interval))
+                else:
+                    next_interval = max(
+                        self.config.role_update_base_interval,
+                        int(self.config.role_update_base_interval * (1.0 + self.role_update_epoch * 0.1))
+                    )
+
+                self._next_role_update_time += next_interval
+
+            # if self.time_step % current_interval == 0:
+            #     self._update_roles_sequential()  # Sequential procedure from Section 7
+            #     self.role_update_epoch += 1
         
         # === PHASE 7: Tracking ===
         
@@ -885,6 +900,16 @@ class MultiAgentSystem:
                 R.add(i)
                 P.discard(i)
         
+            else:
+                # Existing follower no longer wants to keep following:
+                # remove from R so Step 3 can send it back to PU
+                if i in C_r:
+                    old_leader = agent.state.following
+                    if old_leader is not None:
+                        followers[old_leader].discard(i)
+                    agent.state.following = None
+                    R.discard(i)
+
         # === STEP 2: Status Optimization (Section 7.4) ===
         # Agents with sufficient followers decide if they want to optimize status
         
@@ -1222,3 +1247,40 @@ if __name__ == "__main__":
     print("  ✓ Section 8: Time-scale separation with decreasing stepsizes")
     print("  ✓ Section 8: Increasing role update intervals T_n")
     print("\n" + "="*80)
+
+
+def test_pu_get_softmax_policy_sums_to_one_and_prefers_large_logit(model_module):
+    system = make_system(model_module, num_agents=2, extra_config=dict(num_states=2, num_actions=3))
+    a = system.agents[0]
+
+    weights = np.array([
+        [10.0, 0.0, -10.0],
+        [0.0, 0.0, 0.0],
+    ])
+
+    probs = a.get_softmax_policy(state=0, weights=weights)
+
+    assert probs.shape == (3,)
+    assert np.sum(probs) == pytest.approx(1.0, abs=1e-12)
+    assert probs[0] > probs[1] > probs[2]
+
+
+def test_pu_select_action_uses_correct_state_row(model_module):
+    np.random.seed(0)
+    system = make_system(model_module, num_agents=2, extra_config=dict(num_states=2, num_actions=2))
+    AgentRole = model_module.AgentRole
+
+    a = system.agents[0]
+    a.state.role = AgentRole.PERSONAL_UTILITY
+
+    # state 0 strongly prefers action 0, state 1 strongly prefers action 1
+    a.state.weights_pu = np.array([
+        [15.0, -15.0],
+        [-15.0, 15.0],
+    ])
+
+    draws_state0 = [a.select_action(state=0) for _ in range(20)]
+    draws_state1 = [a.select_action(state=1) for _ in range(20)]
+
+    assert all(x == 0 for x in draws_state0)
+    assert all(x == 1 for x in draws_state1)
