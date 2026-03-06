@@ -81,6 +81,12 @@ class SystemConfig:
     gossip_rate: float = 0.5  # Probability of gossip at each step
     gossip_alpha: float = 0.5  # Averaging parameter in gossip
 
+    # --- Runtime/Simulation controls ---
+    tracking_mode: str = "full"  # "full" keeps all diagnostics, "light" keeps core metrics only
+    use_numpy_fast_path: bool = False  # Enable vectorized reputation updates for large-N sweeps
+    initial_actor_interaction_rate: float = 0.7
+    initial_participant_interaction_rate: float = 0.7
+
 
 @dataclass
 class AgentState:
@@ -137,6 +143,10 @@ class Agent:
         for other_id in range(config.num_agents):
             self.state.personal_benefit_estimates[other_id] = 0.0
             self.state.reputation_estimates[other_id] = np.random.randn() * 0.1
+
+        # Runtime tuning: initial rates are configurable for faster large-scale experiments.
+        self.state.actor_interaction_rate = float(config.initial_actor_interaction_rate)
+        self.state.participant_interaction_rate = float(config.initial_participant_interaction_rate)
         
         # Initial highest rep agent estimate
         self.state.highest_rep_agent_estimate = np.random.randint(config.num_agents)
@@ -406,6 +416,92 @@ class MultiAgentSystem:
             'actual_payoffs': [],
             'social_welfare': [],
         }
+
+        # Optional vectorized caches used by the large-scale experiment harness.
+        self._v_matrix = None
+        self._s_matrix = None
+        if self.config.use_numpy_fast_path:
+            self._initialize_numpy_fast_state()
+
+    def _initialize_numpy_fast_state(self):
+        """Initialize dense NxN buffers for v_i(k,t) and s_i(k,t)."""
+        num_agents = self.config.num_agents
+        self._v_matrix = np.zeros((num_agents, num_agents), dtype=float)
+        self._s_matrix = np.zeros((num_agents, num_agents), dtype=float)
+        for i, agent in enumerate(self.agents):
+            for k in range(num_agents):
+                self._v_matrix[i, k] = float(agent.state.personal_benefit_estimates.get(k, 0.0))
+                self._s_matrix[i, k] = float(agent.state.reputation_estimates.get(k, 0.0))
+
+    def _sync_s_matrix_to_state_dicts(self, agent_ids=None):
+        """Materialize dense s_i(k,t) rows into per-agent dicts when needed."""
+        if self._s_matrix is None:
+            return
+        num_agents = self.config.num_agents
+        if agent_ids is None:
+            agent_ids = range(num_agents)
+        for i in agent_ids:
+            row = self._s_matrix[i]
+            self.agents[i].state.reputation_estimates = {
+                k: float(row[k]) for k in range(num_agents)
+            }
+
+    def _identify_highest_reputation_agent_from_matrix(self, agent_id: int):
+        """
+        Fast REP-1 selection on dense s_i(k,t): choose from C\\{i} with tie tolerance delta.
+        """
+        num_agents = self.config.num_agents
+        agent = self.agents[agent_id]
+        if num_agents <= 1:
+            agent.state.highest_rep_agent_estimate = agent_id
+            return
+
+        row = self._s_matrix[agent_id].copy()
+        row[agent_id] = -np.inf  # REP-1: exclude self
+        max_rep = np.max(row)
+        if not np.isfinite(max_rep):
+            others = [k for k in range(num_agents) if k != agent_id]
+            agent.state.highest_rep_agent_estimate = int(np.random.choice(others))
+            return
+
+        candidates = np.where(row >= max_rep - self.config.delta)[0]
+        candidates = candidates[candidates != agent_id]
+        if candidates.size == 0:
+            others = [k for k in range(num_agents) if k != agent_id]
+            agent.state.highest_rep_agent_estimate = int(np.random.choice(others))
+            return
+
+        agent.state.highest_rep_agent_estimate = int(np.random.choice(candidates))
+
+    def _phase4_updates_numpy_fast(
+        self,
+        observed_payoff_vector: np.ndarray,
+        active_participant_ids: np.ndarray,
+        eta_v_t: float,
+    ):
+        """
+        Vectorized Phase-4 updates:
+        - REP-4: update v_i(k,t) for all agents i and all k each step.
+        - REP-2: update s_i(k,t+1)=avg_j s_j(k,t)+delta_v_i(k,t) for active participants.
+        """
+        prev_v = self._v_matrix
+
+        # Broadcast active/inactive actor payoffs across all observer agents i.
+        active_mask = observed_payoff_vector != 0.0
+        new_v = np.where(
+            active_mask[np.newaxis, :],
+            prev_v + eta_v_t * (observed_payoff_vector[np.newaxis, :] - prev_v),
+            prev_v * (1.0 - eta_v_t),
+        )
+        delta_v = new_v - prev_v
+        self._v_matrix = new_v
+
+        if active_participant_ids.size > 0:
+            avg_s = np.mean(self._s_matrix[active_participant_ids, :], axis=0)
+            self._s_matrix[active_participant_ids, :] = avg_s[np.newaxis, :] + delta_v[active_participant_ids, :]
+
+            for agent_id in active_participant_ids:
+                self._identify_highest_reputation_agent_from_matrix(int(agent_id))
     
     def compute_actual_payoff(self, agent_id: int, state: int, action: int) -> float:
         """
@@ -501,10 +597,13 @@ class MultiAgentSystem:
                 # Section 6.4.5: Reputation agent gets social support from leader
                 if agent.state.following is not None:
                     # [REP-6] Use current followed-agent reputation estimate s_i(k,t).
-                    followed_rep_estimate = agent.state.reputation_estimates.get(
-                        agent.state.following,
-                        0.0,
-                    )
+                    if self.config.use_numpy_fast_path and self._s_matrix is not None:
+                        followed_rep_estimate = float(self._s_matrix[agent_id, agent.state.following])
+                    else:
+                        followed_rep_estimate = agent.state.reputation_estimates.get(
+                            agent.state.following,
+                            0.0,
+                        )
                     agent.update_reputation_reward_estimate(followed_rep_estimate, eta_J_t)
             
             elif agent.state.role == AgentRole.STATUS:
@@ -516,33 +615,47 @@ class MultiAgentSystem:
         
         # === PHASE 4: Updates for Active Participants (Section 6.4) ===
 
-        # (4.1)
-        # [REP-4] Section 6.4.2 updates v_i(k,t) for every agent i each step
-        # (active k use observed payoff, inactive k decay via zero payoff).
-        delta_v_by_agent = {}
-        for agent in self.agents:
-            delta_v_by_agent[agent.agent_id] = agent.update_personal_benefit_estimates(
-                observed_payoffs, eta_v_t
+        if self.config.use_numpy_fast_path and self._v_matrix is not None and self._s_matrix is not None:
+            observed_payoff_vector = np.array(
+                [observed_payoffs[i] for i in range(self.config.num_agents)],
+                dtype=float,
             )
+            active_participant_array = np.array(
+                [a.agent_id for a in active_participants],
+                dtype=int,
+            )
+            self._phase4_updates_numpy_fast(observed_payoff_vector, active_participant_array, eta_v_t)
 
-        # (4.2) snapshot
-        snapshot_s = {}
-        for k in range(self.config.num_agents):
-            snapshot_s[k] = [
-                p.state.reputation_estimates.get(k, 0.0)
-                for p in active_participants
-            ]
-        avg_s = {k: float(np.mean(vals)) if len(vals) > 0 else 0.0 for k, vals in snapshot_s.items()}
+            for agent in active_participants:
+                agent.update_actor_interaction_rate(alpha_rate_t)
+        else:
+            # (4.1)
+            # [REP-4] Section 6.4.2 updates v_i(k,t) for every agent i each step
+            # (active k use observed payoff, inactive k decay via zero payoff).
+            delta_v_by_agent = {}
+            for agent in self.agents:
+                delta_v_by_agent[agent.agent_id] = agent.update_personal_benefit_estimates(
+                    observed_payoffs, eta_v_t
+                )
 
-        # (4.3) s_i(k,t+1) = avg_s[k] + delta_v_i(k)
-        for agent in active_participants:
-            deltas = delta_v_by_agent[agent.agent_id]
+            # (4.2) snapshot
+            snapshot_s = {}
             for k in range(self.config.num_agents):
-                agent.state.reputation_estimates[k] = avg_s[k] + deltas.get(k, 0.0)
+                snapshot_s[k] = [
+                    p.state.reputation_estimates.get(k, 0.0)
+                    for p in active_participants
+                ]
+            avg_s = {k: float(np.mean(vals)) if len(vals) > 0 else 0.0 for k, vals in snapshot_s.items()}
 
-        for agent in active_participants:
-            agent.identify_highest_reputation_agent()
-            agent.update_actor_interaction_rate(alpha_rate_t)
+            # (4.3) s_i(k,t+1) = avg_s[k] + delta_v_i(k)
+            for agent in active_participants:
+                deltas = delta_v_by_agent[agent.agent_id]
+                for k in range(self.config.num_agents):
+                    agent.state.reputation_estimates[k] = avg_s[k] + deltas.get(k, 0.0)
+
+            for agent in active_participants:
+                agent.identify_highest_reputation_agent()
+                agent.update_actor_interaction_rate(alpha_rate_t)
 
 
         # [REP-3] No second gossip pass here.
@@ -577,6 +690,9 @@ class MultiAgentSystem:
         This is critical: updates must occur in order to properly handle
         indirect follower relationships (Section 7.2)
         """
+        if self.config.use_numpy_fast_path and self._s_matrix is not None:
+            # Step-1 uses agent.state.reputation_estimates; sync dense cache before role logic.
+            self._sync_s_matrix_to_state_dicts()
         
         # Initialize: copy current state
         P = set(i for i, a in enumerate(self.agents) if a.state.role == AgentRole.PERSONAL_UTILITY)
@@ -707,40 +823,33 @@ class MultiAgentSystem:
     
     def _track_results(self, this_step_payoffs: Dict, num_actors: int, num_participants: int):
         """Track simulation results for analysis"""
-        
-        # Norm consensus: variance of policy weights across agents
+        mode = str(self.config.tracking_mode).lower()
+        if mode not in {"full", "light"}:
+            raise ValueError(f"Unsupported tracking_mode='{self.config.tracking_mode}'. Use 'full' or 'light'.")
+
+        # Core metrics used by experiment sweeps.
+        followers = [len(a.state.followers) for a in self.agents]
+        self.results['follower_counts'].append(followers)
+        self.results['actor_counts'].append(num_actors)
+        self.results['participant_counts'].append(num_participants)
+        self.results['social_welfare'].append(sum(this_step_payoffs.values()))
+
+        if mode == "light":
+            return
+
+        # Full diagnostics (more expensive for large-N long-horizon runs).
         all_weights = np.array([a.state.weights_pu.flatten() for a in self.agents])
         norm_variance = np.mean(np.var(all_weights, axis=0))
         self.results['norm_consensus'].append(norm_variance)
-        
-        # Expected utilities (based on payoff history)
+
         utils = {
             i: np.mean(a.state.payoff_history) if a.state.payoff_history else 0.0
             for i, a in enumerate(self.agents)
         }
         self.results['expected_utilities'].append(utils)
-        
-        # Follower counts
-        followers = [len(a.state.followers) for a in self.agents]
-        self.results['follower_counts'].append(followers)
-        
-        # Actor and participant counts
-        self.results['actor_counts'].append(num_actors)
-        self.results['participant_counts'].append(num_participants)
-        
-        # Learned actor rates
         self.results['actor_rates'].append([a.state.actor_interaction_rate for a in self.agents])
-        
-        # Roles
-        roles = [a.state.role for a in self.agents]
-        self.results['roles_history'].append(roles)
-        
-        # Payoffs
+        self.results['roles_history'].append([a.state.role for a in self.agents])
         self.results['actual_payoffs'].append(this_step_payoffs)
-        
-        # Social welfare
-        total_welfare = sum(this_step_payoffs.values())
-        self.results['social_welfare'].append(total_welfare)
     
     def simulate(self) -> Dict:
         """Run the full simulation"""
