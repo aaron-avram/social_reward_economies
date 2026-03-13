@@ -23,6 +23,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from src.code_debugged import SystemConfig, MultiAgentSystem, AgentRole
+try:
+    from experiments.perturbation_recovery import run_experiment as run_perturbation_recovery
+except ImportError:
+    # Supports direct execution: python3 experiments/experiments.py
+    from perturbation_recovery import run_experiment as run_perturbation_recovery
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,7 +44,7 @@ def make_config(**kwargs) -> SystemConfig:
         num_time_steps=5000,
         M=1.0,
         u_0=0.1,
-        gamma=2.0,
+        gamma=2.5,
         kappa=2.0,
         c_threshold=0.1,
         B_R=0.3,   # Lowered from 0.8: payoffs are in [0,1] with mean ~0.5
@@ -183,117 +188,99 @@ def experiment_C():
 
 def experiment_D():
     """
-    Experiment D: Run until leader emerges (Phase 1), then perturb the leader's
-    policy weights to be suboptimal (Phase 2), and continue simulation.
-
-    Expected:
-    - Leader loses followers as its reputation drops.
-    - If perturbation is large enough, a new leader may emerge.
-    - System is resilient: eventually self-corrects.
+    Experiment D wrapper around the reproducible perturbation/recovery harness.
+    Produces the legacy PNG plus CSV summaries for traceability.
     """
     print("\n" + "#"*60)
     print("# Experiment D: Perturbation test")
     print("#"*60)
 
-    # Phase 1: Run until leader emerges
-    print("\n[Phase 1] Running until leader emerges (3000 steps)...")
-    config = make_config(gamma=2.0, kappa=2.0, num_time_steps=3000)
-    system = MultiAgentSystem(config)
-    results_phase1 = system.simulate()
+    result = run_perturbation_recovery(
+        mode="static",
+        num_agents=8,
+        num_states=3,
+        num_actions=2,
+        num_steps_max=12000,
+        gamma=2.5,
+        kappa=2.0,
+        B_R=0.3,
+        B_F=0.15,
+        c_threshold=0.1,
+        seeds=1,
+        seed_start=25,
+        role_update_base_interval=100,
+        fixed_role_update_interval=True,
+        perturb_strength=12.0,
+        perturb_duration=300,
+        collapse_followers_on_perturb=False,
+        reputation_shock_factor=1.0,
+        post_window=3500,
+        conv_threshold=1.0,  # strict n-1
+        conv_hold_steps=120,
+        recovery_threshold=1.0,  # strict n-1 recovery
+        recovery_hold_steps=80,
+        stable_tail_window=200,
+        dominant_threshold=0.5,
+        drop_fraction_threshold=0.5,
+        output_dir=str(OUTPUT_DIR),
+        run_label="exp_D_perturbation_seed25",
+        auto_run_subdir=True,
+        plot_sample_interval=100,
+        tracking_mode="light",
+        reward_model="shared_base_gaussian",
+        reward_base_mu=0.5,
+        reward_base_sigma=0.08,
+        reward_agent_sigma=0.1,
+        reward_clip_min=0.01,
+        reward_clip_max=2.5,
+        output_prefix="exp_D_perturbation",
+    )
 
-    leader_id = results_phase1["opinion_leader"]
-    leader_followers_pre = results_phase1["final_followers"][leader_id] if leader_id >= 0 else 0
-    print(f"\n[Phase 1] Leader: Agent {leader_id} with {leader_followers_pre} followers")
+    record = result["run_records"][0]
+    details = result["details_by_seed"][record.seed]
+    follower_rows = details["follower_rows"]
+    welfare_series = details["welfare_series"].tolist()
 
-    # Track pre-perturbation welfare
-    welfare_pre = np.mean(results_phase1["social_welfare"][-500:])
-    print(f"[Phase 1] Avg welfare (last 500 steps): {welfare_pre:.4f}")
+    if record.t_perturb_start > 0:
+        pre_idx = record.t_perturb_start - 1
+    else:
+        pre_idx = len(follower_rows) - 1
 
-    if leader_id < 0:
-        print("[Phase 1] No leader emerged — skipping perturbation.")
-        return results_phase1, None
+    pre_followers = follower_rows[pre_idx] if follower_rows else [0] * 8
+    post_followers = follower_rows[-1] if follower_rows else [0] * 8
+    pre_leader = int(record.leader_pre)
+    post_leader = int(record.final_leader)
 
-    # Phase 2: Perturb leader's policy weights to be anti-optimal
-    print("\n[Phase 2] Perturbing leader's policy weights (random noise)...")
-    leader_agent = system.agents[leader_id]
-    old_weights = leader_agent.state.weights_pu.copy()
+    print("\n[Experiment D Summary]")
+    print(
+        f"  t_conv={record.t_conv}, t_perturb_start={record.t_perturb_start}, "
+        f"t_perturb_end={record.t_perturb_end}, recovery_time={record.recovery_time}"
+    )
+    print(
+        f"  leader_pre={pre_leader}, pre_followers={record.pre_followers}, "
+        f"drop_fraction={record.drop_fraction:.3f}, normless_duration={record.normless_duration}"
+    )
+    print(
+        f"  final_leader={post_leader}, final_top_followers={record.final_top_followers}, "
+        f"leader_changed_after_recovery={int(record.leader_changed)}, "
+        f"leader_changed_final={int(record.final_leader_changed)}, "
+        f"stable_recovery_last_{record.stable_tail_window}={int(record.stable_recovery)}"
+    )
+    print(f"  runs csv → {result['runs_csv']}")
+    print(f"  aggregate csv → {result['aggregate_csv']}")
+    print(f"  plot → {result['plot_files'][record.seed]}")
 
-    # Reset policy weights to strong anti-preference (opposite of convergence)
-    # This forces the leader to take suboptimal actions
-    leader_agent.state.weights_pu = -5.0 * np.abs(old_weights)
-    leader_agent.state.weights_status = -5.0 * np.abs(leader_agent.state.weights_status)
-
-    # Also reset the leader's reward estimates to simulate reputation collapse
-    leader_agent.state.estimated_reward_pu = 0.0
-    leader_agent.state.estimated_reward_status = 0.0
-    for k in system.agents[leader_id].state.reputation_estimates:
-        system.agents[leader_id].state.reputation_estimates[k] *= 0.1
-
-    # Continue simulation for another 3000 steps
-    print("[Phase 2] Running for 3000 more steps after perturbation...")
-    system.config.num_time_steps = 6000  # extend the total
-    for _ in range(3000):
-        system.step()
-
-    results_phase2 = {
-        "norm_consensus": results_phase1["norm_consensus"] + system.results["norm_consensus"][-3000:],
-        "follower_counts": results_phase1["follower_counts"] + system.results["follower_counts"][-3000:],
-        "social_welfare": results_phase1["social_welfare"] + system.results["social_welfare"][-3000:],
-        "roles_history": results_phase1["roles_history"] + system.results["roles_history"][-3000:],
-        "final_roles": [a.state.role for a in system.agents],
-        "final_followers": [len(a.state.followers) for a in system.agents],
-        "opinion_leader": int(np.argmax([len(a.state.followers) for a in system.agents])),
-        "actor_counts": results_phase1["actor_counts"] + system.results["actor_counts"][-3000:],
-        "participant_counts": results_phase1["participant_counts"] + system.results["participant_counts"][-3000:],
-        "actor_rates": results_phase1["actor_rates"] + system.results["actor_rates"][-3000:],
-        "expected_utilities": results_phase1["expected_utilities"] + system.results["expected_utilities"][-3000:],
-        "actual_payoffs": results_phase1["actual_payoffs"] + system.results["actual_payoffs"][-3000:],
+    # Preserve old function contract for the comparison table in __main__.
+    results_phase1 = {
+        "opinion_leader": pre_leader if pre_leader >= 0 else -1,
+        "final_followers": pre_followers,
+        "social_welfare": welfare_series[: max(1, pre_idx + 1)],
     }
-
-    welfare_post = np.mean(system.results["social_welfare"][-500:])
-    new_leader = results_phase2["opinion_leader"]
-    new_followers = results_phase2["final_followers"][new_leader]
-
-    print(f"\n[Phase 2] After perturbation:")
-    print(f"  New leader: Agent {new_leader} ({new_followers} followers)")
-    print(f"  Ex-leader (Agent {leader_id}) followers: {results_phase2['final_followers'][leader_id]}")
-    print(f"  Avg welfare (last 500 steps): {welfare_post:.4f}")
-
-    summarize(results_phase2, "Experiment D (post-perturbation)")
-
-    # Save combined plot
-    followers_array = np.array(results_phase2["follower_counts"])
-    n_agents = followers_array.shape[1]
-    colors = plt.cm.tab10(np.linspace(0, 1, n_agents))
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-
-    ax = axes[0]
-    for i in range(n_agents):
-        ax.plot(followers_array[:, i], label=f"Agent {i}", color=colors[i], linewidth=1.5)
-    ax.axvline(x=3000, color="red", linestyle="--", linewidth=2, label="Perturbation")
-    ax.set_title("Experiment D: Follower Counts (Perturbation at step 3000)")
-    ax.set_xlabel("Timestep")
-    ax.set_ylabel("Followers")
-    ax.legend(fontsize=7, ncol=2)
-    ax.grid(True, alpha=0.3)
-
-    ax2 = axes[1]
-    welfare_series = results_phase2["social_welfare"]
-    ax2.plot(welfare_series, color="darkgreen", linewidth=1.5)
-    ax2.axvline(x=3000, color="red", linestyle="--", linewidth=2, label="Perturbation")
-    ax2.set_title("Social Welfare")
-    ax2.set_xlabel("Timestep")
-    ax2.set_ylabel("Total payoff per step")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.suptitle("Experiment D: Perturbation Test", fontsize=11, fontweight="bold")
-    plt.tight_layout()
-    output_file = OUTPUT_DIR / "exp_D_perturbation.png"
-    plt.savefig(str(output_file), dpi=120, bbox_inches="tight")
-    plt.close()
-    print(f"  Plot saved → {output_file}")
+    results_phase2 = {
+        "opinion_leader": post_leader if post_leader >= 0 else -1,
+        "final_followers": post_followers,
+        "social_welfare": welfare_series,
+    }
 
     return results_phase1, results_phase2
 

@@ -16,6 +16,7 @@ BUG FIX ID MAP (grouped):
 - REP-4: Personal-benefit estimates v_i(k,t) must update for all agents each step
 - REP-5: Reputation followers must emulate leader's active-role policy (PU vs STATUS)
 - REP-6: Reputation reward estimate must match followed-agent reputation s_i(k,t)
+- REP-7: Personal-benefit learning must use observer-specific utility u_i(s, x_k)
 - ROLE-1: Non-followers bootstrap reputation-role entry via γ*s_i(L_i,t)
 - ROLE-2: Remove extra gate `max_rep >= B_i` in Step-1 follow decision
 - ROLE-3: Redirect if selected leader is itself a follower
@@ -24,6 +25,7 @@ BUG FIX ID MAP (grouped):
 - STATUS-1: Update status reward signal before Step-2 gate so STATUS entry is reachable
 """
 
+import math
 import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
@@ -549,24 +551,25 @@ class MultiAgentSystem:
 
     def _phase4_updates_numpy_fast(
         self,
-        observed_payoff_vector: np.ndarray,
+        observed_utility_matrix: np.ndarray,
+        active_actor_ids: np.ndarray,
         active_participant_ids: np.ndarray,
         eta_v_t: float,
     ):
         """
         Vectorized Phase-4 updates:
         - REP-4: update v_i(k,t) for all agents i and all k each step.
+        - REP-7: use observer-specific utilities u_i(s(t), x_k(t)) for each (i, k).
         - REP-2: update s_i(k,t+1)=avg_j s_j(k,t)+delta_v_i(k,t) for active participants.
         """
         prev_v = self._v_matrix
 
-        # Broadcast active/inactive actor payoffs across all observer agents i.
-        active_mask = observed_payoff_vector != 0.0
-        new_v = np.where(
-            active_mask[np.newaxis, :],
-            prev_v + eta_v_t * (observed_payoff_vector[np.newaxis, :] - prev_v),
-            prev_v * (1.0 - eta_v_t),
-        )
+        new_v = prev_v * (1.0 - eta_v_t)
+        if active_actor_ids.size > 0:
+            new_v[:, active_actor_ids] = (
+                prev_v[:, active_actor_ids]
+                + eta_v_t * (observed_utility_matrix[:, active_actor_ids] - prev_v[:, active_actor_ids])
+            )
         delta_v = new_v - prev_v
         self._v_matrix = new_v
 
@@ -577,18 +580,33 @@ class MultiAgentSystem:
             for agent_id in active_participant_ids:
                 self._identify_highest_reputation_agent_from_matrix(int(agent_id))
     
-    def compute_actual_payoff(self, agent_id: int, state: int, action: int) -> float:
+    def compute_observer_utility(self, observer_id: int, state: int, action: int) -> float:
         """
-        Compute actual payoff for agent taking action in state
-        Includes base preference bonus and follower bonus for status agents
+        Compute observer-specific utility u_i(s, x) for a realized action x in state s.
+        This is used both for the actor's own payoff and for Section 6.4.2 personal-benefit
+        learning by observers.
         """
         if self.config.reward_model == "shared_base_gaussian":
-            return float(self._reward_tables[agent_id, state, action])
+            return float(self._reward_tables[observer_id, state, action])
 
-        agent = self.agents[agent_id]
+        agent = self.agents[observer_id]
         preference_bonus = 1.0 if action == agent.preferred_action else 0.0
         follower_bonus = 0.0  # Followers get social support, not direct bonus
         return preference_bonus + follower_bonus
+
+    def compute_observer_utility_vector(self, state: int, action: int) -> np.ndarray:
+        """Vectorized u_i(s, x) over all observers i for one realized (state, action)."""
+        if self.config.reward_model == "shared_base_gaussian":
+            return np.array(self._reward_tables[:, state, action], dtype=float, copy=True)
+
+        return np.array(
+            [1.0 if action == agent.preferred_action else 0.0 for agent in self.agents],
+            dtype=float,
+        )
+
+    def compute_actual_payoff(self, agent_id: int, state: int, action: int) -> float:
+        """Return the actor's own realized payoff u_i(s, x_i)."""
+        return self.compute_observer_utility(agent_id, state, action)
     
     def step(self):
         """
@@ -634,18 +652,20 @@ class MultiAgentSystem:
         
         actions = {}
         this_step_payoffs = {}
+        observed_utility_matrix = np.zeros((self.config.num_agents, self.config.num_agents), dtype=float)
         for agent_id in active_actors:
             agent = self.agents[agent_id]
             state = np.random.randint(self.config.num_states)
             action = agent.select_action(state)
             actions[agent_id] = (state, action)
-            payoff = self.compute_actual_payoff(agent_id, state, action)
+            # [REP-7] Reputation learning in Section 6.4.2 is observer-specific:
+            # each observer i evaluates actor k's realized (state, action) via u_i(s, x_k).
+            observer_utilities = self.compute_observer_utility_vector(state, action)
+            observed_utility_matrix[:, agent_id] = observer_utilities
+            payoff = float(observer_utilities[agent_id])
             this_step_payoffs[agent_id] = payoff
             agent.state.payoff_history.append(payoff)
-        
-        # Observed payoffs: fresh for active actors, 0 for others
-        observed_payoffs = {i: this_step_payoffs.get(i, 0.0) for i in range(self.config.num_agents)}
-        
+
         # === PHASE 3: Role-Based Updates for Active Actors (Section 6) ===
         
         for agent_id in active_actors:
@@ -695,26 +715,32 @@ class MultiAgentSystem:
         # === PHASE 4: Updates for Active Participants (Section 6.4) ===
 
         if self.config.use_numpy_fast_path and self._v_matrix is not None and self._s_matrix is not None:
-            observed_payoff_vector = np.array(
-                [observed_payoffs[i] for i in range(self.config.num_agents)],
-                dtype=float,
-            )
+            active_actor_array = np.array(sorted(active_actors), dtype=int)
             active_participant_array = np.array(
                 [a.agent_id for a in active_participants],
                 dtype=int,
             )
-            self._phase4_updates_numpy_fast(observed_payoff_vector, active_participant_array, eta_v_t)
+            self._phase4_updates_numpy_fast(
+                observed_utility_matrix,
+                active_actor_array,
+                active_participant_array,
+                eta_v_t,
+            )
 
             for agent in active_participants:
                 agent.update_actor_interaction_rate(alpha_rate_t)
         else:
             # (4.1)
-            # [REP-4] Section 6.4.2 updates v_i(k,t) for every agent i each step
-            # (active k use observed payoff, inactive k decay via zero payoff).
+            # [REP-4]/[REP-7] Section 6.4.2 updates v_i(k,t) for every agent i each step
+            # using observer-specific utilities u_i(s(t), x_k(t)) for active actors k.
             delta_v_by_agent = {}
             for agent in self.agents:
+                observed_utilities = {
+                    k: float(observed_utility_matrix[agent.agent_id, k])
+                    for k in range(self.config.num_agents)
+                }
                 delta_v_by_agent[agent.agent_id] = agent.update_personal_benefit_estimates(
-                    observed_payoffs, eta_v_t
+                    observed_utilities, eta_v_t
                 )
 
             # (4.2) snapshot
@@ -813,6 +839,13 @@ class MultiAgentSystem:
         
         # Maintain follower relationships during update
         followers = {i: set(self.agents[i].state.followers) for i in range(self.config.num_agents)}
+
+        def remove_from_all_follower_sets(agent_id: int):
+            # Paper Section 7 updates follower sets as F_j \ {i} for all j != k (or all j
+            # when falling back to PU). This defensive cleanup keeps the graph consistent
+            # even if stale membership remains in more than one leader set.
+            for leader_id in range(self.config.num_agents):
+                followers[leader_id].discard(agent_id)
         
         if update_candidates is None:
             updatable = set(range(self.config.num_agents))
@@ -820,6 +853,13 @@ class MultiAgentSystem:
             updatable = {int(i) for i in update_candidates if 0 <= int(i) < self.config.num_agents}
             if not updatable:
                 return
+
+        # [STATUS-2] Recompute status membership for agents reevaluated in this call.
+        # Section 7.4 determines STATUS only for agents that meet follower and payoff
+        # criteria at the current epoch. Clearing stale STATUS flags for updatable
+        # agents ensures zero-follower status agents do not persist incorrectly.
+        for i in updatable:
+            S.discard(i)
 
         # === STEP 1: Reputation Optimization (Section 7.3) ===
         # Agents without followers decide if they want to follow someone
@@ -875,13 +915,6 @@ class MultiAgentSystem:
                     # Skip following - stay in personal utility instead
                     continue
 
-                # Update role and follower relationships
-                if i in R:
-                    # Was already following, change to new leader
-                    old_leader = agent.state.following
-                    if old_leader is not None:
-                        followers[old_leader].discard(i)
-
                 # [ROLE-5] When agent i becomes a follower, redirect i's own followers
                 # to i's new leader (best_k) to prevent multi-level chains.
                 # This handles the case where i was previously a leader (e.g., from STATUS
@@ -892,6 +925,7 @@ class MultiAgentSystem:
                         followers[best_k].add(follower_id)
                     followers[i].clear()
 
+                remove_from_all_follower_sets(i)
                 agent.state.role = AgentRole.REPUTATION
                 agent.state.following = best_k
                 followers[best_k].add(i)
@@ -904,16 +938,16 @@ class MultiAgentSystem:
                 # Existing follower no longer wants to keep following:
                 # remove from R so Step 3 can send it back to PU
                 if i in C_r:
-                    old_leader = agent.state.following
-                    if old_leader is not None:
-                        followers[old_leader].discard(i)
+                    remove_from_all_follower_sets(i)
                     agent.state.following = None
                     R.discard(i)
 
         # === STEP 2: Status Optimization (Section 7.4) ===
         # Agents with sufficient followers decide if they want to optimize status
         
-        min_followers = max(1, int(self.config.c_threshold * self.config.num_agents))
+        # Section 7.4 uses the inequality |F_i| >= cN. Since follower counts are integers,
+        # the smallest qualifying count is ceil(cN), not floor(cN).
+        min_followers = int(math.ceil(self.config.c_threshold * self.config.num_agents))
         
         for i in updatable:
             if len(followers[i]) >= min_followers:
@@ -925,7 +959,7 @@ class MultiAgentSystem:
                 if self.config.kappa * agent.state.estimated_reward_status > agent.state.estimated_reward_pu:
                     agent.state.role = AgentRole.STATUS
                     if agent.state.following is not None:
-                        followers[agent.state.following].discard(i)
+                        remove_from_all_follower_sets(i)
                         agent.state.following = None
                     
                     S.add(i)
@@ -941,7 +975,7 @@ class MultiAgentSystem:
             if i not in R and i not in S:
                 agent.state.role = AgentRole.PERSONAL_UTILITY
                 if agent.state.following is not None:
-                    followers[agent.state.following].discard(i)
+                    remove_from_all_follower_sets(i)
                     agent.state.following = None
                 
                 P.add(i)
@@ -1184,7 +1218,10 @@ if __name__ == "__main__":
     print(f"\nRole Incentives (Section 7):")
     print(f"  γ (reputation weight): {config.gamma}")
     print(f"  κ (status weight): {config.kappa}")
-    print(f"  c (follower threshold): {config.c_threshold:.2f} → {int(config.c_threshold * config.num_agents)} followers")
+    print(
+        f"  c (follower threshold): {config.c_threshold:.2f} → "
+        f"{int(math.ceil(config.c_threshold * config.num_agents))} followers"
+    )
     
     print(f"\nHysteresis Thresholds (Section 7.1.3):")
     print(f"  B_R (start following): {config.B_R}")
