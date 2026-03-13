@@ -173,8 +173,8 @@ def test_async_partial_update_status_switch_clears_following(model_module):
     system.agents[i].state.following = leader
     system.agents[leader].state.followers.add(i)
 
-    # enough followers to qualify for status
-    system.agents[i].state.followers = {2}
+    # enough followers to qualify for status: ceil(0.2*6) = 2
+    system.agents[i].state.followers = {2, 3}
     system.agents[i].state.estimated_reward_status = 10.0
     system.agents[i].state.estimated_reward_pu = 0.0
 
@@ -183,6 +183,36 @@ def test_async_partial_update_status_switch_clears_following(model_module):
     assert system.agents[i].state.role == AgentRole.STATUS
     assert system.agents[i].state.following is None
     assert i not in system.agents[leader].state.followers
+
+
+def test_async_partial_update_demotes_zero_follower_status_only_for_selected_agents(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=5,
+        extra_config=dict(gamma=0.0, kappa=2.0, c_threshold=0.2),
+    )
+    AgentRole = model_module.AgentRole
+
+    selected = 1
+    untouched = 2
+
+    system.agents[selected].state.role = AgentRole.STATUS
+    system.agents[selected].state.followers = set()
+    system.agents[selected].state.following = None
+    system.agents[selected].state.estimated_reward_status = 10.0
+    system.agents[selected].state.estimated_reward_pu = 0.0
+
+    system.agents[untouched].state.role = AgentRole.STATUS
+    system.agents[untouched].state.followers = set()
+    system.agents[untouched].state.following = None
+    system.agents[untouched].state.estimated_reward_status = 10.0
+    system.agents[untouched].state.estimated_reward_pu = 0.0
+
+    system._update_roles_sequential(update_candidates=[selected])
+
+    assert system.agents[selected].state.role == AgentRole.PERSONAL_UTILITY
+    assert system.agents[untouched].state.role == AgentRole.STATUS
 
 
 def test_async_partial_update_preserves_follow_graph_consistency(model_module):
@@ -585,13 +615,13 @@ def test_async_partial_update_empty_candidate_list_is_noop(model_module):
 
 
 
-# Not a valid invariant under the current Section 7.3 implementation:
-# agents with followers are excluded from Step-1 reputation switching.
-def test_async_partial_update_redirects_existing_followers_when_agent_becomes_follower(model_module):
+def test_async_partial_update_redirects_existing_followers_when_agent_becomes_follower(
+    model_module, monkeypatch
+):
     """
-    Async version of ROLE-5:
-    if selected agent i currently has followers and async reevaluation makes i follow best_k,
-    then i's followers should be redirected to best_k.
+    Async ROLE-5 scenario consistent with Section 7.3:
+    i starts with no followers (so i ∈ C), receives followers earlier in the same
+    Step-1 pass, then i switches to REPUTATION and those followers are redirected.
     """
     np.random.seed(0)
     system = make_system(
@@ -601,46 +631,39 @@ def test_async_partial_update_redirects_existing_followers_when_agent_becomes_fo
     )
     AgentRole = model_module.AgentRole
 
-    i = 1
-    new_leader = 3
-    old_follower_a = 0
-    old_follower_b = 2
+    follower_a, follower_b, i, new_leader = 0, 1, 3, 4
 
-    # agent i currently a PU leader with followers {0,2}
+    # Deterministic Step-1 order: followers first, then i.
+    monkeypatch.setattr(np.random, "shuffle", lambda xs: xs.sort())
+
+    # Agent i starts in C(t) and prefers to follow new_leader.
     system.agents[i].state.role = AgentRole.PERSONAL_UTILITY
     system.agents[i].state.following = None
-    system.agents[i].state.followers = {old_follower_a, old_follower_b}
+    system.agents[i].state.followers = set()
     system.agents[i].state.estimated_reward_pu = 0.0
-    system.agents[i].state.reputation_estimates = {0: 0.1, 2: 0.1, 3: 3.0, 4: 0.1, 1: 0.0}
+    system.agents[i].state.reputation_estimates = {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.0, 4: 3.0}
     system.agents[i].state.highest_rep_agent_estimate = new_leader
 
-    # those followers currently follow i
-    system.agents[old_follower_a].state.role = AgentRole.REPUTATION
-    system.agents[old_follower_a].state.following = i
-    system.agents[old_follower_a].state.followers = set()
+    # Two updatable agents initially choose i as leader.
+    for f in (follower_a, follower_b):
+        system.agents[f].state.role = AgentRole.PERSONAL_UTILITY
+        system.agents[f].state.following = None
+        system.agents[f].state.followers = set()
+        system.agents[f].state.estimated_reward_pu = 0.0
+        system.agents[f].state.reputation_estimates = {0: 0.0, 1: 0.0, 2: 0.0, 3: 2.5, 4: 0.2}
+        system.agents[f].state.highest_rep_agent_estimate = i
 
-    system.agents[old_follower_b].state.role = AgentRole.REPUTATION
-    system.agents[old_follower_b].state.following = i
-    system.agents[old_follower_b].state.followers = set()
-
-    # new leader
     system.agents[new_leader].state.role = AgentRole.PERSONAL_UTILITY
     system.agents[new_leader].state.followers = set()
 
-    # filler
-    system.agents[4].state.role = AgentRole.PERSONAL_UTILITY
-    system.agents[4].state.followers = set()
-
-    system._update_roles_sequential(update_candidates=[i])
+    system._update_roles_sequential(update_candidates=[follower_a, follower_b, i])
 
     assert system.agents[i].state.role == AgentRole.REPUTATION
     assert system.agents[i].state.following == new_leader
-
-    assert system.agents[old_follower_a].state.following == new_leader
-    assert system.agents[old_follower_b].state.following == new_leader
-
-    assert old_follower_a in system.agents[new_leader].state.followers
-    assert old_follower_b in system.agents[new_leader].state.followers
+    assert system.agents[follower_a].state.following == new_leader
+    assert system.agents[follower_b].state.following == new_leader
+    assert follower_a in system.agents[new_leader].state.followers
+    assert follower_b in system.agents[new_leader].state.followers
     assert len(system.agents[i].state.followers) == 0
 
 

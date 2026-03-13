@@ -672,6 +672,74 @@ def test_role_status_requires_min_followers(model_module):
     assert system.agents[0].state.role != AgentRole.STATUS
 
 
+def test_role_status_threshold_uses_ceil_of_c_times_n(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=10,
+        extra_config=dict(gamma=0.0, kappa=2.0, c_threshold=0.25),
+    )
+    AgentRole = model_module.AgentRole
+
+    agent = system.agents[0]
+    agent.state.role = AgentRole.PERSONAL_UTILITY
+    agent.state.followers = {1, 2}
+    agent.state.estimated_reward_status = 999.0
+    agent.state.estimated_reward_pu = 0.0
+
+    system._update_roles_sequential()
+
+    assert agent.state.role == AgentRole.PERSONAL_UTILITY
+
+
+def test_status_agent_with_zero_followers_reverts_to_personal_utility(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=6,
+        extra_config=dict(gamma=0.0, kappa=2.0, c_threshold=0.2),
+    )
+    AgentRole = model_module.AgentRole
+
+    i = 1
+    agent = system.agents[i]
+    agent.state.role = AgentRole.STATUS
+    agent.state.followers = set()
+    agent.state.following = None
+    agent.state.estimated_reward_status = 999.0
+    agent.state.estimated_reward_pu = 0.0
+
+    system._update_roles_sequential()
+
+    assert agent.state.role == AgentRole.PERSONAL_UTILITY
+
+
+def test_zero_follower_status_agent_can_enter_reputation_in_step1(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=4,
+        extra_config=dict(gamma=2.0, kappa=0.0, B_R=0.8, B_F=0.6, c_threshold=0.25),
+    )
+    AgentRole = model_module.AgentRole
+
+    i = 1
+    leader = 0
+    agent = system.agents[i]
+    agent.state.role = AgentRole.STATUS
+    agent.state.followers = set()
+    agent.state.following = None
+    agent.state.estimated_reward_pu = 0.0
+    agent.state.reputation_estimates = {0: 2.0, 1: 0.0, 2: 0.1, 3: 0.1}
+    agent.state.highest_rep_agent_estimate = leader
+
+    system._update_roles_sequential()
+
+    assert agent.state.role == AgentRole.REPUTATION
+    assert agent.state.following == leader
+    assert i in system.agents[leader].state.followers
+
+
 def test_role_status_switch_clears_following(model_module):
     np.random.seed(0)
     system = make_system(
@@ -688,7 +756,7 @@ def test_role_status_switch_clears_following(model_module):
     system.agents[i].state.following = leader
     system.agents[leader].state.followers.add(i)
 
-    system.agents[i].state.followers = {2}
+    system.agents[i].state.followers = {2, 3}
     system.agents[i].state.estimated_reward_status = 10.0
     system.agents[i].state.estimated_reward_pu = 0.0
 
@@ -897,8 +965,8 @@ def test_role_step2_threshold_met_but_status_not_chosen_if_payoff_comparison_fai
     i = 0
     agent = system.agents[i]
 
-    # threshold met: min followers = max(1, int(0.2*6)) = 1
-    agent.state.followers = {1}
+    # threshold met: ceil(0.2*6) = 2
+    agent.state.followers = {1, 2}
     agent.state.role = AgentRole.PERSONAL_UTILITY
 
     # but kappa * J_status <= J_pu, so should NOT switch
@@ -908,6 +976,37 @@ def test_role_step2_threshold_met_but_status_not_chosen_if_payoff_comparison_fai
     system._update_roles_sequential()
 
     assert agent.state.role != AgentRole.STATUS
+
+
+def test_role_step3_removes_agent_from_all_follower_sets(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=5,
+        extra_config=dict(gamma=0.0, kappa=0.0, c_threshold=0.2),
+    )
+    AgentRole = model_module.AgentRole
+
+    i = 1
+    agent = system.agents[i]
+    agent.state.role = AgentRole.REPUTATION
+    agent.state.following = 0
+    agent.state.followers = set()
+    agent.state.estimated_reward_pu = 10.0
+    agent.state.reputation_estimates = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+    agent.state.highest_rep_agent_estimate = 0
+
+    # Inject stale duplicate membership to verify Step-3 cleanup matches the paper's
+    # "remove from all F_j" behavior.
+    system.agents[0].state.followers = {i}
+    system.agents[2].state.followers = {i}
+
+    system._update_roles_sequential()
+
+    assert agent.state.role == AgentRole.PERSONAL_UTILITY
+    assert agent.state.following is None
+    assert i not in system.agents[0].state.followers
+    assert i not in system.agents[2].state.followers
 
 
 def test_role_step1_existing_follower_keeps_same_leader_when_still_worth_it(model_module):
@@ -1207,29 +1306,37 @@ def test_fast_path_phase4_updates_reputation_and_highest_rep_agent(model_module)
         [0.0, 9.0, 4.0],
     ], dtype=float)
 
-    observed_payoff_vector = np.array([10.0, 0.0, 0.0], dtype=float)
+    observed_utility_matrix = np.array([
+        [10.0, 0.0, 0.0],
+        [6.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+    ], dtype=float)
+    active_actor_ids = np.array([0], dtype=int)
     active_participant_ids = np.array([0, 1, 2], dtype=int)
     eta_v_t = 0.2
 
     system._phase4_updates_numpy_fast(
-        observed_payoff_vector=observed_payoff_vector,
+        observed_utility_matrix=observed_utility_matrix,
+        active_actor_ids=active_actor_ids,
         active_participant_ids=active_participant_ids,
         eta_v_t=eta_v_t,
     )
 
-    # v update: only target 0 is active, so all observers get delta_v(:,0)=+2.0
-    assert np.allclose(system._v_matrix[:, 0], 2.0)
+    # v update: only target 0 is active, with observer-specific utilities [10, 6, 2]
+    assert np.allclose(system._v_matrix[:, 0], np.array([2.0, 1.2, 0.4]))
 
     # average old s for each target:
     # k=0: mean(0,0,0)=0
     # k=1: mean(1,5,9)=5
     # k=2: mean(2,8,4)=14/3
     #
-    # then add delta_v. since only k=0 has delta +2, rows for active participants become:
-    # [2, 5, 14/3]
-    expected_row = np.array([2.0, 5.0, 14.0 / 3.0])
-    for i in range(3):
-        assert np.allclose(system._s_matrix[i], expected_row)
+    # then add each observer's own delta_v(:,0), giving distinct rows:
+    expected_rows = np.array([
+        [2.0, 5.0, 14.0 / 3.0],
+        [1.2, 5.0, 14.0 / 3.0],
+        [0.4, 5.0, 14.0 / 3.0],
+    ])
+    assert np.allclose(system._s_matrix, expected_rows)
 
     # highest reputation agent should be target 1 for agent 0 (self excluded)
     # because among non-self entries for row [2,5,14/3]:

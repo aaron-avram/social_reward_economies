@@ -389,6 +389,69 @@ def test_rep642_all_agents_update_personal_benefit_each_step(model_module):
     assert a1.state.personal_benefit_estimates[0] == pytest.approx(expected, abs=1e-12)
 
 
+def test_rep642_personal_benefit_is_observer_specific_in_step(model_module):
+    system = make_system(model_module, num_agents=3, extra_config=dict(role_update_base_interval=10**9))
+    actor = system.agents[0]
+    disagreeing_observer = system.agents[1]
+    agreeing_observer = system.agents[2]
+
+    for agent in system.agents:
+        agent.state.actor_interaction_rate = 0.0
+        agent.state.participant_interaction_rate = 0.0
+
+    actor.state.actor_interaction_rate = 100.0
+    actor.select_action = lambda state: 0
+
+    eta_v_t = system.config.eta_v_base / (1.0 + 1.0 * 0.01)
+
+    np.random.seed(0)
+    system.step()
+
+    assert disagreeing_observer.state.personal_benefit_estimates[0] == pytest.approx(0.0, abs=1e-12)
+    assert agreeing_observer.state.personal_benefit_estimates[0] == pytest.approx(eta_v_t, abs=1e-12)
+
+
+def test_rep642_shared_base_gaussian_observer_specific_utilities(model_module):
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(num_states=1, reward_model="shared_base_gaussian"),
+    )
+
+    system._reward_tables[:, :, :] = 0.0
+    system._reward_tables[0, 0, 1] = 0.4
+    system._reward_tables[1, 0, 1] = 1.2
+    system._reward_tables[2, 0, 1] = 2.3
+
+    utilities = system.compute_observer_utility_vector(0, 1)
+
+    assert np.allclose(utilities, np.array([0.4, 1.2, 2.3]))
+
+
+def test_rep642_numpy_fast_path_uses_observer_specific_utilities(model_module):
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(role_update_base_interval=10**9, use_numpy_fast_path=True),
+    )
+    actor = system.agents[0]
+
+    for agent in system.agents:
+        agent.state.actor_interaction_rate = 0.0
+        agent.state.participant_interaction_rate = 0.0
+
+    actor.state.actor_interaction_rate = 100.0
+    actor.select_action = lambda state: 0
+
+    eta_v_t = system.config.eta_v_base / (1.0 + 1.0 * 0.01)
+
+    np.random.seed(0)
+    system.step()
+
+    assert system._v_matrix[1, 0] == pytest.approx(0.0, abs=1e-12)
+    assert system._v_matrix[2, 0] == pytest.approx(eta_v_t, abs=1e-12)
+
+
 def test_rep643_non_participant_reputation_estimates_unchanged(model_module):
     system = make_system(model_module, num_agents=2, extra_config=dict(role_update_base_interval=10**9))
     a0, a1 = system.agents
@@ -605,6 +668,9 @@ def test_status_entry_can_occur_after_status_reward_learning(model_module):
     follower.state.role = AgentRole.REPUTATION
     follower.state.following = 0
     follower.state.followers = set()
+    follower.state.estimated_reward_pu = 0.0
+    follower.state.reputation_estimates = {0: 1.0, 1: 0.0, 2: 0.0}
+    follower.state.highest_rep_agent_estimate = 0
 
     # Ensure both leader and follower participate in actor/participant sets at this step.
     leader.state.actor_interaction_rate = 100.0
