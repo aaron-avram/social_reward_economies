@@ -11,6 +11,7 @@ This catalog uses grouped, stable IDs for the bugs originally identified in `src
 - `REP-4`: Personal-benefit estimates `v_i(k,t)` must update for all agents each step (not only active participants)
 - `REP-5`: Reputation followers must emulate the leader's active-role policy (`w_k(t)`, PU vs STATUS), not always `w_k^pu`
 - `REP-6`: Reputation reward estimate `\hat J_i^r(t)` must match `s_i(k,t)` for followed agent `k` (Section 6.6)
+- `REP-7`: Personal-benefit learning must use observer-specific utility `u_i(s(t), x_k(t))`, not actor `k`'s self-payoff
 - `ROLE-1`: Non-followers must bootstrap reputation-role entry from observed reputation signal
 - `ROLE-2`: Remove extra `max_rep >= B_i` gate from Step-1 follow condition
 - `ROLE-3`: Redirect if selected follow target is itself a follower
@@ -53,6 +54,9 @@ Section 6.4.5 specifies followers emulate leader behavior using `w_k(t)`, which 
 #### REP-6 (High)
 Section 6.6 specifies that active reputation-optimizing agents update reward estimate as `\hat J_i^r(t)=s_i(k,t)` for the followed agent `k`. Current implementation updates `estimated_reward_rep` as an EMA of the followed agent's realized payoff instead.
 
+#### REP-7 (High)
+Section 6.4.2 defines `v_i(k,t)` using the observer-specific utility `u_i(s(t), x_k(t))`. The old implementation reused actor `k`'s own realized payoff for every observer, so all agents learned essentially the same personal-benefit signal for a given actor action. That compressed observer disagreement and made action-based reputation shocks weaker than the paper intends.
+
 ### Role Updates
 
 #### ROLE-1 (High)
@@ -83,6 +87,12 @@ The following bugs were identified on **March 5, 2026** from new reputation-cove
 - `REP-4` via `test_rep642_all_agents_update_personal_benefit_each_step`
 - `REP-5` via `test_rep645_follower_tracks_status_policy_of_status_leader`
 - `REP-6` via `test_rep66_reputation_reward_estimate_matches_followed_agent_reputation`
+
+The following additional bug was identified on **March 12, 2026** from further reputation-learning
+audit and Experiment D debugging:
+
+- `REP-7` via `test_rep642_personal_benefit_is_observer_specific_in_step`
+- `REP-7` via `test_rep642_numpy_fast_path_uses_observer_specific_utilities`
 
 ## Note on Fixed Code
 
