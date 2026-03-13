@@ -997,6 +997,16 @@ class MultiAgentSystem:
         self.results['participant_counts'].append(num_participants)
         self.results['social_welfare'].append(sum(this_step_payoffs.values()))
 
+        self.results.setdefault('status_counts', []).append(
+            sum(1 for a in self.agents if a.state.role == AgentRole.STATUS)
+        )
+        self.results.setdefault('pu_counts', []).append(
+            sum(1 for a in self.agents if a.state.role == AgentRole.PERSONAL_UTILITY)
+        )
+        self.results.setdefault('rep_counts', []).append(
+            sum(1 for a in self.agents if a.state.role == AgentRole.REPUTATION)
+        )
+
         if mode == "light":
             return
 
