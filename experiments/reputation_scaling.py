@@ -25,7 +25,7 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import sys
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -71,6 +71,9 @@ class AggregateRecord:
     ci95_tail_welfare: float
 
 
+DetailedTrace = Dict[str, np.ndarray]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reputation scaling gamma sweep harness.")
     parser.add_argument("--mode", choices=["static", "async"], required=True)
@@ -108,8 +111,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plot-sample-interval",
         type=int,
-        default=250,
-        help="Downsample plotted time-series to every N steps (for paper-style visualization).",
+        default=1,
+        help="Downsample plotted time-series to every N steps (1 records every timestep).",
     )
     parser.add_argument(
         "--role-update-epochs",
@@ -119,6 +122,12 @@ def parse_args() -> argparse.Namespace:
              "(e.g., \"2000,3000,6000\"). Used when role_update_T_seq is empty.",
     )
     parser.add_argument("--tracking-mode", choices=["full", "light"], default="light")
+    parser.add_argument(
+        "--trace-detailed-seeds",
+        choices=["none", "first", "all"],
+        default="first",
+        help="When tracking-mode=full, export per-agent PU/reputation traces for none, the first seed, or all seeds.",
+    )
     parser.add_argument("--initial-actor-rate", type=float, default=0.2)
     parser.add_argument("--initial-participant-rate", type=float, default=0.2)
     parser.add_argument(
@@ -232,7 +241,7 @@ def make_config(args: argparse.Namespace, gamma: float, mode: str) -> SystemConf
         kappa=args.kappa,
         c_threshold=0.1,
         B_R=0.3,
-        B_F=0.15,
+        B_F=1_000_000.0,  # Disable hysteresis in Experiment B family; only Experiment D uses it.
         delta=0.15,
         alpha_pu_base=0.05,
         beta_status_base=0.05,
@@ -299,7 +308,7 @@ def run_single(
     mode: str,
     gamma: float,
     seed: int,
-) -> Tuple[RunRecord, np.ndarray, np.ndarray]:
+) -> Tuple[RunRecord, np.ndarray, np.ndarray, Optional[DetailedTrace]]:
     np.random.seed(seed)
     config = make_config(args, gamma=gamma, mode=mode)
     system = MultiAgentSystem(config)
@@ -375,7 +384,24 @@ def run_single(
         leader_switches=int(leader_switches),
         tail_welfare=tail_welfare,
     )
-    return record, top_follower_series, leader_series
+    detailed_trace: Optional[DetailedTrace] = None
+    if str(args.tracking_mode).lower() == "full":
+        pu_history = np.asarray(results.get("estimated_reward_pu_history", []), dtype=float)
+        rep_history = np.asarray(results.get("weighted_selected_reputation_history", []), dtype=float)
+        raw_rep_history = np.asarray(results.get("selected_reputation_history", []), dtype=float)
+        highest_rep_history = np.asarray(results.get("highest_rep_agent_history", []), dtype=int)
+        following_history = np.asarray(results.get("following_history", []), dtype=int)
+        if pu_history.size > 0 and rep_history.size > 0:
+            detailed_trace = {
+                "estimated_reward_pu_history": pu_history,
+                "weighted_selected_reputation_history": rep_history,
+                "selected_reputation_history": raw_rep_history,
+                "highest_rep_agent_history": highest_rep_history,
+                "following_history": following_history,
+                "role_update_times": np.asarray(results.get("role_update_times", []), dtype=int),
+            }
+
+    return record, top_follower_series, leader_series, detailed_trace
 
 
 def _mean_std_ci(values: Sequence[float]) -> Tuple[float, float, float]:
@@ -441,12 +467,53 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
         writer.writerows(rows)
 
 
+def build_static_role_update_times(args: argparse.Namespace, horizon: int) -> List[int]:
+    if args.mode == "async":
+        return []
+
+    horizon = max(0, int(horizon))
+    if horizon == 0:
+        return []
+
+    t_seq = parse_role_update_T_seq(args.role_update_T_seq)
+    if t_seq:
+        cursor = max(0, int(args.role_update_s0))
+        epochs = []
+        for interval in t_seq:
+            cursor += int(interval)
+            if 0 < cursor <= horizon:
+                epochs.append(int(cursor))
+        return epochs
+
+    epochs = parse_role_update_epochs(args.role_update_epochs)
+    if epochs:
+        return [int(t) for t in epochs if 0 < int(t) <= horizon]
+
+    if args.fixed_role_update_interval:
+        interval = max(1, int(args.role_update_base_interval))
+        return list(range(interval, horizon + 1, interval))
+
+    out: List[int] = []
+    epoch = 0
+    next_time = max(1, int(args.role_update_base_interval))
+    while next_time <= horizon:
+        out.append(int(next_time))
+        epoch += 1
+        next_interval = max(
+            int(args.role_update_base_interval),
+            int(args.role_update_base_interval * (1.0 + epoch * 0.1)),
+        )
+        next_time += next_interval
+    return out
+
+
 def plot_progression(
     mode: str,
     gammas: Sequence[float],
     top_series_by_gamma: Dict[float, List[np.ndarray]],
     output_file: Path,
     sample_interval: int,
+    role_update_times: Sequence[int],
 ) -> None:
     n = len(gammas)
     cols = 4 if n >= 4 else n
@@ -471,6 +538,15 @@ def plot_progression(
 
         ax.plot(x, mean, linewidth=1.6, label=f"gamma={gamma:g}")
         ax.fill_between(x, mean - std, mean + std, alpha=0.25)
+        for idx_line, step in enumerate(role_update_times):
+            ax.axvline(
+                int(step),
+                color="gray",
+                linestyle="--",
+                linewidth=0.8,
+                alpha=0.22,
+                label="Role update" if idx == 0 and idx_line == 0 else None,
+            )
         ax.set_title(f"gamma={gamma:g}")
         ax.set_xlabel("Timestep")
         ax.set_ylabel("Top followers")
@@ -537,6 +613,107 @@ def write_table_values_csv(
     write_csv(output_file, rows)
 
 
+def write_agent_trace_csv(
+    trace: DetailedTrace,
+    output_file: Path,
+) -> None:
+    pu_history = np.asarray(trace["estimated_reward_pu_history"], dtype=float)
+    rep_history = np.asarray(trace["weighted_selected_reputation_history"], dtype=float)
+    raw_rep_history = np.asarray(trace["selected_reputation_history"], dtype=float)
+    highest_rep_history = np.asarray(trace["highest_rep_agent_history"], dtype=int)
+    following_history = np.asarray(trace["following_history"], dtype=int)
+    role_update_times = set(int(t) for t in np.asarray(trace["role_update_times"], dtype=int).tolist())
+
+    n_steps, n_agents = pu_history.shape
+    rows = []
+    for t in range(n_steps):
+        row = {
+            "t": t + 1,
+            "role_update_step": int((t + 1) in role_update_times),
+        }
+        for agent_id in range(n_agents):
+            row[f"agent_{agent_id}_pu"] = float(pu_history[t, agent_id])
+            row[f"agent_{agent_id}_rep_weighted"] = float(rep_history[t, agent_id])
+            row[f"agent_{agent_id}_rep_raw"] = float(raw_rep_history[t, agent_id])
+            row[f"agent_{agent_id}_highest_rep_agent"] = int(highest_rep_history[t, agent_id])
+            row[f"agent_{agent_id}_following"] = int(following_history[t, agent_id])
+        rows.append(row)
+
+    write_csv(output_file, rows)
+
+
+def plot_agent_estimate_trajectories(
+    trace: DetailedTrace,
+    output_file: Path,
+    title: str,
+    *,
+    zoom_to_follow_window: bool,
+) -> None:
+    pu_history = np.asarray(trace["estimated_reward_pu_history"], dtype=float)
+    rep_history = np.asarray(trace["weighted_selected_reputation_history"], dtype=float)
+    role_update_times = [int(t) for t in np.asarray(trace["role_update_times"], dtype=int).tolist()]
+    n_steps, n_agents = pu_history.shape
+    x = np.arange(1, n_steps + 1)
+
+    cols = 4 if n_agents >= 8 else 2
+    rows = int(np.ceil(n_agents / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.0 * cols, 2.8 * rows), squeeze=False)
+
+    for agent_id in range(n_agents):
+        ax = axes[agent_id // cols][agent_id % cols]
+        pu = pu_history[:, agent_id]
+        rep = rep_history[:, agent_id]
+        follow_mask = rep > pu
+
+        ax.plot(x, pu, label="PU estimate", linewidth=1.2, color="tab:blue")
+        ax.plot(x, rep, label="gamma * reputation", linewidth=1.2, color="tab:red")
+        if np.any(follow_mask):
+            ax.fill_between(x, pu, rep, where=follow_mask, color="tab:red", alpha=0.16, step=None)
+
+        for idx_line, step in enumerate(role_update_times):
+            ax.axvline(
+                int(step),
+                color="gray",
+                linestyle="--",
+                linewidth=0.7,
+                alpha=0.22,
+                label="Role update" if agent_id == 0 and idx_line == 0 else None,
+            )
+
+        if zoom_to_follow_window and np.any(follow_mask):
+            idx = np.where(follow_mask)[0]
+            pad = max(10, int(0.05 * n_steps))
+            start = max(1, int(idx[0] + 1 - pad))
+            end = min(n_steps, int(idx[-1] + 1 + pad))
+            ax.set_xlim(start, end)
+        elif zoom_to_follow_window:
+            ax.text(
+                0.5,
+                0.90,
+                "No rep > PU window",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                fontsize=8,
+                color="dimgray",
+            )
+
+        ax.set_title(f"Agent {agent_id}", fontsize=10)
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Estimate")
+        ax.grid(True, alpha=0.3)
+
+    for idx in range(n_agents, rows * cols):
+        axes[idx // cols][idx % cols].axis("off")
+
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False)
+    fig.suptitle(title, fontsize=12, fontweight="bold", y=0.995)
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
+    plt.savefig(output_file, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def plot_paper_style_summary(
     mode: str,
     gammas: Sequence[float],
@@ -545,6 +722,7 @@ def plot_paper_style_summary(
     output_file: Path,
     num_agents: int,
     sample_interval: int,
+    role_update_times: Sequence[int],
 ) -> None:
     """
     Produce a figure styled close to the paper screenshot's chart section:
@@ -602,6 +780,15 @@ def plot_paper_style_summary(
             )
 
     ax.set_title("Maximum Followers for a Single Agent Over Time", fontsize=16)
+    for idx, step in enumerate(role_update_times):
+        ax.axvline(
+            int(step),
+            color="gray",
+            linestyle="--",
+            linewidth=0.8,
+            alpha=0.22,
+            label="Role update" if idx == 0 else None,
+        )
     ax.set_xlabel("Timestep", fontsize=12)
     ax.set_ylabel("Max Number of Followers", fontsize=12)
     ax.set_xlim(0, max(1, x_max))
@@ -667,6 +854,8 @@ def main() -> None:
     all_records: List[RunRecord] = []
     top_series_by_gamma: Dict[float, List[np.ndarray]] = {g: [] for g in gammas}
     leader_series_by_gamma: Dict[float, List[np.ndarray]] = {g: [] for g in gammas}
+    detailed_traces: Dict[Tuple[float, int], DetailedTrace] = {}
+    role_update_times = build_static_role_update_times(args, horizon=int(args.num_steps))
     total_jobs = len(gammas) * len(seeds)
     job = 0
     runs_csv = output_dir / f"reputation_scaling_runs_{args.mode}.csv"
@@ -680,10 +869,17 @@ def main() -> None:
         for seed in seeds:
             job += 1
             print(f"[{job:03d}/{total_jobs:03d}] mode={args.mode} gamma={gamma:g} seed={seed}", flush=True)
-            rec, top_series, leader_series = run_single(args=args, mode=args.mode, gamma=gamma, seed=seed)
+            rec, top_series, leader_series, detailed_trace = run_single(args=args, mode=args.mode, gamma=gamma, seed=seed)
             all_records.append(rec)
             top_series_by_gamma[gamma].append(top_series)
             leader_series_by_gamma[gamma].append(leader_series)
+            if detailed_trace is not None:
+                save_trace = (
+                    args.trace_detailed_seeds == "all"
+                    or (args.trace_detailed_seeds == "first" and seed == seeds[0])
+                )
+                if save_trace:
+                    detailed_traces[(gamma, seed)] = detailed_trace
             # Incremental checkpoint for long sweeps.
             write_csv(runs_csv, [asdict(r) for r in all_records])
 
@@ -698,6 +894,7 @@ def main() -> None:
         top_series_by_gamma,
         prog_png,
         sample_interval=max(1, int(args.plot_sample_interval)),
+        role_update_times=role_update_times,
     )
     plot_top_followers_curve(args.mode, agg_records, curve_png)
     plot_paper_style_summary(
@@ -708,7 +905,28 @@ def main() -> None:
         output_file=paper_png,
         num_agents=args.num_agents,
         sample_interval=max(1, int(args.plot_sample_interval)),
+        role_update_times=role_update_times,
     )
+
+    for (gamma, seed), trace in detailed_traces.items():
+        gamma_tag = _format_gamma(gamma)
+        trace_csv = output_dir / f"reputation_scaling_agent_traces_g{gamma_tag}_seed{seed}_{args.mode}.csv"
+        full_png = output_dir / f"reputation_scaling_agent_traces_full_g{gamma_tag}_seed{seed}_{args.mode}.png"
+        zoom_png = output_dir / f"reputation_scaling_agent_traces_zoom_g{gamma_tag}_seed{seed}_{args.mode}.png"
+
+        write_agent_trace_csv(trace, trace_csv)
+        plot_agent_estimate_trajectories(
+            trace,
+            full_png,
+            title=f"Experiment B traces: gamma={gamma:g}, seed={seed} (full)",
+            zoom_to_follow_window=False,
+        )
+        plot_agent_estimate_trajectories(
+            trace,
+            zoom_png,
+            title=f"Experiment B traces: gamma={gamma:g}, seed={seed} (zoomed to rep > PU)",
+            zoom_to_follow_window=True,
+        )
 
     print("\nCompleted.", flush=True)
     print(f"Per-run CSV:     {runs_csv}", flush=True)
@@ -717,6 +935,15 @@ def main() -> None:
     print(f"Progression PNG: {prog_png}", flush=True)
     print(f"Curve PNG:       {curve_png}", flush=True)
     print(f"Paper PNG:       {paper_png}", flush=True)
+    if detailed_traces:
+        print("Detailed trace artifacts written for:", flush=True)
+        for gamma, seed in sorted(detailed_traces.keys()):
+            gamma_tag = _format_gamma(gamma)
+            print(
+                f"  gamma={gamma:g} seed={seed}: "
+                f"reputation_scaling_agent_traces_g{gamma_tag}_seed{seed}_{args.mode}.csv",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

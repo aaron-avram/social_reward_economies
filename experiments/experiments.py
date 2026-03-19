@@ -48,7 +48,7 @@ def make_config(**kwargs) -> SystemConfig:
         kappa=2.0,
         c_threshold=0.1,
         B_R=0.3,   # Lowered from 0.8: payoffs are in [0,1] with mean ~0.5
-        B_F=0.15,  # Lowered from 0.6: must be < B_R
+        B_F=1_000_000.0,  # Disable hysteresis outside Experiment D (A-C meeting decision, 2026-03-18)
         delta=0.15,
         alpha_pu_base=0.05,
         beta_status_base=0.05,
@@ -58,6 +58,7 @@ def make_config(**kwargs) -> SystemConfig:
         role_update_base_interval=100,
         gossip_rate=0.5,
         gossip_alpha=0.5,
+        tracking_mode="full",
     )
     defaults.update(kwargs)
     return SystemConfig(**defaults)
@@ -86,17 +87,37 @@ def summarize(results: dict, label: str):
     print(f"  Avg social welfare (last 500 steps): {welfare:.4f}")
 
 
+def _role_update_times(results: dict) -> list[int]:
+    return [int(t) for t in results.get("role_update_times", [])]
+
+
+def _add_role_update_lines(ax, role_update_times: list[int]):
+    if not role_update_times:
+        return
+    for idx, step in enumerate(role_update_times):
+        ax.axvline(
+            int(step),
+            color="gray",
+            linestyle="--",
+            linewidth=0.8,
+            alpha=0.25,
+            label="Role update" if idx == 0 else None,
+        )
+
+
 def plot_follower_timeseries(results: dict, title: str, filename: str):
     """Save a plot of follower counts over time."""
     followers_array = np.array(results["follower_counts"])
     n_agents = followers_array.shape[1]
     colors = plt.cm.tab10(np.linspace(0, 1, n_agents))
+    role_update_times = _role_update_times(results)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
     ax = axes[0]
     for i in range(n_agents):
         ax.plot(followers_array[:, i], label=f"Agent {i}", color=colors[i], linewidth=1.5)
+    _add_role_update_lines(ax, role_update_times)
     ax.set_title(f"Follower Counts — {title}")
     ax.set_xlabel("Timestep")
     ax.set_ylabel("Followers")
@@ -105,6 +126,7 @@ def plot_follower_timeseries(results: dict, title: str, filename: str):
 
     ax2 = axes[1]
     ax2.plot(results["social_welfare"], color="darkgreen", linewidth=1.5)
+    _add_role_update_lines(ax2, role_update_times)
     ax2.set_title("Social Welfare")
     ax2.set_xlabel("Timestep")
     ax2.set_ylabel("Total payoff per step")
@@ -113,6 +135,93 @@ def plot_follower_timeseries(results: dict, title: str, filename: str):
     plt.suptitle(title, fontsize=11, fontweight="bold")
     plt.tight_layout()
     plt.savefig(filename, dpi=120, bbox_inches="tight")
+    plt.close()
+    print(f"  Plot saved → {filename}")
+
+
+def write_agent_estimate_csv(results: dict, filename: str):
+    pu_history = np.asarray(results["estimated_reward_pu_history"], dtype=float)
+    rep_history = np.asarray(results["weighted_selected_reputation_history"], dtype=float)
+    raw_rep_history = np.asarray(results["selected_reputation_history"], dtype=float)
+    highest_rep_history = np.asarray(results["highest_rep_agent_history"], dtype=int)
+    following_history = np.asarray(results["following_history"], dtype=int)
+    role_update_times = set(_role_update_times(results))
+
+    if pu_history.size == 0:
+        raise ValueError("Full tracking is required to export agent estimate trajectories.")
+
+    n_steps, n_agents = pu_history.shape
+    rows = []
+    for t in range(n_steps):
+        row = {
+            "t": t + 1,
+            "role_update_step": int((t + 1) in role_update_times),
+        }
+        for agent_id in range(n_agents):
+            row[f"agent_{agent_id}_pu"] = float(pu_history[t, agent_id])
+            row[f"agent_{agent_id}_rep_weighted"] = float(rep_history[t, agent_id])
+            row[f"agent_{agent_id}_rep_raw"] = float(raw_rep_history[t, agent_id])
+            row[f"agent_{agent_id}_highest_rep_agent"] = int(highest_rep_history[t, agent_id])
+            row[f"agent_{agent_id}_following"] = int(following_history[t, agent_id])
+        rows.append(row)
+
+    import csv
+
+    with open(filename, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  Trajectory CSV saved → {filename}")
+
+
+def plot_agent_reward_trajectories(results: dict, title: str, filename: str, zoom_to_follow_window: bool):
+    pu_history = np.asarray(results["estimated_reward_pu_history"], dtype=float)
+    rep_history = np.asarray(results["weighted_selected_reputation_history"], dtype=float)
+    if pu_history.size == 0 or rep_history.size == 0:
+        raise ValueError("Full tracking is required to plot agent estimate trajectories.")
+
+    role_update_times = _role_update_times(results)
+    n_steps, n_agents = pu_history.shape
+    x = np.arange(1, n_steps + 1)
+    cols = 2
+    rows = int(np.ceil(n_agents / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(13, 2.8 * rows), squeeze=False, sharey=False)
+
+    for agent_id in range(n_agents):
+        ax = axes[agent_id // cols][agent_id % cols]
+        pu = pu_history[:, agent_id]
+        rep = rep_history[:, agent_id]
+        follow_mask = rep > pu
+
+        ax.plot(x, pu, label="PU estimate", linewidth=1.5, color="tab:blue")
+        ax.plot(x, rep, label="gamma * reputation", linewidth=1.5, color="tab:red")
+        if np.any(follow_mask):
+            ax.fill_between(x, pu, rep, where=follow_mask, color="tab:red", alpha=0.15)
+        _add_role_update_lines(ax, role_update_times)
+
+        if zoom_to_follow_window and np.any(follow_mask):
+            idx = np.where(follow_mask)[0]
+            pad = max(10, int(0.05 * n_steps))
+            start = max(1, int(idx[0] + 1 - pad))
+            end = min(n_steps, int(idx[-1] + 1 + pad))
+            ax.set_xlim(start, end)
+        elif zoom_to_follow_window:
+            ax.text(0.5, 0.92, "No rep > PU window", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=9, color="dimgray")
+
+        ax.set_title(f"Agent {agent_id}")
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Estimate")
+        ax.grid(True, alpha=0.3)
+
+    for idx in range(n_agents, rows * cols):
+        axes[idx // cols][idx % cols].axis("off")
+
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False)
+    fig.suptitle(title, fontsize=12, fontweight="bold", y=0.995)
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
+    plt.savefig(filename, dpi=130, bbox_inches="tight")
     plt.close()
     print(f"  Plot saved → {filename}")
 
@@ -136,6 +245,19 @@ def experiment_A():
     summarize(results, "Experiment A: γ=0, κ=0")
     plot_follower_timeseries(results, "Experiment A: γ=0 κ=0 (No leader expected)",
                              str(OUTPUT_DIR / "exp_A_no_leader.png"))
+    write_agent_estimate_csv(results, str(OUTPUT_DIR / "exp_A_agent_reward_trajectories.csv"))
+    plot_agent_reward_trajectories(
+        results,
+        "Experiment A: PU vs gamma*reputation (full trajectory)",
+        str(OUTPUT_DIR / "exp_A_agent_reward_trajectories_full.png"),
+        zoom_to_follow_window=False,
+    )
+    plot_agent_reward_trajectories(
+        results,
+        "Experiment A: PU vs gamma*reputation (zoomed to rep > PU window)",
+        str(OUTPUT_DIR / "exp_A_agent_reward_trajectories_zoom.png"),
+        zoom_to_follow_window=True,
+    )
     return results
 
 
@@ -158,6 +280,19 @@ def experiment_B():
     summarize(results, "Experiment B: γ=2.0, κ=0")
     plot_follower_timeseries(results, "Experiment B: γ=2.0 κ=0 (Leader expected)",
                              str(OUTPUT_DIR / "exp_B_reputation_only.png"))
+    write_agent_estimate_csv(results, str(OUTPUT_DIR / "exp_B_agent_reward_trajectories.csv"))
+    plot_agent_reward_trajectories(
+        results,
+        "Experiment B: PU vs gamma*reputation (full trajectory)",
+        str(OUTPUT_DIR / "exp_B_agent_reward_trajectories_full.png"),
+        zoom_to_follow_window=False,
+    )
+    plot_agent_reward_trajectories(
+        results,
+        "Experiment B: PU vs gamma*reputation (zoomed to rep > PU window)",
+        str(OUTPUT_DIR / "exp_B_agent_reward_trajectories_zoom.png"),
+        zoom_to_follow_window=True,
+    )
     return results
 
 
@@ -314,7 +449,7 @@ if __name__ == "__main__":
     row("B", 2.0, 0.0, res_B)
     row("C", 2.0, 2.0, res_C)
     if res_D2:
-        row("D-pre", 2.0, 2.0, res_D1)
-        row("D-post", 2.0, 2.0, res_D2)
+        row("D-pre", 2.5, 2.0, res_D1)
+        row("D-post", 2.5, 2.0, res_D2)
 
     print("\nDone.")

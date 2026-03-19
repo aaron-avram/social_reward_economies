@@ -443,6 +443,12 @@ class MultiAgentSystem:
             'roles_history': [],
             'actual_payoffs': [],
             'social_welfare': [],
+            'role_update_times': [],
+            'estimated_reward_pu_history': [],
+            'selected_reputation_history': [],
+            'weighted_selected_reputation_history': [],
+            'highest_rep_agent_history': [],
+            'following_history': [],
         }
 
         # Optional reward table r_i(s,a) for richer state/action-dependent experiments.
@@ -613,6 +619,7 @@ class MultiAgentSystem:
         Execute one time step following Sections 6–7
         """
         self.time_step += 1
+        role_updated_this_step = False
         
         # --- Time-scale aware stepsizes (Section 8, Assumption 5) ---
         # Decay as 1/t to satisfy summability conditions
@@ -783,6 +790,7 @@ class MultiAgentSystem:
                 self._update_roles_sequential()
                 self.role_update_epoch += 1
                 self._next_role_update_epoch_idx += 1
+                role_updated_this_step = True
         else:
             if self.config.fixed_role_update_interval:
                 # Fixed global epoch spacing (static schedule): s_n = n * T.
@@ -797,6 +805,7 @@ class MultiAgentSystem:
             if self.time_step >= self._next_role_update_time:
                 self._update_roles_sequential()
                 self.role_update_epoch += 1
+                role_updated_this_step = True
 
                 if self.config.fixed_role_update_interval:
                     next_interval = max(1, int(self.config.role_update_base_interval))
@@ -814,7 +823,12 @@ class MultiAgentSystem:
         
         # === PHASE 7: Tracking ===
         
-        self._track_results(this_step_payoffs, len(active_actors), len(active_participants))
+        self._track_results(
+            this_step_payoffs,
+            len(active_actors),
+            len(active_participants),
+            role_updated=role_updated_this_step,
+        )
     
     def _update_roles_sequential(self, update_candidates=None):
         """
@@ -878,11 +892,21 @@ class MultiAgentSystem:
         for i in update_order:
             agent = self.agents[i]
             
-            # Determine effective threshold with hysteresis (Section 7.1.3)
-            if i in C_r:
-                B_i = self.config.B_F  # Continue following with lower threshold
+            # Determine effective threshold with hysteresis (Section 7.1.3).
+            # Meeting update (2026-03-18): the lower hysteresis threshold is only
+            # allowed when there is exactly one current opinion leader. During
+            # multi-leader competition, followers should switch freely without the
+            # lower threshold stabilizing rival camps.
+            opinion_leader_count = sum(1 for leader_id in range(self.config.num_agents) if len(followers[leader_id]) > 0)
+            hysteresis_active = (
+                i in C_r
+                and opinion_leader_count == 1
+                and float(self.config.B_F) < float(self.config.B_R)
+            )
+            if hysteresis_active:
+                B_i = self.config.B_F
             else:
-                B_i = self.config.B_R  # Start following with higher threshold
+                B_i = self.config.B_R
             
             # Get estimated rewards (weighted by gamma for reputation)
             # [ROLE-1] For Step-1 role switching, use observed reputation signal
@@ -984,7 +1008,7 @@ class MultiAgentSystem:
         for i in range(self.config.num_agents):
             self.agents[i].state.followers = followers[i]
     
-    def _track_results(self, this_step_payoffs: Dict, num_actors: int, num_participants: int):
+    def _track_results(self, this_step_payoffs: Dict, num_actors: int, num_participants: int, role_updated: bool = False):
         """Track simulation results for analysis"""
         mode = str(self.config.tracking_mode).lower()
         if mode not in {"full", "light"}:
@@ -996,6 +1020,8 @@ class MultiAgentSystem:
         self.results['actor_counts'].append(num_actors)
         self.results['participant_counts'].append(num_participants)
         self.results['social_welfare'].append(sum(this_step_payoffs.values()))
+        if role_updated:
+            self.results['role_update_times'].append(int(self.time_step))
 
         self.results.setdefault('status_counts', []).append(
             sum(1 for a in self.agents if a.state.role == AgentRole.STATUS)
@@ -1023,6 +1049,29 @@ class MultiAgentSystem:
         self.results['actor_rates'].append([a.state.actor_interaction_rate for a in self.agents])
         self.results['roles_history'].append([a.state.role for a in self.agents])
         self.results['actual_payoffs'].append(this_step_payoffs)
+        self.results['estimated_reward_pu_history'].append(
+            [float(a.state.estimated_reward_pu) for a in self.agents]
+        )
+
+        selected_rep = []
+        weighted_selected_rep = []
+        highest_rep_agents = []
+        following_ids = []
+        for agent in self.agents:
+            leader_id = agent.state.highest_rep_agent_estimate
+            highest_rep_agents.append(-1 if leader_id is None else int(leader_id))
+            following_ids.append(-1 if agent.state.following is None else int(agent.state.following))
+            if leader_id is None:
+                rep_val = 0.0
+            else:
+                rep_val = float(agent.state.reputation_estimates.get(leader_id, 0.0))
+            selected_rep.append(rep_val)
+            weighted_selected_rep.append(float(self.config.gamma) * rep_val)
+
+        self.results['selected_reputation_history'].append(selected_rep)
+        self.results['weighted_selected_reputation_history'].append(weighted_selected_rep)
+        self.results['highest_rep_agent_history'].append(highest_rep_agents)
+        self.results['following_history'].append(following_ids)
     
     def simulate(self) -> Dict:
         """Run the full simulation"""

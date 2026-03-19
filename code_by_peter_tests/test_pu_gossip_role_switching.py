@@ -627,6 +627,62 @@ def test_role_hysteresis_start_vs_continue(model_module):
     assert system.agents[2].state.following == leader
 
 
+def test_role_hysteresis_disabled_when_multiple_leaders_exist(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=4,
+        extra_config=dict(gamma=1.0, kappa=0.0, B_R=0.8, B_F=0.6, delta=0.0, c_threshold=1.0),
+    )
+    AgentRole = model_module.AgentRole
+
+    # Two simultaneous leaders: 0 and 3.
+    system.agents[0].state.followers = {2}
+    system.agents[3].state.followers = {1}
+
+    system.agents[1].state.role = AgentRole.REPUTATION
+    system.agents[1].state.following = 3
+    system.agents[2].state.role = AgentRole.REPUTATION
+    system.agents[2].state.following = 0
+    system.agents[2].state.followers = set()
+    system.agents[2].state.estimated_reward_pu = 0.0
+    system.agents[2].state.reputation_estimates = {0: 0.7, 1: 0.0, 2: 0.0, 3: 0.65}
+    system.agents[2].identify_highest_reputation_agent()
+
+    system._update_roles_sequential()
+
+    # With multiple leaders, the lower hysteresis threshold B_F should not apply.
+    assert system.agents[2].state.role == AgentRole.PERSONAL_UTILITY
+    assert system.agents[2].state.following is None
+
+
+def test_role_hysteresis_never_blocks_switch_to_higher_reputation_leader(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=4,
+        extra_config=dict(gamma=1.0, kappa=0.0, B_R=0.8, B_F=0.6, delta=0.0, c_threshold=1.0),
+    )
+    AgentRole = model_module.AgentRole
+
+    system.agents[0].state.followers = {2}
+    system.agents[3].state.followers = {1}
+
+    system.agents[1].state.role = AgentRole.REPUTATION
+    system.agents[1].state.following = 3
+    system.agents[2].state.role = AgentRole.REPUTATION
+    system.agents[2].state.following = 0
+    system.agents[2].state.followers = set()
+    system.agents[2].state.estimated_reward_pu = 0.0
+    system.agents[2].state.reputation_estimates = {0: 0.6, 1: 0.0, 2: 0.0, 3: 0.9}
+    system.agents[2].identify_highest_reputation_agent()
+
+    system._update_roles_sequential()
+
+    assert system.agents[2].state.role == AgentRole.REPUTATION
+    assert system.agents[2].state.following == 3
+
+
 def test_role_follower_chain_redirection_simple(model_module):
     np.random.seed(0)
     system = make_system(
@@ -976,6 +1032,34 @@ def test_role_step2_threshold_met_but_status_not_chosen_if_payoff_comparison_fai
     system._update_roles_sequential()
 
     assert agent.state.role != AgentRole.STATUS
+
+
+def test_full_tracking_records_role_update_times_and_agent_estimate_histories(model_module):
+    np.random.seed(0)
+    config = model_module.SystemConfig(
+        num_agents=3,
+        num_states=2,
+        num_actions=2,
+        num_time_steps=5,
+        gamma=2.0,
+        kappa=0.0,
+        B_R=0.3,
+        B_F=1_000_000.0,
+        role_update_base_interval=2,
+        fixed_role_update_interval=True,
+        tracking_mode="full",
+        use_numpy_fast_path=False,
+    )
+    system = model_module.MultiAgentSystem(config)
+    with np.errstate(all="ignore"):
+        results = system.simulate()
+
+    assert results["role_update_times"] == [2, 4]
+    assert len(results["estimated_reward_pu_history"]) == 5
+    assert len(results["selected_reputation_history"]) == 5
+    assert len(results["weighted_selected_reputation_history"]) == 5
+    assert len(results["highest_rep_agent_history"]) == 5
+    assert len(results["following_history"]) == 5
 
 
 def test_role_step3_removes_agent_from_all_follower_sets(model_module):

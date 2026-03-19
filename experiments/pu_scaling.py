@@ -132,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plot-sample-interval",
         type=int,
-        default=250,
+        default=1,
     )
 
     return parser.parse_args()
@@ -216,7 +216,7 @@ def make_config(
         kappa=0.0,   # Experiment A
         c_threshold=0.1,
         B_R=0.3,
-        B_F=0.15,
+        B_F=1_000_000.0,
         delta=0.15,
         alpha_pu_base=0.05,
         beta_status_base=0.05,
