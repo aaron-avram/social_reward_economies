@@ -72,6 +72,7 @@ class AggregateRecord:
 
 
 DetailedTrace = Dict[str, np.ndarray]
+AsyncDebugArtifacts = Dict[str, object]
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,6 +155,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional per-step Bernoulli probability for role updates in async mode. "
              "If omitted, async uses independent per-agent clocks driven by "
              "role_update_T_seq/role_update_epochs (or role_update_base_interval as fallback).",
+    )
+    parser.add_argument(
+        "--async-decision-audit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="In async mode, write scheduler/decision audit CSVs and compact per-agent debug traces.",
     )
     return parser.parse_args()
 
@@ -298,9 +305,297 @@ def _leader_switches(leader_series: np.ndarray) -> int:
     return sum(1 for a, b in zip(non_null[:-1], non_null[1:]) if a != b)
 
 
+def _serialize_int_array(values: np.ndarray) -> str:
+    arr = np.asarray(values, dtype=int).reshape(-1)
+    return "|".join(str(int(v)) for v in arr.tolist())
+
+
+def _extract_trace_bundle(results: Dict[str, object]) -> Optional[DetailedTrace]:
+    pu_history = np.asarray(results.get("estimated_reward_pu_history", []), dtype=float)
+    rep_history = np.asarray(results.get("weighted_selected_reputation_history", []), dtype=float)
+    raw_rep_history = np.asarray(results.get("selected_reputation_history", []), dtype=float)
+    highest_rep_history = np.asarray(results.get("highest_rep_agent_history", []), dtype=int)
+    following_history = np.asarray(results.get("following_history", []), dtype=int)
+    role_label_history = np.asarray(results.get("role_label_history", []), dtype=object)
+    if pu_history.size == 0 or rep_history.size == 0:
+        return None
+    return {
+        "estimated_reward_pu_history": pu_history,
+        "weighted_selected_reputation_history": rep_history,
+        "selected_reputation_history": raw_rep_history,
+        "highest_rep_agent_history": highest_rep_history,
+        "following_history": following_history,
+        "role_label_history": role_label_history,
+        "role_update_times": np.asarray(results.get("role_update_times", []), dtype=int),
+    }
+
+
 def _time_to_threshold(series: np.ndarray, threshold: int) -> int:
     idx = np.where(series >= threshold)[0]
     return int(idx[0] + 1) if idx.size > 0 else -1
+
+
+def _select_async_focus_agents(
+    system: MultiAgentSystem,
+    trace: DetailedTrace,
+) -> List[Dict[str, object]]:
+    n_agents = system.config.num_agents
+    follower_counts = [len(a.state.followers) for a in system.agents]
+    ranked = sorted(range(n_agents), key=lambda i: (follower_counts[i], -i), reverse=True)
+    role_labels = np.asarray(trace["role_label_history"], dtype=object)
+    highest_rep_history = np.asarray(trace["highest_rep_agent_history"], dtype=int)
+    following_history = np.asarray(trace["following_history"], dtype=int)
+    final_roles = role_labels[-1].tolist() if role_labels.size > 0 else [a.state.role.value for a in system.agents]
+    final_highest = highest_rep_history[-1].tolist() if highest_rep_history.size > 0 else [-1] * n_agents
+    final_following = following_history[-1].tolist() if following_history.size > 0 else [
+        -1 if a.state.following is None else int(a.state.following) for a in system.agents
+    ]
+
+    focus_rows: List[Dict[str, object]] = []
+    seen = set()
+
+    def add(agent_id: Optional[int], reason: str):
+        if agent_id is None:
+            return
+        agent_id = int(agent_id)
+        if agent_id < 0 or agent_id >= n_agents or agent_id in seen:
+            return
+        seen.add(agent_id)
+        focus_rows.append({"agent_id": agent_id, "focus_reason": reason})
+
+    top_leader = ranked[0] if ranked and follower_counts[ranked[0]] > 0 else None
+    second_leader = next((i for i in ranked[1:] if follower_counts[i] > 0), None)
+    add(top_leader, "top_leader")
+    add(second_leader, "second_leader")
+
+    if top_leader is not None:
+        for follower_id in sorted(system.agents[top_leader].state.followers)[:3]:
+            add(int(follower_id), "top_leader_follower")
+
+    for agent_id, role_label in enumerate(final_roles):
+        if str(role_label) == "personal_utility":
+            add(agent_id, "final_pu")
+        if len(focus_rows) >= 8:
+            break
+
+    mismatch_agents = [
+        i for i in range(n_agents)
+        if int(final_following[i]) >= 0 and int(final_highest[i]) != int(final_following[i])
+    ]
+    for agent_id in mismatch_agents[:2]:
+        add(agent_id, "highest_follow_mismatch")
+
+    for agent_id in ranked:
+        if len(focus_rows) >= 10:
+            break
+        add(agent_id, "filler")
+
+    return focus_rows
+
+
+def write_async_scheduler_csv(rows: Sequence[dict], output_file: Path) -> None:
+    write_csv(output_file, rows)
+
+
+def write_async_focus_trace_csv(
+    trace: DetailedTrace,
+    audit_rows: Sequence[dict],
+    focus_agents: Sequence[dict],
+    output_file: Path,
+) -> None:
+    pu_history = np.asarray(trace["estimated_reward_pu_history"], dtype=float)
+    rep_history = np.asarray(trace["weighted_selected_reputation_history"], dtype=float)
+    raw_rep_history = np.asarray(trace["selected_reputation_history"], dtype=float)
+    highest_rep_history = np.asarray(trace["highest_rep_agent_history"], dtype=int)
+    following_history = np.asarray(trace["following_history"], dtype=int)
+    role_label_history = np.asarray(trace["role_label_history"], dtype=object)
+    role_update_times = set(int(t) for t in np.asarray(trace["role_update_times"], dtype=int).tolist())
+
+    audit_map = {
+        (int(row["t"]), int(row["agent_id"])): row
+        for row in audit_rows
+    }
+
+    n_steps, _ = pu_history.shape
+    rows = []
+    for t_idx in range(n_steps):
+        step = t_idx + 1
+        for focus in focus_agents:
+            agent_id = int(focus["agent_id"])
+            audit = audit_map.get((step, agent_id))
+            rows.append(
+                {
+                    "t": step,
+                    "role_update_step": int(step in role_update_times),
+                    "agent_id": agent_id,
+                    "focus_reason": str(focus["focus_reason"]),
+                    "role": str(role_label_history[t_idx, agent_id]),
+                    "following": int(following_history[t_idx, agent_id]),
+                    "highest_rep_agent": int(highest_rep_history[t_idx, agent_id]),
+                    "selected_rep_raw": float(raw_rep_history[t_idx, agent_id]),
+                    "selected_rep_weighted": float(rep_history[t_idx, agent_id]),
+                    "estimated_reward_pu": float(pu_history[t_idx, agent_id]),
+                    "effective_threshold": "" if audit is None or audit["effective_threshold"] is None else float(audit["effective_threshold"]),
+                    "decision_code": "NO_UPDATE" if audit is None else str(audit["decision_code"]),
+                    "scheduled_for_update": 0 if audit is None else 1,
+                    "opinion_leader_count": "" if audit is None else int(audit["opinion_leader_count"]),
+                    "hysteresis_active": "" if audit is None else int(bool(audit["hysteresis_active"])),
+                    "redirect_applied": "" if audit is None else int(bool(audit["redirect_applied"])),
+                }
+            )
+
+    write_csv(output_file, rows)
+
+
+def diagnose_async_run(
+    *,
+    args: argparse.Namespace,
+    record: RunRecord,
+    system: MultiAgentSystem,
+    decision_audit_rows: Sequence[dict],
+    scheduler_rows: Sequence[dict],
+    update_counts: np.ndarray,
+) -> Dict[str, object]:
+    n_agents = int(args.num_agents)
+    expected_updates = float(args.num_steps) / max(1.0, float(args.role_update_base_interval))
+    mean_updates = float(np.mean(update_counts)) if update_counts.size > 0 else 0.0
+    min_updates = int(np.min(update_counts)) if update_counts.size > 0 else 0
+    max_updates = int(np.max(update_counts)) if update_counts.size > 0 else 0
+    zero_update_agents = int(np.sum(update_counts == 0)) if update_counts.size > 0 else 0
+
+    step1_rows = [row for row in decision_audit_rows if bool(row.get("in_C", False))]
+    threshold_fail_rows = [row for row in step1_rows if row.get("decision_code") == "STAY_PU_REP_BELOW_THRESHOLD"]
+    follow_rows = [row for row in step1_rows if str(row.get("decision_code", "")).startswith("FOLLOW_")]
+    redirect_rows = [row for row in follow_rows if bool(row.get("redirect_applied", False))]
+    root_lock_rows = [row for row in decision_audit_rows if (not bool(row.get("in_C", False))) and bool(row.get("has_followers", False))]
+    hysteresis_violations = [
+        row for row in decision_audit_rows
+        if bool(row.get("hysteresis_active", False)) and int(row.get("opinion_leader_count", 0)) > 1
+    ]
+    better_candidate_rows = [
+        row for row in step1_rows
+        if int(row.get("following_before", -1)) >= 0
+        and float(row.get("selected_reputation_raw", 0.0)) > float(row.get("current_followed_reputation_raw", 0.0))
+    ]
+    better_candidate_switch_rows = [
+        row for row in better_candidate_rows
+        if row.get("decision_code") in {"FOLLOW_DIRECT", "FOLLOW_REDIRECT"}
+        and int(row.get("following_after", -1)) != int(row.get("following_before", -1))
+    ]
+
+    highest_targets = [int(row["highest_rep_agent_estimate"]) for row in step1_rows if int(row["highest_rep_agent_estimate"]) >= 0]
+    if highest_targets:
+        counts = np.bincount(np.asarray(highest_targets, dtype=int), minlength=n_agents)
+        distinct_highest_targets = int(np.sum(counts > 0))
+        max_highest_target_share = float(np.max(counts) / max(1, len(highest_targets)))
+    else:
+        distinct_highest_targets = 0
+        max_highest_target_share = 0.0
+
+    final_root_count = int(sum(1 for a in system.agents if len(a.state.followers) > 0))
+
+    bucket = "STEP1-THRESHOLD"
+    if zero_update_agents > 0 or mean_updates < 0.5 * expected_updates:
+        bucket = "ASYNC-SCHEDULING"
+    elif final_root_count > 1 and len(root_lock_rows) >= max(len(threshold_fail_rows), len(redirect_rows)):
+        bucket = "ROOT-LOCKING"
+    elif len(redirect_rows) > 0 and final_root_count > 1 and len(redirect_rows) >= len(threshold_fail_rows):
+        bucket = "REDIRECT-STICKINESS"
+    elif distinct_highest_targets > max(10, n_agents // 5) and max_highest_target_share < 0.2:
+        bucket = "NOISY-ARGMAX"
+    elif len(threshold_fail_rows) >= max(len(root_lock_rows), len(redirect_rows)):
+        bucket = "STEP1-THRESHOLD"
+
+    if bucket == "ASYNC-SCHEDULING":
+        diagnosis_text = (
+            f"main reason followers do not reach N-1 is ASYNC-SCHEDULING: "
+            f"mean updates/agent={mean_updates:.2f} versus expected ≈{expected_updates:.2f}, "
+            f"with {zero_update_agents} agents never reevaluating."
+        )
+    elif bucket == "ROOT-LOCKING":
+        diagnosis_text = (
+            f"main reason followers do not reach N-1 is ROOT-LOCKING: "
+            f"{final_root_count} root leaders finish with followers, and {len(root_lock_rows)} scheduled updates "
+            f"were on agents blocked from Step 1 because they already had followers."
+        )
+    elif bucket == "REDIRECT-STICKINESS":
+        diagnosis_text = (
+            f"main reason followers do not reach N-1 is REDIRECT-STICKINESS: "
+            f"{len(redirect_rows)} Step-1 follow decisions redirected through existing follower chains, "
+            f"which keeps multiple roots alive."
+        )
+    elif bucket == "NOISY-ARGMAX":
+        diagnosis_text = (
+            f"main reason followers do not reach N-1 is NOISY-ARGMAX: "
+            f"highest-reputation choices were split across {distinct_highest_targets} targets and "
+            f"the largest target share was only {max_highest_target_share:.3f}."
+        )
+    else:
+        diagnosis_text = (
+            f"main reason followers do not reach N-1 is STEP1-THRESHOLD: "
+            f"{len(threshold_fail_rows)} candidate updates failed because gamma*rep did not beat max(B_i, J_pu), "
+            f"while only {len(better_candidate_switch_rows)}/{len(better_candidate_rows)} better-candidate opportunities switched."
+        )
+
+    return {
+        "mode": str(record.mode),
+        "gamma": float(record.gamma),
+        "seed": int(record.seed),
+        "diagnosis_bucket": bucket,
+        "diagnosis_text": diagnosis_text,
+        "mean_updates_per_agent": mean_updates,
+        "min_updates_per_agent": min_updates,
+        "max_updates_per_agent": max_updates,
+        "zero_update_agents": zero_update_agents,
+        "expected_updates_per_agent": expected_updates,
+        "step1_candidate_rows": int(len(step1_rows)),
+        "threshold_fail_rows": int(len(threshold_fail_rows)),
+        "follow_rows": int(len(follow_rows)),
+        "redirect_rows": int(len(redirect_rows)),
+        "root_lock_rows": int(len(root_lock_rows)),
+        "better_candidate_rows": int(len(better_candidate_rows)),
+        "better_candidate_switch_rows": int(len(better_candidate_switch_rows)),
+        "hysteresis_violations": int(len(hysteresis_violations)),
+        "distinct_highest_targets": int(distinct_highest_targets),
+        "max_highest_target_share": float(max_highest_target_share),
+        "final_root_count": int(final_root_count),
+        "leader_switches": int(record.leader_switches),
+        "final_top_followers": int(record.final_top_followers),
+        "time_to_90pct_followers": int(record.time_to_90pct_followers),
+    }
+
+
+def write_async_diagnosis_markdown(
+    *,
+    output_file: Path,
+    diagnosis: Dict[str, object],
+    focus_agents: Sequence[dict],
+) -> None:
+    lines = [
+        "# Async Debug Diagnosis",
+        "",
+        f"- gamma: {diagnosis['gamma']}",
+        f"- seed: {diagnosis['seed']}",
+        f"- bucket: {diagnosis['diagnosis_bucket']}",
+        f"- summary: {diagnosis['diagnosis_text']}",
+        "",
+        "## Key checks",
+        f"- updates per agent: mean={diagnosis['mean_updates_per_agent']:.2f}, min={diagnosis['min_updates_per_agent']}, max={diagnosis['max_updates_per_agent']}, zero={diagnosis['zero_update_agents']}",
+        f"- threshold failures: {diagnosis['threshold_fail_rows']} / {diagnosis['step1_candidate_rows']} Step-1 candidate updates",
+        f"- redirect follows: {diagnosis['redirect_rows']} / {diagnosis['follow_rows']} follow decisions",
+        f"- root-lock rows: {diagnosis['root_lock_rows']}",
+        f"- hysteresis violations with multiple leaders: {diagnosis['hysteresis_violations']}",
+        f"- better-candidate switches: {diagnosis['better_candidate_switch_rows']} / {diagnosis['better_candidate_rows']}",
+        f"- distinct highest-reputation targets: {diagnosis['distinct_highest_targets']} (max share {diagnosis['max_highest_target_share']:.3f})",
+        f"- final root leaders with followers: {diagnosis['final_root_count']}",
+        "",
+        "## Focus agents",
+    ]
+    for row in focus_agents:
+        lines.append(f"- agent {int(row['agent_id'])}: {row['focus_reason']}")
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text("\n".join(lines) + "\n")
 
 
 def run_single(
@@ -308,10 +603,16 @@ def run_single(
     mode: str,
     gamma: float,
     seed: int,
-) -> Tuple[RunRecord, np.ndarray, np.ndarray, Optional[DetailedTrace]]:
+) -> Tuple[RunRecord, np.ndarray, np.ndarray, Optional[DetailedTrace], Optional[AsyncDebugArtifacts]]:
     np.random.seed(seed)
     config = make_config(args, gamma=gamma, mode=mode)
     system = MultiAgentSystem(config)
+    async_debug_enabled = bool(mode == "async" and args.async_decision_audit)
+    if async_debug_enabled:
+        system.enable_async_decision_audit()
+
+    scheduler_rows: List[Dict[str, object]] = []
+    update_counts = np.zeros(args.num_agents, dtype=int)
 
     if mode == "async":
         with redirect_stdout(io.StringIO()):
@@ -332,11 +633,15 @@ def run_single(
             for _ in range(args.num_steps):
                 system.step()
                 if args.async_role_update_prob is None:
+                    role_timers_before = role_timers.copy()
                     role_timers -= 1
                     update_ids = np.where(role_timers <= 0)[0]
                     if update_ids.size > 0:
                         update_list = update_ids.tolist()
                         system._update_roles_sequential(update_list)
+                        system.refresh_last_tracked_state()
+                        system.results.setdefault("role_update_times", []).append(int(system.time_step))
+                        update_counts[update_ids] += 1
 
                         if len(interval_seq) == 1:
                             role_timers[update_ids] += int(interval_seq[0])
@@ -350,13 +655,38 @@ def run_single(
                                 if idx < len(interval_seq) - 1:
                                     interval_indices[agent_id] = idx + 1
                         system.role_update_epoch += 1
+                    if async_debug_enabled:
+                        scheduler_rows.append(
+                            {
+                                "t": int(system.time_step),
+                                "update_ids": _serialize_int_array(update_ids),
+                                "update_count": int(update_ids.size),
+                                "role_timers_before_decrement": _serialize_int_array(role_timers_before),
+                                "role_timers_after_reset": _serialize_int_array(role_timers),
+                                "interval_indices": _serialize_int_array(interval_indices),
+                            }
+                        )
                 else:
                     update_mask = np.random.random(args.num_agents) < async_update_prob
                     update_ids = np.where(update_mask)[0]
                     if update_ids.size > 0:
                         system._update_roles_sequential(update_ids.tolist())
+                        system.refresh_last_tracked_state()
                         # Track async update events for diagnostics.
                         system.role_update_epoch += 1
+                        system.results.setdefault("role_update_times", []).append(int(system.time_step))
+                        update_counts[update_ids] += 1
+                    if async_debug_enabled:
+                        scheduler_rows.append(
+                            {
+                                "t": int(system.time_step),
+                                "update_ids": _serialize_int_array(update_ids),
+                                "update_count": int(update_ids.size),
+                                "role_timers_before_decrement": "",
+                                "role_timers_after_reset": "",
+                                "interval_indices": "",
+                            }
+                        )
             results = _finalize_results(system)
     else:
         with redirect_stdout(io.StringIO()):
@@ -386,22 +716,30 @@ def run_single(
     )
     detailed_trace: Optional[DetailedTrace] = None
     if str(args.tracking_mode).lower() == "full":
-        pu_history = np.asarray(results.get("estimated_reward_pu_history", []), dtype=float)
-        rep_history = np.asarray(results.get("weighted_selected_reputation_history", []), dtype=float)
-        raw_rep_history = np.asarray(results.get("selected_reputation_history", []), dtype=float)
-        highest_rep_history = np.asarray(results.get("highest_rep_agent_history", []), dtype=int)
-        following_history = np.asarray(results.get("following_history", []), dtype=int)
-        if pu_history.size > 0 and rep_history.size > 0:
-            detailed_trace = {
-                "estimated_reward_pu_history": pu_history,
-                "weighted_selected_reputation_history": rep_history,
-                "selected_reputation_history": raw_rep_history,
-                "highest_rep_agent_history": highest_rep_history,
-                "following_history": following_history,
-                "role_update_times": np.asarray(results.get("role_update_times", []), dtype=int),
-            }
+        detailed_trace = _extract_trace_bundle(results)
 
-    return record, top_follower_series, leader_series, detailed_trace
+    async_debug: Optional[AsyncDebugArtifacts] = None
+    if async_debug_enabled:
+        trace_bundle = _extract_trace_bundle(results)
+        decision_audit_rows = system.get_async_decision_audit_rows()
+        focus_agents = _select_async_focus_agents(system, trace_bundle) if trace_bundle is not None else []
+        diagnosis = diagnose_async_run(
+            args=args,
+            record=record,
+            system=system,
+            decision_audit_rows=decision_audit_rows,
+            scheduler_rows=scheduler_rows,
+            update_counts=update_counts,
+        )
+        async_debug = {
+            "scheduler_rows": scheduler_rows,
+            "decision_audit_rows": decision_audit_rows,
+            "focus_agents": focus_agents,
+            "diagnosis": diagnosis,
+            "trace_bundle": trace_bundle,
+        }
+
+    return record, top_follower_series, leader_series, detailed_trace, async_debug
 
 
 def _mean_std_ci(values: Sequence[float]) -> Tuple[float, float, float]:
@@ -849,12 +1187,14 @@ def main() -> None:
             )
         else:
             print(f"async_mode=bernoulli_per_agent(p={float(args.async_role_update_prob):.6f})", flush=True)
+        print(f"async_decision_audit={bool(args.async_decision_audit)}", flush=True)
     print("#" * 72, flush=True)
 
     all_records: List[RunRecord] = []
     top_series_by_gamma: Dict[float, List[np.ndarray]] = {g: [] for g in gammas}
     leader_series_by_gamma: Dict[float, List[np.ndarray]] = {g: [] for g in gammas}
     detailed_traces: Dict[Tuple[float, int], DetailedTrace] = {}
+    async_diagnosis_rows: List[dict] = []
     role_update_times = build_static_role_update_times(args, horizon=int(args.num_steps))
     total_jobs = len(gammas) * len(seeds)
     job = 0
@@ -869,7 +1209,12 @@ def main() -> None:
         for seed in seeds:
             job += 1
             print(f"[{job:03d}/{total_jobs:03d}] mode={args.mode} gamma={gamma:g} seed={seed}", flush=True)
-            rec, top_series, leader_series, detailed_trace = run_single(args=args, mode=args.mode, gamma=gamma, seed=seed)
+            rec, top_series, leader_series, detailed_trace, async_debug = run_single(
+                args=args,
+                mode=args.mode,
+                gamma=gamma,
+                seed=seed,
+            )
             all_records.append(rec)
             top_series_by_gamma[gamma].append(top_series)
             leader_series_by_gamma[gamma].append(leader_series)
@@ -880,6 +1225,28 @@ def main() -> None:
                 )
                 if save_trace:
                     detailed_traces[(gamma, seed)] = detailed_trace
+            if async_debug is not None:
+                gamma_tag = _format_gamma(gamma)
+                scheduler_csv = output_dir / f"reputation_scaling_async_scheduler_g{gamma_tag}_seed{seed}.csv"
+                audit_csv = output_dir / f"reputation_scaling_async_decision_audit_g{gamma_tag}_seed{seed}.csv"
+                focus_csv = output_dir / f"reputation_scaling_async_focus_trace_g{gamma_tag}_seed{seed}.csv"
+                diagnosis_md = output_dir / f"reputation_scaling_async_diagnosis_g{gamma_tag}_seed{seed}.md"
+
+                write_async_scheduler_csv(async_debug["scheduler_rows"], scheduler_csv)
+                write_csv(audit_csv, async_debug["decision_audit_rows"])
+                if async_debug["trace_bundle"] is not None:
+                    write_async_focus_trace_csv(
+                        async_debug["trace_bundle"],
+                        async_debug["decision_audit_rows"],
+                        async_debug["focus_agents"],
+                        focus_csv,
+                    )
+                write_async_diagnosis_markdown(
+                    output_file=diagnosis_md,
+                    diagnosis=async_debug["diagnosis"],
+                    focus_agents=async_debug["focus_agents"],
+                )
+                async_diagnosis_rows.append(dict(async_debug["diagnosis"]))
             # Incremental checkpoint for long sweeps.
             write_csv(runs_csv, [asdict(r) for r in all_records])
 
@@ -888,6 +1255,11 @@ def main() -> None:
     write_csv(runs_csv, [asdict(r) for r in all_records])
     write_csv(agg_csv, [asdict(r) for r in agg_records])
     write_table_values_csv(gammas=gammas, aggregate_rows=agg_records, output_file=table_csv)
+    if async_diagnosis_rows:
+        write_csv(
+            output_dir / "reputation_scaling_async_diagnosis_summary.csv",
+            async_diagnosis_rows,
+        )
     plot_progression(
         args.mode,
         gammas,

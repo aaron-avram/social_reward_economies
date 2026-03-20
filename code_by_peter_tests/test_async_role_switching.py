@@ -17,6 +17,12 @@ def model_module():
     return load_model_module()
 
 
+def _parse_serialized_ids(text):
+    if text is None or text == "":
+        return []
+    return [int(part) for part in str(text).split("|") if part != ""]
+
+
 # ==================== ASYNC ROLE SWITCHING (partial updates) ====================
 
 def test_async_partial_update_only_selected_agent_recomputes_role(model_module):
@@ -712,3 +718,178 @@ def test_async_agent_with_followers_cannot_enter_reputation_switch_step(model_mo
     assert system.agents[i].state.followers == {0, 2}
     assert system.agents[0].state.following == i
     assert system.agents[2].state.following == i
+
+
+def test_async_scheduler_audit_records_exact_timer_expirations():
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    rep_scaling = importlib.import_module("experiments.reputation_scaling")
+
+    class Args:
+        mode = "async"
+        num_agents = 4
+        num_states = 2
+        num_actions = 2
+        num_steps = 8
+        kappa = 0.0
+        tail_window = 5
+        role_update_s0 = 0
+        role_update_T_seq = "3"
+        role_update_base_interval = 3
+        fixed_role_update_interval = True
+        role_update_epochs = ""
+        tracking_mode = "light"
+        numpy_fast_path = False
+        initial_actor_rate = 0.2
+        initial_participant_rate = 0.2
+        reward_model = "simple_preferred_action"
+        reward_base_mu = 0.5
+        reward_base_sigma = 0.08
+        reward_agent_sigma = 0.1
+        reward_clip_min = 0.01
+        reward_clip_max = 2.5
+        async_role_update_prob = None
+        async_decision_audit = True
+        trace_detailed_seeds = "none"
+        plot_sample_interval = 1
+        output_dir = "."
+
+    np.random.seed(0)
+    _, _, _, _, async_debug = rep_scaling.run_single(args=Args(), mode="async", gamma=2.0, seed=0)
+
+    assert async_debug is not None
+    scheduler_rows = async_debug["scheduler_rows"]
+    assert len(scheduler_rows) == Args.num_steps
+
+    for row in scheduler_rows:
+        before = np.array(_parse_serialized_ids(row["role_timers_before_decrement"]), dtype=int)
+        after = np.array(_parse_serialized_ids(row["role_timers_after_reset"]), dtype=int)
+        update_ids = _parse_serialized_ids(row["update_ids"])
+        if before.size == 0:
+            continue
+        expected_updates = np.where(before - 1 <= 0)[0].tolist()
+        assert update_ids == expected_updates
+        if update_ids:
+            assert after.size == before.size
+            for idx in update_ids:
+                assert after[idx] > 0
+
+
+def test_async_decision_audit_records_threshold_and_redirect_fields(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=4,
+        extra_config=dict(gamma=2.0, kappa=0.0, B_R=0.1, B_F=0.05, c_threshold=1.0),
+    )
+    AgentRole = model_module.AgentRole
+
+    system.enable_async_decision_audit()
+
+    system.agents[0].state.role = AgentRole.PERSONAL_UTILITY
+    system.agents[0].state.followers = {1}
+
+    system.agents[1].state.role = AgentRole.REPUTATION
+    system.agents[1].state.following = 0
+    system.agents[1].state.followers = set()
+
+    system.agents[2].state.role = AgentRole.PERSONAL_UTILITY
+    system.agents[2].state.followers = set()
+    system.agents[2].state.following = None
+    system.agents[2].state.estimated_reward_pu = 0.0
+    system.agents[2].state.reputation_estimates = {0: 0.5, 1: 2.0, 2: 0.0, 3: 0.1}
+    system.agents[2].state.highest_rep_agent_estimate = 1
+
+    system.agents[3].state.role = AgentRole.PERSONAL_UTILITY
+    system.agents[3].state.followers = set()
+
+    system.time_step = 17
+    system._update_roles_sequential(update_candidates=[2])
+
+    row = system.get_async_decision_audit_rows()[-1]
+    assert row["t"] == 17
+    assert row["agent_id"] == 2
+    assert row["in_C"] is True
+    assert row["effective_threshold"] == pytest.approx(0.1)
+    assert row["step1_condition_met"] is True
+    assert row["best_k_before_redirect"] == 1
+    assert row["best_k_after_redirect"] == 0
+    assert row["redirect_target_is_follower"] is True
+    assert row["redirect_applied"] is True
+    assert row["decision_code"] == "FOLLOW_REDIRECT"
+    assert row["new_role"] == AgentRole.REPUTATION.value
+    assert row["following_after"] == 0
+
+
+def test_async_decision_audit_hysteresis_inactive_with_multiple_leaders(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=5,
+        extra_config=dict(gamma=1.0, kappa=0.0, B_R=0.8, B_F=0.6, c_threshold=1.0),
+    )
+    AgentRole = model_module.AgentRole
+
+    system.enable_async_decision_audit()
+
+    system.agents[0].state.role = AgentRole.PERSONAL_UTILITY
+    system.agents[0].state.followers = {1}
+
+    system.agents[3].state.role = AgentRole.PERSONAL_UTILITY
+    system.agents[3].state.followers = {4}
+
+    system.agents[1].state.role = AgentRole.REPUTATION
+    system.agents[1].state.following = 0
+    system.agents[1].state.followers = set()
+    system.agents[1].state.estimated_reward_pu = 0.0
+    system.agents[1].state.reputation_estimates = {0: 0.7, 1: 0.0, 2: 0.1, 3: 0.5, 4: 0.1}
+    system.agents[1].state.highest_rep_agent_estimate = 0
+
+    system.agents[2].state.role = AgentRole.PERSONAL_UTILITY
+    system.agents[2].state.followers = set()
+
+    system.agents[4].state.role = AgentRole.REPUTATION
+    system.agents[4].state.following = 3
+    system.agents[4].state.followers = set()
+
+    system._update_roles_sequential(update_candidates=[1])
+
+    row = system.get_async_decision_audit_rows()[-1]
+    assert row["agent_id"] == 1
+    assert row["opinion_leader_count"] == 2
+    assert row["hysteresis_active"] is False
+    assert row["effective_threshold"] == pytest.approx(0.8)
+
+
+def test_async_decision_audit_decision_code_matches_threshold_fail_outcome(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(gamma=1.0, kappa=0.0, B_R=0.8, B_F=0.6, c_threshold=1.0),
+    )
+    AgentRole = model_module.AgentRole
+
+    system.enable_async_decision_audit()
+
+    system.agents[0].state.role = AgentRole.PERSONAL_UTILITY
+    system.agents[0].state.followers = {1}
+
+    system.agents[1].state.role = AgentRole.REPUTATION
+    system.agents[1].state.following = 0
+    system.agents[1].state.followers = set()
+    system.agents[1].state.estimated_reward_pu = 1.0
+    system.agents[1].state.reputation_estimates = {0: 0.1, 1: 0.0, 2: 0.0}
+    system.agents[1].state.highest_rep_agent_estimate = 0
+
+    system.agents[2].state.role = AgentRole.PERSONAL_UTILITY
+    system.agents[2].state.followers = set()
+
+    system._update_roles_sequential(update_candidates=[1])
+
+    row = system.get_async_decision_audit_rows()[-1]
+    assert row["decision_code"] == "STAY_PU_REP_BELOW_THRESHOLD"
+    assert row["new_role"] == AgentRole.PERSONAL_UTILITY.value
+    assert row["following_after"] == -1

@@ -29,7 +29,7 @@ import math
 import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Set, List, Tuple
+from typing import Dict, Set, List, Tuple, Optional
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
@@ -449,7 +449,14 @@ class MultiAgentSystem:
             'weighted_selected_reputation_history': [],
             'highest_rep_agent_history': [],
             'following_history': [],
+            'role_label_history': [],
         }
+
+        # Async-debug instrumentation is opt-in so normal experiment runs do not
+        # pay the memory/serialization cost.
+        self._async_decision_audit_enabled = False
+        self._async_decision_audit_rows: List[Dict[str, object]] = []
+        self._compact_debug_histories_enabled = False
 
         # Optional reward table r_i(s,a) for richer state/action-dependent experiments.
         self._reward_tables = None
@@ -514,6 +521,69 @@ class MultiAgentSystem:
             return sorted(set(epochs))
 
         return sorted(set(int(t) for t in self.config.role_update_epochs if int(t) > 0))
+
+    def enable_async_decision_audit(self):
+        """
+        Enable compact per-step histories plus per-update decision rows for async
+        role-switch debugging. This is lighter than full tracking but preserves
+        the fields needed to trace Step-1 decisions over time.
+        """
+        self._async_decision_audit_enabled = True
+        self._compact_debug_histories_enabled = True
+
+    def get_async_decision_audit_rows(self) -> List[Dict[str, object]]:
+        return list(self._async_decision_audit_rows)
+
+    def refresh_last_tracked_state(self):
+        """
+        Async harnesses apply subset role updates after step()-level tracking.
+        Refresh the most recent tracked state so timestep t reflects the post-update
+        follower graph and compact histories for that same timestep.
+        """
+        if not self.results.get("follower_counts"):
+            return
+
+        followers = [len(a.state.followers) for a in self.agents]
+        self.results["follower_counts"][-1] = followers
+        if self.results.get("status_counts"):
+            self.results["status_counts"][-1] = sum(
+                1 for a in self.agents if a.state.role == AgentRole.STATUS
+            )
+        if self.results.get("pu_counts"):
+            self.results["pu_counts"][-1] = sum(
+                1 for a in self.agents if a.state.role == AgentRole.PERSONAL_UTILITY
+            )
+        if self.results.get("rep_counts"):
+            self.results["rep_counts"][-1] = sum(
+                1 for a in self.agents if a.state.role == AgentRole.REPUTATION
+            )
+
+        if self.results.get("estimated_reward_pu_history"):
+            self.results["estimated_reward_pu_history"][-1] = [
+                float(a.state.estimated_reward_pu) for a in self.agents
+            ]
+        if self.results.get("role_label_history"):
+            self.results["role_label_history"][-1] = [str(a.state.role.value) for a in self.agents]
+        if self.results.get("selected_reputation_history"):
+            selected_rep = []
+            weighted_selected_rep = []
+            highest_rep_agents = []
+            following_ids = []
+            for agent in self.agents:
+                leader_id = agent.state.highest_rep_agent_estimate
+                highest_rep_agents.append(-1 if leader_id is None else int(leader_id))
+                following_ids.append(-1 if agent.state.following is None else int(agent.state.following))
+                if leader_id is None:
+                    rep_val = 0.0
+                else:
+                    rep_val = float(agent.state.reputation_estimates.get(leader_id, 0.0))
+                selected_rep.append(rep_val)
+                weighted_selected_rep.append(float(self.config.gamma) * rep_val)
+
+            self.results["selected_reputation_history"][-1] = selected_rep
+            self.results["weighted_selected_reputation_history"][-1] = weighted_selected_rep
+            self.results["highest_rep_agent_history"][-1] = highest_rep_agents
+            self.results["following_history"][-1] = following_ids
 
     def _sync_s_matrix_to_state_dicts(self, agent_ids=None):
         """Materialize dense s_i(k,t) rows into per-agent dicts when needed."""
@@ -868,6 +938,53 @@ class MultiAgentSystem:
             if not updatable:
                 return
 
+        audit_rows: Optional[Dict[int, Dict[str, object]]] = None
+        if self._async_decision_audit_enabled:
+            audit_rows = {}
+            initial_opinion_leader_count = sum(
+                1 for leader_id in range(self.config.num_agents) if len(followers[leader_id]) > 0
+            )
+            for i in sorted(updatable):
+                agent = self.agents[i]
+                highest_rep_agent = agent.state.highest_rep_agent_estimate
+                selected_rep_raw = 0.0
+                if highest_rep_agent is not None:
+                    selected_rep_raw = float(agent.state.reputation_estimates.get(highest_rep_agent, 0.0))
+                following_before = -1 if agent.state.following is None else int(agent.state.following)
+                current_followed_rep_raw = 0.0
+                if following_before >= 0:
+                    current_followed_rep_raw = float(
+                        agent.state.reputation_estimates.get(following_before, 0.0)
+                    )
+                audit_rows[i] = {
+                    "t": int(self.time_step),
+                    "agent_id": int(i),
+                    "scheduled_for_update": True,
+                    "current_role": str(agent.state.role.value),
+                    "has_followers": bool(len(followers[i]) > 0),
+                    "in_C": False,
+                    "following_before": following_before,
+                    "highest_rep_agent_estimate": -1 if highest_rep_agent is None else int(highest_rep_agent),
+                    "selected_reputation_raw": selected_rep_raw,
+                    "selected_reputation_weighted": float(self.config.gamma) * selected_rep_raw,
+                    "current_followed_reputation_raw": current_followed_rep_raw,
+                    "current_followed_reputation_weighted": float(self.config.gamma) * current_followed_rep_raw,
+                    "estimated_reward_pu": float(agent.state.estimated_reward_pu),
+                    "effective_threshold": None,
+                    "opinion_leader_count": int(initial_opinion_leader_count),
+                    "hysteresis_active": False,
+                    "step1_rep_signal_raw": 0.0,
+                    "step1_rep_signal_weighted": 0.0,
+                    "step1_condition_met": False,
+                    "best_k_before_redirect": -1,
+                    "best_k_after_redirect": -1,
+                    "redirect_applied": False,
+                    "redirect_target_is_follower": False,
+                    "new_role": str(agent.state.role.value),
+                    "following_after": following_before,
+                    "decision_code": "NOT_IN_C",
+                }
+
         # [STATUS-2] Recompute status membership for agents reevaluated in this call.
         # Section 7.4 determines STATUS only for agents that meet follower and payoff
         # criteria at the current epoch. Clearing stale STATUS flags for updatable
@@ -884,6 +1001,10 @@ class MultiAgentSystem:
         # Partition C into agents already following (C_r) and not following (C_pu)
         C_r = C & R  # Already following
         C_pu = C & P  # Not yet following
+
+        if audit_rows is not None:
+            for i in audit_rows:
+                audit_rows[i]["in_C"] = bool(i in C)
         
         # Process in random order to avoid bias
         update_order = list(C & updatable)
@@ -916,27 +1037,51 @@ class MultiAgentSystem:
             max_rep = max(agent.state.reputation_estimates.values()) if agent.state.reputation_estimates else 0.0
             est_rep_weighted = self.config.gamma * max_rep  # γ·s_i(L_i,t) per Section 6.6 + 7.3
             est_pu = agent.state.estimated_reward_pu
+            if audit_rows is not None:
+                audit_rows[i]["effective_threshold"] = float(B_i)
+                audit_rows[i]["opinion_leader_count"] = int(opinion_leader_count)
+                audit_rows[i]["hysteresis_active"] = bool(hysteresis_active)
+                audit_rows[i]["step1_rep_signal_raw"] = float(max_rep)
+                audit_rows[i]["step1_rep_signal_weighted"] = float(est_rep_weighted)
 
             # Decision: should optimize reputation? (Section 7.3, line 1)
             # [ROLE-2] Section 7.3 uses a single condition:
             # γĴ^r_i > max{B_i, Ĵ^pu_i}. We intentionally do NOT add an extra
             # "and max_rep >= B_i" gate is not in the paper and blocks all following.
-            if est_rep_weighted > max(B_i, est_pu):
+            step1_condition_met = bool(est_rep_weighted > max(B_i, est_pu))
+            if audit_rows is not None:
+                audit_rows[i]["step1_condition_met"] = step1_condition_met
+
+            if step1_condition_met:
                 # Follow highest reputation agent
                 best_k = agent.state.highest_rep_agent_estimate
+                best_k_before_redirect = -1 if best_k is None else int(best_k)
+                redirect_target_is_follower = (
+                    best_k in R and self.agents[best_k].state.following is not None
+                ) if best_k is not None else False
+                redirect_applied = False
                 
                 # Check if best_k is already a follower (Section 7.2)
                 # [ROLE-3] If the selected target best_k is itself a follower,
                 # redirect to best_k's leader so we avoid indirect follower chains.
                 # Check if best_k is in R (already following), then follow
                 # best_k's leader instead to prevent indirect follower chains.
-                if best_k in R and self.agents[best_k].state.following is not None:
+                if redirect_target_is_follower:
                     best_k = self.agents[best_k].state.following
+                    redirect_applied = True
+
+                if audit_rows is not None:
+                    audit_rows[i]["best_k_before_redirect"] = best_k_before_redirect
+                    audit_rows[i]["best_k_after_redirect"] = -1 if best_k is None else int(best_k)
+                    audit_rows[i]["redirect_applied"] = bool(redirect_applied)
+                    audit_rows[i]["redirect_target_is_follower"] = bool(redirect_target_is_follower)
 
                 # [ROLE-4] After redirect, ensure we don't follow ourselves
                 # (can happen if redirect chain points back to i)
                 if best_k == i:
                     # Skip following - stay in personal utility instead
+                    if audit_rows is not None:
+                        audit_rows[i]["decision_code"] = "SELF_REDIRECT_BLOCK"
                     continue
 
                 # [ROLE-5] When agent i becomes a follower, redirect i's own followers
@@ -957,8 +1102,15 @@ class MultiAgentSystem:
                 
                 R.add(i)
                 P.discard(i)
+                if audit_rows is not None:
+                    if redirect_applied:
+                        audit_rows[i]["decision_code"] = "FOLLOW_REDIRECT"
+                    else:
+                        audit_rows[i]["decision_code"] = "FOLLOW_DIRECT"
         
             else:
+                if audit_rows is not None:
+                    audit_rows[i]["decision_code"] = "STAY_PU_REP_BELOW_THRESHOLD"
                 # Existing follower no longer wants to keep following:
                 # remove from R so Step 3 can send it back to PU
                 if i in C_r:
@@ -989,6 +1141,8 @@ class MultiAgentSystem:
                     S.add(i)
                     P.discard(i)
                     R.discard(i)
+                    if audit_rows is not None and i in audit_rows:
+                        audit_rows[i]["decision_code"] = "STATUS_TAKEN"
         
         # === STEP 3: Personal Utility (Section 7.5) ===
         # All remaining agents optimize personal utility
@@ -1003,10 +1157,20 @@ class MultiAgentSystem:
                     agent.state.following = None
                 
                 P.add(i)
+                if audit_rows is not None and i in audit_rows:
+                    if audit_rows[i]["decision_code"] == "NOT_IN_C":
+                        audit_rows[i]["decision_code"] = "FALLBACK_TO_PU"
         
         # === Apply updated follower relationships ===
         for i in range(self.config.num_agents):
             self.agents[i].state.followers = followers[i]
+
+        if audit_rows is not None:
+            for i, row in audit_rows.items():
+                agent = self.agents[i]
+                row["new_role"] = str(agent.state.role.value)
+                row["following_after"] = -1 if agent.state.following is None else int(agent.state.following)
+                self._async_decision_audit_rows.append(row)
     
     def _track_results(self, this_step_payoffs: Dict, num_actors: int, num_participants: int, role_updated: bool = False):
         """Track simulation results for analysis"""
@@ -1033,6 +1197,35 @@ class MultiAgentSystem:
             sum(1 for a in self.agents if a.state.role == AgentRole.REPUTATION)
         )
 
+        collect_compact_histories = (mode == "full") or self._compact_debug_histories_enabled
+        if collect_compact_histories:
+            self.results['estimated_reward_pu_history'].append(
+                [float(a.state.estimated_reward_pu) for a in self.agents]
+            )
+            self.results['role_label_history'].append(
+                [str(a.state.role.value) for a in self.agents]
+            )
+
+            selected_rep = []
+            weighted_selected_rep = []
+            highest_rep_agents = []
+            following_ids = []
+            for agent in self.agents:
+                leader_id = agent.state.highest_rep_agent_estimate
+                highest_rep_agents.append(-1 if leader_id is None else int(leader_id))
+                following_ids.append(-1 if agent.state.following is None else int(agent.state.following))
+                if leader_id is None:
+                    rep_val = 0.0
+                else:
+                    rep_val = float(agent.state.reputation_estimates.get(leader_id, 0.0))
+                selected_rep.append(rep_val)
+                weighted_selected_rep.append(float(self.config.gamma) * rep_val)
+
+            self.results['selected_reputation_history'].append(selected_rep)
+            self.results['weighted_selected_reputation_history'].append(weighted_selected_rep)
+            self.results['highest_rep_agent_history'].append(highest_rep_agents)
+            self.results['following_history'].append(following_ids)
+
         if mode == "light":
             return
 
@@ -1049,30 +1242,7 @@ class MultiAgentSystem:
         self.results['actor_rates'].append([a.state.actor_interaction_rate for a in self.agents])
         self.results['roles_history'].append([a.state.role for a in self.agents])
         self.results['actual_payoffs'].append(this_step_payoffs)
-        self.results['estimated_reward_pu_history'].append(
-            [float(a.state.estimated_reward_pu) for a in self.agents]
-        )
 
-        selected_rep = []
-        weighted_selected_rep = []
-        highest_rep_agents = []
-        following_ids = []
-        for agent in self.agents:
-            leader_id = agent.state.highest_rep_agent_estimate
-            highest_rep_agents.append(-1 if leader_id is None else int(leader_id))
-            following_ids.append(-1 if agent.state.following is None else int(agent.state.following))
-            if leader_id is None:
-                rep_val = 0.0
-            else:
-                rep_val = float(agent.state.reputation_estimates.get(leader_id, 0.0))
-            selected_rep.append(rep_val)
-            weighted_selected_rep.append(float(self.config.gamma) * rep_val)
-
-        self.results['selected_reputation_history'].append(selected_rep)
-        self.results['weighted_selected_reputation_history'].append(weighted_selected_rep)
-        self.results['highest_rep_agent_history'].append(highest_rep_agents)
-        self.results['following_history'].append(following_ids)
-    
     def simulate(self) -> Dict:
         """Run the full simulation"""
         print(f"Running Sections 6–7 simulation for {self.config.num_time_steps} timesteps...")
