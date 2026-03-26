@@ -1014,14 +1014,11 @@ class MultiAgentSystem:
             agent = self.agents[i]
             
             # Determine effective threshold with hysteresis (Section 7.1.3).
-            # Meeting update (2026-03-18): the lower hysteresis threshold is only
-            # allowed when there is exactly one current opinion leader. During
-            # multi-leader competition, followers should switch freely without the
-            # lower threshold stabilizing rival camps.
+            # The previous follower graph only affects which threshold applies:
+            # B_R for non-followers and B_F for agents who were already following.
             opinion_leader_count = sum(1 for leader_id in range(self.config.num_agents) if len(followers[leader_id]) > 0)
             hysteresis_active = (
                 i in C_r
-                and opinion_leader_count == 1
                 and float(self.config.B_F) < float(self.config.B_R)
             )
             if hysteresis_active:
@@ -1029,19 +1026,28 @@ class MultiAgentSystem:
             else:
                 B_i = self.config.B_R
             
-            # Get estimated rewards (weighted by gamma for reputation)
-            # [ROLE-1] For Step-1 role switching, use observed reputation signal
-            # Ĵ^r_i ≈ s_i(L_i,t) = max reputation estimate.
-            # estimated_reward_rep is only non-zero for current followers; for non-followers
-            # the follow decision must use max_rep (the best candidate's s_i value) directly.
-            max_rep = max(agent.state.reputation_estimates.values()) if agent.state.reputation_estimates else 0.0
-            est_rep_weighted = self.config.gamma * max_rep  # γ·s_i(L_i,t) per Section 6.6 + 7.3
+            # Use the same current highest-reputation target for both threshold
+            # comparison and the eventual follow decision.
+            if agent.state.highest_rep_agent_estimate is None:
+                if self.config.use_numpy_fast_path and self._s_matrix is not None:
+                    self._identify_highest_reputation_agent_from_matrix(i)
+                else:
+                    agent.identify_highest_reputation_agent()
+
+            target_k = agent.state.highest_rep_agent_estimate
+            selected_rep_raw = 0.0
+            if target_k is not None:
+                selected_rep_raw = float(agent.state.reputation_estimates.get(target_k, 0.0))
+
+            # [ROLE-1] Section 7.3 uses the currently selected target L_i(t),
+            # not the maximum over self-inclusive estimates.
+            est_rep_weighted = self.config.gamma * selected_rep_raw  # γ·s_i(L_i,t)
             est_pu = agent.state.estimated_reward_pu
             if audit_rows is not None:
                 audit_rows[i]["effective_threshold"] = float(B_i)
                 audit_rows[i]["opinion_leader_count"] = int(opinion_leader_count)
                 audit_rows[i]["hysteresis_active"] = bool(hysteresis_active)
-                audit_rows[i]["step1_rep_signal_raw"] = float(max_rep)
+                audit_rows[i]["step1_rep_signal_raw"] = float(selected_rep_raw)
                 audit_rows[i]["step1_rep_signal_weighted"] = float(est_rep_weighted)
 
             # Decision: should optimize reputation? (Section 7.3, line 1)

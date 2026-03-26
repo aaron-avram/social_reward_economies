@@ -129,11 +129,13 @@ def test_role_follower_chain_redirection():
     system.agents[2].state.role = AgentRole.PERSONAL_UTILITY
     system.agents[2].state.reputation_estimates = {0: 0.5, 1: 1.0, 2: 0.0}
     system.agents[2].state.estimated_reward_pu = 0.0
+    system.agents[2].identify_highest_reputation_agent()
 
-    system._update_roles_sequential()
+    system._update_roles_sequential(update_candidates=[2])
 
     print("Agent 2 following:", system.agents[2].state.following)
     assert system.agents[2].state.following == 0, "Follower chain not redirected correctly."
+    assert system.agents[0].state.followers == {1, 2}, "Follower graph should be rebuilt onto the redirected leader."
 
 
 def test_role_identify_highest_rep_excludes_self():
@@ -184,6 +186,120 @@ def test_role_hysteresis_start_vs_continue():
         "Should CONTINUE following at 0.7 when B_F=0.6"
 
 
+def test_role_hysteresis_continue_applies_with_multiple_leaders():
+    np.random.seed(0)
+    config = SystemConfig(
+        num_agents=4, num_time_steps=1, gamma=1.0, kappa=0.0,
+        B_R=0.8, B_F=0.6, delta=0.0,
+        c_threshold=1.0
+    )
+    system = MultiAgentSystem(config)
+
+    # Two current opinion leaders: 0 and 1 both have followers.
+    system.agents[2].state.role = AgentRole.REPUTATION
+    system.agents[2].state.following = 0
+    system.agents[0].state.followers.add(2)
+
+    system.agents[3].state.role = AgentRole.REPUTATION
+    system.agents[3].state.following = 1
+    system.agents[1].state.followers.add(3)
+
+    # Agent 2 should still use B_F even while multiple leaders exist.
+    system.agents[2].state.estimated_reward_pu = 0.0
+    system.agents[2].state.reputation_estimates = {0: 0.7, 1: 0.5, 2: 0.0, 3: 0.0}
+    system.agents[2].identify_highest_reputation_agent()
+
+    system._update_roles_sequential(update_candidates=[2])
+
+    print("Agent 2 role/following with two leaders:", system.agents[2].state.role, system.agents[2].state.following)
+    assert system.agents[2].state.role == AgentRole.REPUTATION, "Existing followers should still use B_F when leaders > 1."
+    assert system.agents[2].state.following == 0, "Follower should keep the current highest-reputation target when 0.7 > B_F."
+
+
+def test_role_existing_follower_switches_to_current_highest():
+    np.random.seed(0)
+    config = SystemConfig(
+        num_agents=3, num_time_steps=1, gamma=1.0, kappa=0.0,
+        B_R=0.8, B_F=0.6, delta=0.0,
+        c_threshold=1.0
+    )
+    system = MultiAgentSystem(config)
+
+    follower = 2
+    old_leader = 0
+    new_leader = 1
+
+    system.agents[follower].state.role = AgentRole.REPUTATION
+    system.agents[follower].state.following = old_leader
+    system.agents[old_leader].state.followers.add(follower)
+    system.agents[follower].state.estimated_reward_pu = 0.0
+    system.agents[follower].state.reputation_estimates = {0: 0.7, 1: 0.9, 2: 0.0}
+    system.agents[follower].identify_highest_reputation_agent()
+
+    system._update_roles_sequential(update_candidates=[follower])
+
+    print("Follower switched to:", system.agents[follower].state.following)
+    assert system.agents[follower].state.following == new_leader, "Follower should switch to the current highest-reputation agent."
+    assert follower not in system.agents[old_leader].state.followers, "Old leader should lose the follower after switching."
+    assert follower in system.agents[new_leader].state.followers, "New leader should gain the follower after switching."
+
+
+def test_role_chain_redirection_uses_current_pass_state():
+    np.random.seed(1)
+    config = SystemConfig(num_agents=4, num_time_steps=1, gamma=1.0, kappa=0.0, B_R=0.1, B_F=0.1, delta=0.0)
+    system = MultiAgentSystem(config)
+
+    # Agent 1 starts as a follower of 0, but in this pass should switch to 3.
+    system.agents[1].state.role = AgentRole.REPUTATION
+    system.agents[1].state.following = 0
+    system.agents[0].state.followers.add(1)
+    system.agents[1].state.estimated_reward_pu = 0.0
+    system.agents[1].state.reputation_estimates = {0: 0.7, 1: 0.0, 2: 0.0, 3: 0.9}
+    system.agents[1].identify_highest_reputation_agent()
+
+    # Agent 2 wants to follow agent 1, so redirection should use 1's updated target (3), not stale state.
+    system.agents[2].state.role = AgentRole.PERSONAL_UTILITY
+    system.agents[2].state.estimated_reward_pu = 0.0
+    system.agents[2].state.reputation_estimates = {0: 0.5, 1: 1.0, 2: 0.0, 3: 0.4}
+    system.agents[2].identify_highest_reputation_agent()
+
+    original_shuffle = np.random.shuffle
+    np.random.shuffle = lambda xs: xs.sort()
+    try:
+        system._update_roles_sequential(update_candidates=[1, 2])
+    finally:
+        np.random.shuffle = original_shuffle
+
+    print("Agent 1 following after update:", system.agents[1].state.following)
+    print("Agent 2 following after update:", system.agents[2].state.following)
+    assert system.agents[1].state.following == 3, "Agent 1 should switch to the new current highest-reputation leader."
+    assert system.agents[2].state.following == 3, "Redirection should use the current-pass leader relation, not stale t-1 state."
+    assert system.agents[0].state.followers == set(), "Old leader should lose followers redirected in the current pass."
+    assert system.agents[3].state.followers == {1, 2}, "Current-pass rebuild should place both followers on the new leader."
+
+
+def test_role_self_reputation_does_not_trigger_follow_entry():
+    np.random.seed(0)
+    config = SystemConfig(
+        num_agents=3, num_time_steps=1, gamma=1.0, kappa=0.0,
+        B_R=0.8, B_F=0.6, delta=0.0,
+        c_threshold=1.0
+    )
+    system = MultiAgentSystem(config)
+
+    agent = system.agents[2]
+    agent.state.role = AgentRole.PERSONAL_UTILITY
+    agent.state.estimated_reward_pu = 0.0
+    agent.state.reputation_estimates = {0: 0.4, 1: 0.5, 2: 999.0}
+    agent.identify_highest_reputation_agent()
+
+    system._update_roles_sequential(update_candidates=[2])
+
+    print("Self-reputation case role/following:", agent.state.role, agent.state.following)
+    assert agent.state.role == AgentRole.PERSONAL_UTILITY, "Self reputation should not trigger follow entry."
+    assert agent.state.following is None, "Agent should remain independent when the best non-self reputation is below B_R."
+
+
 def test_role_status_requires_min_followers():
     np.random.seed(0)
     config = SystemConfig(num_agents=10, num_time_steps=1, gamma=0.0, kappa=2.0, c_threshold=0.3)
@@ -213,7 +329,7 @@ def test_role_status_switch_clears_following():
     system.agents[i].state.following = leader
     system.agents[leader].state.followers.add(i)
 
-    system.agents[i].state.followers = {2}  # qualifies (min_followers = 1)
+    system.agents[i].state.followers = {2, 3}  # qualifies because ceil(0.2 * 6) = 2
     system.agents[i].state.estimated_reward_status = 10.0
     system.agents[i].state.estimated_reward_pu = 0.0
 
@@ -421,6 +537,10 @@ def run_all_tests():
     test_role_follower_chain_redirection()
     test_role_identify_highest_rep_excludes_self()
     test_role_hysteresis_start_vs_continue()
+    test_role_hysteresis_continue_applies_with_multiple_leaders()
+    test_role_existing_follower_switches_to_current_highest()
+    test_role_chain_redirection_uses_current_pass_state()
+    test_role_self_reputation_does_not_trigger_follow_entry()
     test_role_status_requires_min_followers()
     test_role_status_switch_clears_following()
 
