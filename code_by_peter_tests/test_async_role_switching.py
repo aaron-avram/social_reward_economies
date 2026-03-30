@@ -757,9 +757,15 @@ def test_async_scheduler_audit_records_exact_timer_expirations():
         output_dir = "."
 
     np.random.seed(0)
-    _, _, _, _, async_debug = rep_scaling.run_single(args=Args(), mode="async", gamma=2.0, seed=0)
+    _, _, _, _, async_debug, role_update_diagnostics = rep_scaling.run_single(
+        args=Args(),
+        mode="async",
+        gamma=2.0,
+        seed=0,
+    )
 
     assert async_debug is not None
+    assert role_update_diagnostics is None
     scheduler_rows = async_debug["scheduler_rows"]
     assert len(scheduler_rows) == Args.num_steps
 
@@ -775,6 +781,192 @@ def test_async_scheduler_audit_records_exact_timer_expirations():
             assert after.size == before.size
             for idx in update_ids:
                 assert after[idx] > 0
+
+
+def test_static_role_update_diagnostics_capture_only_role_update_epochs():
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    rep_scaling = importlib.import_module("experiments.reputation_scaling")
+
+    class Args:
+        mode = "static"
+        num_agents = 4
+        num_states = 2
+        num_actions = 2
+        num_steps = 8
+        kappa = 0.0
+        tail_window = 5
+        role_update_s0 = 0
+        role_update_T_seq = ""
+        role_update_base_interval = 3
+        fixed_role_update_interval = True
+        role_update_epochs = ""
+        tracking_mode = "light"
+        numpy_fast_path = False
+        initial_actor_rate = 0.2
+        initial_participant_rate = 0.2
+        reward_model = "simple_preferred_action"
+        reward_base_mu = 0.5
+        reward_base_sigma = 0.08
+        reward_agent_sigma = 0.1
+        reward_clip_min = 0.01
+        reward_clip_max = 2.5
+        async_role_update_prob = None
+        async_decision_audit = False
+        role_update_diagnostics = True
+        trace_detailed_seeds = "none"
+        plot_sample_interval = 1
+        output_dir = "."
+
+    np.random.seed(0)
+    _, _, _, _, async_debug, role_update_diagnostics = rep_scaling.run_single(
+        args=Args(),
+        mode="static",
+        gamma=5.0,
+        seed=0,
+    )
+
+    assert async_debug is None
+    assert role_update_diagnostics is not None
+
+    expected_role_update_times = rep_scaling.build_static_role_update_times(Args(), horizon=Args.num_steps)
+    assert [int(row["t"]) for row in role_update_diagnostics] == expected_role_update_times
+    assert [int(row["role_update_index"]) for row in role_update_diagnostics] == list(
+        range(1, len(expected_role_update_times) + 1)
+    )
+
+    first_row = role_update_diagnostics[0]
+    for key in (
+        "top_leader_id",
+        "top_followers",
+        "second_followers",
+        "distinct_follow_targets",
+        "n_reputation",
+        "n_personal_utility",
+        "mean_pu_estimate",
+        "mean_rep_signal_weighted",
+        "share_gate_margin_positive",
+        "top_highest_rep_target_share",
+    ):
+        assert key in first_row
+
+
+def test_reputation_scaling_selected_seeds_override_contiguous_range():
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    rep_scaling = importlib.import_module("experiments.reputation_scaling")
+
+    class Args:
+        selected_seeds = "9,2,7,2"
+        seed_start = 100
+        seeds = 5
+
+    assert rep_scaling.parse_selected_seeds(Args.selected_seeds) == [2, 7, 9]
+    assert rep_scaling.resolve_seeds(Args()) == [2, 7, 9]
+
+
+def test_role_update_diagnostic_helpers_classify_fragmented_vs_partial():
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    rep_scaling = importlib.import_module("experiments.reputation_scaling")
+
+    fragmented_rows = rep_scaling.enrich_role_update_diagnostic_rows(
+        mode="static",
+        gamma=5.0,
+        seed=7,
+        rows=[
+            {
+                "t": 3000,
+                "role_update_index": 1,
+                "top_leader_id": 10,
+                "top_followers": 28,
+                "second_leader_id": 11,
+                "second_followers": 18,
+                "third_leader_id": 12,
+                "third_followers": 10,
+                "top_follower_share": 28 / 99,
+                "top2_follower_share": 46 / 99,
+                "distinct_follow_targets": 3,
+                "n_reputation": 90,
+                "n_personal_utility": 10,
+                "n_status": 0,
+                "mean_pu_estimate": 0.4,
+                "mean_rep_signal_weighted": 0.8,
+                "mean_step1_margin": 0.4,
+                "share_step1_margin_positive": 1.0,
+                "mean_gate_margin": 0.2,
+                "share_gate_margin_positive": 1.0,
+                "distinct_highest_rep_targets": 3,
+                "top_highest_rep_target_id": 10,
+                "top_highest_rep_target_share": 0.42,
+                "second_highest_rep_target_share": 0.31,
+            },
+            {
+                "t": 6000,
+                "role_update_index": 2,
+                "top_leader_id": 11,
+                "top_followers": 41,
+                "second_leader_id": 10,
+                "second_followers": 20,
+                "third_leader_id": 12,
+                "third_followers": 11,
+                "top_follower_share": 41 / 99,
+                "top2_follower_share": 61 / 99,
+                "distinct_follow_targets": 3,
+                "n_reputation": 96,
+                "n_personal_utility": 4,
+                "n_status": 0,
+                "mean_pu_estimate": 0.4,
+                "mean_rep_signal_weighted": 0.9,
+                "mean_step1_margin": 0.5,
+                "share_step1_margin_positive": 1.0,
+                "mean_gate_margin": 0.3,
+                "share_gate_margin_positive": 1.0,
+                "distinct_highest_rep_targets": 3,
+                "top_highest_rep_target_id": 11,
+                "top_highest_rep_target_share": 0.44,
+                "second_highest_rep_target_share": 0.29,
+            },
+        ],
+    )
+    fragmented_summary = rep_scaling.summarize_role_update_diagnostics(
+        mode="static",
+        gamma=5.0,
+        seed=7,
+        num_agents=100,
+        record=rep_scaling.RunRecord(
+            mode="static",
+            gamma=5.0,
+            seed=7,
+            leader_id=11,
+            final_top_followers=41,
+            time_to_90pct_followers=-1,
+            leader_switches=1,
+            tail_welfare=0.0,
+        ),
+        top_follower_series=np.array([0, 12, 28, 41]),
+        rows=fragmented_rows,
+    )
+    assert fragmented_summary["leader_switches_role_update_only"] == 1
+    assert fragmented_summary["failure_bucket"] == "fragmented_following"
+
+    assert (
+        rep_scaling.classify_seed_failure_bucket(
+            num_agents=100,
+            final_top_followers=57,
+            final_share_gate_margin_positive=1.0,
+            final_top_highest_rep_target_share=0.82,
+            final_second_followers=8,
+            leader_switches_role_update_only=0,
+        )
+        == "stable_partial_convergence"
+    )
 
 
 def test_async_decision_audit_records_threshold_and_redirect_fields(model_module):

@@ -26,6 +26,7 @@ BUG FIX ID MAP (grouped):
 """
 
 import math
+from collections import Counter
 import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
@@ -465,6 +466,7 @@ class MultiAgentSystem:
         self._async_decision_audit_enabled = False
         self._async_decision_audit_rows: List[Dict[str, object]] = []
         self._compact_debug_histories_enabled = False
+        self._role_update_diagnostics_enabled = False
 
         # Optional reward table r_i(s,a) for richer state/action-dependent experiments.
         self._reward_tables = None
@@ -603,8 +605,126 @@ class MultiAgentSystem:
         self._async_decision_audit_enabled = True
         self._compact_debug_histories_enabled = True
 
+    def enable_role_update_diagnostics(self):
+        """
+        Enable lightweight snapshots recorded only at role-update epochs.
+
+        These diagnostics are intended for long static sweeps where full
+        per-timestep traces are too expensive, but we still want enough detail
+        to distinguish weak-following from fragmented-following failures.
+        """
+        self._role_update_diagnostics_enabled = True
+
     def get_async_decision_audit_rows(self) -> List[Dict[str, object]]:
         return list(self._async_decision_audit_rows)
+
+    def get_role_update_diagnostic_rows(self) -> List[Dict[str, object]]:
+        return list(self.results.get("role_update_diagnostics", []))
+
+    def _build_role_update_diagnostic_row(self, role_update_index: int) -> Dict[str, object]:
+        follower_counts = [len(a.state.followers) for a in self.agents]
+        ranked_leaders = sorted(
+            range(self.config.num_agents),
+            key=lambda i: (-follower_counts[i], i),
+        )
+
+        def top_leader(rank: int) -> Tuple[int, int]:
+            if rank >= len(ranked_leaders):
+                return -1, 0
+            leader_id = int(ranked_leaders[rank])
+            followers = int(follower_counts[leader_id])
+            if followers <= 0:
+                return -1, 0
+            return leader_id, followers
+
+        top_leader_id, top_followers = top_leader(0)
+        second_leader_id, second_followers = top_leader(1)
+        third_leader_id, third_followers = top_leader(2)
+
+        highest_targets: List[int] = []
+        following_targets: List[int] = []
+        pu_estimates: List[float] = []
+        rep_signals_weighted: List[float] = []
+        step1_margins: List[float] = []
+        gate_margins: List[float] = []
+        role_counts = {
+            AgentRole.REPUTATION.value: 0,
+            AgentRole.PERSONAL_UTILITY.value: 0,
+            AgentRole.STATUS.value: 0,
+        }
+
+        for agent in self.agents:
+            role_counts[agent.state.role.value] += 1
+            pu_est = float(agent.state.estimated_reward_pu)
+            pu_estimates.append(pu_est)
+
+            target_id = agent.state.highest_rep_agent_estimate
+            if target_id is not None:
+                highest_targets.append(int(target_id))
+                rep_raw = float(agent.state.reputation_estimates.get(target_id, 0.0))
+            else:
+                rep_raw = 0.0
+            rep_weighted = float(self.config.gamma) * rep_raw
+            rep_signals_weighted.append(rep_weighted)
+            step1_margins.append(rep_weighted - pu_est)
+
+            follower_count = int(len(agent.state.followers))
+            if (
+                agent.state.role == AgentRole.REPUTATION
+                and follower_count == 0
+                and float(self.config.B_F) < float(self.config.B_R)
+            ):
+                threshold = float(self.config.B_F)
+            else:
+                threshold = float(self.config.B_R)
+            gate_margins.append(rep_weighted - max(threshold, pu_est))
+
+            if agent.state.following is not None:
+                following_targets.append(int(agent.state.following))
+
+        highest_counts = Counter(highest_targets)
+        following_counts = Counter(following_targets)
+        top_highest_target_id = -1
+        top_highest_target_share = 0.0
+        second_highest_target_share = 0.0
+        if highest_counts:
+            highest_top2 = highest_counts.most_common(2)
+            top_highest_target_id = int(highest_top2[0][0])
+            top_highest_target_share = float(highest_top2[0][1] / max(1, len(highest_targets)))
+            if len(highest_top2) > 1:
+                second_highest_target_share = float(highest_top2[1][1] / max(1, len(highest_targets)))
+
+        denom_followers = max(1, self.config.num_agents - 1)
+        return {
+            "t": int(self.time_step),
+            "role_update_index": int(role_update_index),
+            "top_leader_id": int(top_leader_id),
+            "top_followers": int(top_followers),
+            "second_leader_id": int(second_leader_id),
+            "second_followers": int(second_followers),
+            "third_leader_id": int(third_leader_id),
+            "third_followers": int(third_followers),
+            "top_follower_share": float(top_followers / denom_followers),
+            "top2_follower_share": float((top_followers + second_followers) / denom_followers),
+            "distinct_follow_targets": int(len(following_counts)),
+            "n_reputation": int(role_counts[AgentRole.REPUTATION.value]),
+            "n_personal_utility": int(role_counts[AgentRole.PERSONAL_UTILITY.value]),
+            "n_status": int(role_counts[AgentRole.STATUS.value]),
+            "mean_pu_estimate": float(np.mean(pu_estimates) if pu_estimates else 0.0),
+            "mean_rep_signal_weighted": float(np.mean(rep_signals_weighted) if rep_signals_weighted else 0.0),
+            "mean_step1_margin": float(np.mean(step1_margins) if step1_margins else 0.0),
+            "share_step1_margin_positive": float(
+                np.mean(np.asarray(step1_margins, dtype=float) > 0.0) if step1_margins else 0.0
+            ),
+            "mean_gate_margin": float(np.mean(gate_margins) if gate_margins else 0.0),
+            "share_gate_margin_positive": float(
+                np.mean(np.asarray(gate_margins, dtype=float) > 0.0) if gate_margins else 0.0
+            ),
+            "distinct_highest_rep_targets": int(len(highest_counts)),
+            "top_highest_rep_target_id": int(top_highest_target_id),
+            "top_highest_rep_target_share": float(top_highest_target_share),
+            "second_highest_rep_target_share": float(second_highest_target_share),
+        }
 
     def refresh_last_tracked_state(self):
         """
@@ -1274,6 +1394,12 @@ class MultiAgentSystem:
         self.results.setdefault('rep_counts', []).append(
             sum(1 for a in self.agents if a.state.role == AgentRole.REPUTATION)
         )
+        if role_updated and self._role_update_diagnostics_enabled:
+            self.results.setdefault("role_update_diagnostics", []).append(
+                self._build_role_update_diagnostic_row(
+                    role_update_index=len(self.results["role_update_times"])
+                )
+            )
 
         collect_compact_histories = (mode == "full") or self._compact_debug_histories_enabled
         if collect_compact_histories:

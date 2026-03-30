@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=10000)
     parser.add_argument("--seeds", type=int, default=20, help="Number of seeds to run.")
     parser.add_argument("--seed-start", type=int, default=0, help="First seed (inclusive).")
+    parser.add_argument(
+        "--selected-seeds",
+        type=str,
+        default="",
+        help="Optional explicit comma-separated seed list (e.g. \"2,7,9\"). Overrides --seeds/--seed-start.",
+    )
     parser.add_argument("--kappa", type=float, default=0.0)
     parser.add_argument("--output-dir", type=str, default=str(Path(__file__).resolve().parent / "outputs"))
     parser.add_argument("--tail-window", type=int, default=500)
@@ -162,12 +168,26 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="In async mode, write scheduler/decision audit CSVs and compact per-agent debug traces.",
     )
+    parser.add_argument(
+        "--role-update-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write lightweight role-update-only diagnostics for convergence/fragmentation analysis.",
+    )
     return parser.parse_args()
 
 
 def parse_gammas(gamma_text: str) -> List[float]:
     parts = [p.strip() for p in gamma_text.split(",") if p.strip()]
     return [float(x) for x in parts]
+
+
+def parse_selected_seeds(seed_text: str) -> List[int]:
+    if not seed_text.strip():
+        return []
+    parts = [p.strip() for p in seed_text.split(",") if p.strip()]
+    seeds = [int(x) for x in parts]
+    return sorted(set(seed for seed in seeds if seed >= 0))
 
 
 def parse_role_update_epochs(epoch_text: str) -> List[int]:
@@ -221,6 +241,13 @@ def _build_async_interval_sequence(args: argparse.Namespace) -> Tuple[List[int],
             return from_epochs, s0, "epochs"
 
     return [max(1, int(args.role_update_base_interval))], s0, "base_interval"
+
+
+def resolve_seeds(args: argparse.Namespace) -> List[int]:
+    selected = parse_selected_seeds(getattr(args, "selected_seeds", ""))
+    if selected:
+        return selected
+    return list(range(int(args.seed_start), int(args.seed_start) + int(args.seeds)))
 
 
 def make_config(args: argparse.Namespace, gamma: float, mode: str) -> SystemConfig:
@@ -603,13 +630,23 @@ def run_single(
     mode: str,
     gamma: float,
     seed: int,
-) -> Tuple[RunRecord, np.ndarray, np.ndarray, Optional[DetailedTrace], Optional[AsyncDebugArtifacts]]:
+) -> Tuple[
+    RunRecord,
+    np.ndarray,
+    np.ndarray,
+    Optional[DetailedTrace],
+    Optional[AsyncDebugArtifacts],
+    Optional[List[dict]],
+]:
     np.random.seed(seed)
     config = make_config(args, gamma=gamma, mode=mode)
     system = MultiAgentSystem(config)
     async_debug_enabled = bool(mode == "async" and args.async_decision_audit)
     if async_debug_enabled:
         system.enable_async_decision_audit()
+    role_update_diagnostics_enabled = bool(mode == "static" and getattr(args, "role_update_diagnostics", False))
+    if role_update_diagnostics_enabled:
+        system.enable_role_update_diagnostics()
 
     scheduler_rows: List[Dict[str, object]] = []
     update_counts = np.zeros(args.num_agents, dtype=int)
@@ -738,8 +775,9 @@ def run_single(
             "diagnosis": diagnosis,
             "trace_bundle": trace_bundle,
         }
+    role_update_diagnostics = system.get_role_update_diagnostic_rows() if role_update_diagnostics_enabled else None
 
-    return record, top_follower_series, leader_series, detailed_trace, async_debug
+    return record, top_follower_series, leader_series, detailed_trace, async_debug, role_update_diagnostics
 
 
 def _mean_std_ci(values: Sequence[float]) -> Tuple[float, float, float]:
@@ -803,6 +841,119 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def enrich_role_update_diagnostic_rows(
+    *,
+    mode: str,
+    gamma: float,
+    seed: int,
+    rows: Sequence[dict],
+) -> List[dict]:
+    enriched: List[dict] = []
+    prev_leader = None
+    prev_top_followers = None
+    for row in rows:
+        out = dict(row)
+        out["mode"] = str(mode)
+        out["gamma"] = float(gamma)
+        out["seed"] = int(seed)
+        if prev_leader is None:
+            out["leader_changed_since_prev_update"] = 0
+            out["delta_top_followers"] = int(out["top_followers"])
+        else:
+            out["leader_changed_since_prev_update"] = int(int(out["top_leader_id"]) != int(prev_leader))
+            out["delta_top_followers"] = int(int(out["top_followers"]) - int(prev_top_followers))
+        prev_leader = int(out["top_leader_id"])
+        prev_top_followers = int(out["top_followers"])
+        enriched.append(out)
+    return enriched
+
+
+def classify_seed_failure_bucket(
+    *,
+    num_agents: int,
+    final_top_followers: int,
+    final_share_gate_margin_positive: float,
+    final_top_highest_rep_target_share: float,
+    final_second_followers: int,
+    leader_switches_role_update_only: int,
+) -> str:
+    threshold_90 = int(np.ceil(0.90 * (num_agents - 1)))
+    if final_top_followers >= threshold_90:
+        return "full_convergence"
+    if final_share_gate_margin_positive < 0.5:
+        return "weak_following"
+    if (
+        leader_switches_role_update_only > 0
+        or final_top_highest_rep_target_share < 0.5
+        or final_second_followers >= max(10, int(np.ceil(0.5 * max(1, final_top_followers))))
+    ):
+        return "fragmented_following"
+    return "stable_partial_convergence"
+
+
+def summarize_role_update_diagnostics(
+    *,
+    mode: str,
+    gamma: float,
+    seed: int,
+    num_agents: int,
+    record: RunRecord,
+    top_follower_series: np.ndarray,
+    rows: Sequence[dict],
+) -> dict:
+    if not rows:
+        return {
+            "mode": str(mode),
+            "gamma": float(gamma),
+            "seed": int(seed),
+            "final_top_followers": int(record.final_top_followers),
+            "max_top_followers": int(np.max(top_follower_series)) if top_follower_series.size else 0,
+            "final_second_followers": 0,
+            "time_to_50pct_followers": -1,
+            "time_to_75pct_followers": -1,
+            "time_to_90pct_followers": int(record.time_to_90pct_followers),
+            "leader_switches_role_update_only": 0,
+            "mean_share_gate_margin_positive": 0.0,
+            "final_share_gate_margin_positive": 0.0,
+            "mean_top_highest_rep_target_share": 0.0,
+            "final_top_highest_rep_target_share": 0.0,
+            "mean_top_follower_share": 0.0,
+            "final_top_follower_share": 0.0,
+            "failure_bucket": "weak_following",
+        }
+
+    threshold_50 = int(np.ceil(0.50 * (num_agents - 1)))
+    threshold_75 = int(np.ceil(0.75 * (num_agents - 1)))
+    top_leader_series = np.array([int(row["top_leader_id"]) for row in rows], dtype=int)
+    summary = {
+        "mode": str(mode),
+        "gamma": float(gamma),
+        "seed": int(seed),
+        "final_top_followers": int(record.final_top_followers),
+        "max_top_followers": int(np.max(top_follower_series)) if top_follower_series.size else 0,
+        "final_second_followers": int(rows[-1]["second_followers"]),
+        "time_to_50pct_followers": int(_time_to_threshold(top_follower_series, threshold_50)),
+        "time_to_75pct_followers": int(_time_to_threshold(top_follower_series, threshold_75)),
+        "time_to_90pct_followers": int(record.time_to_90pct_followers),
+        "leader_switches_role_update_only": int(_leader_switches(top_leader_series)),
+        "mean_share_gate_margin_positive": float(np.mean([float(r["share_gate_margin_positive"]) for r in rows])),
+        "final_share_gate_margin_positive": float(rows[-1]["share_gate_margin_positive"]),
+        "mean_top_highest_rep_target_share": float(np.mean([float(r["top_highest_rep_target_share"]) for r in rows])),
+        "final_top_highest_rep_target_share": float(rows[-1]["top_highest_rep_target_share"]),
+        "mean_top_follower_share": float(np.mean([float(r["top_follower_share"]) for r in rows])),
+        "final_top_follower_share": float(rows[-1]["top_follower_share"]),
+    }
+    summary["failure_bucket"] = classify_seed_failure_bucket(
+        num_agents=num_agents,
+        final_top_followers=int(summary["final_top_followers"]),
+        final_share_gate_margin_positive=float(summary["final_share_gate_margin_positive"]),
+        final_top_highest_rep_target_share=float(summary["final_top_highest_rep_target_share"]),
+        final_second_followers=int(summary["final_second_followers"]),
+        leader_switches_role_update_only=int(summary["leader_switches_role_update_only"]),
+    )
+    return summary
 
 
 def build_static_role_update_times(args: argparse.Namespace, horizon: int) -> List[int]:
@@ -1150,7 +1301,7 @@ def main() -> None:
     gammas = parse_gammas(args.gammas)
     role_t_seq = parse_role_update_T_seq(args.role_update_T_seq)
     role_epochs = parse_role_update_epochs(args.role_update_epochs)
-    seeds = list(range(args.seed_start, args.seed_start + args.seeds))
+    seeds = resolve_seeds(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1159,7 +1310,14 @@ def main() -> None:
     print(f"mode={args.mode}", flush=True)
     print(f"gammas={gammas}", flush=True)
     print(f"num_agents={args.num_agents}, num_states={args.num_states}, num_actions={args.num_actions}", flush=True)
-    print(f"num_steps={args.num_steps}, seeds={len(seeds)} ({seeds[0]}..{seeds[-1]})", flush=True)
+    if seeds:
+        if seeds == list(range(seeds[0], seeds[-1] + 1)):
+            seed_label = f"{seeds[0]}..{seeds[-1]}"
+        else:
+            seed_label = ",".join(str(seed) for seed in seeds)
+        print(f"num_steps={args.num_steps}, seeds={len(seeds)} ({seed_label})", flush=True)
+    else:
+        print(f"num_steps={args.num_steps}, seeds=0", flush=True)
     print(f"kappa={args.kappa}", flush=True)
     print(
         f"role_update_base_interval={args.role_update_base_interval}, "
@@ -1201,12 +1359,16 @@ def main() -> None:
     leader_series_by_gamma: Dict[float, List[np.ndarray]] = {g: [] for g in gammas}
     detailed_traces: Dict[Tuple[float, int], DetailedTrace] = {}
     async_diagnosis_rows: List[dict] = []
+    role_update_diagnostic_rows: List[dict] = []
+    role_update_diagnostic_summaries: List[dict] = []
     role_update_times = build_static_role_update_times(args, horizon=int(args.num_steps))
     total_jobs = len(gammas) * len(seeds)
     job = 0
     runs_csv = output_dir / f"reputation_scaling_runs_{args.mode}.csv"
     agg_csv = output_dir / f"reputation_scaling_aggregate_{args.mode}.csv"
     table_csv = output_dir / f"reputation_scaling_table_values_{args.mode}.csv"
+    role_diag_csv = output_dir / f"reputation_scaling_role_update_diagnostics_{args.mode}.csv"
+    role_summary_csv = output_dir / f"reputation_scaling_seed_diagnostic_summary_{args.mode}.csv"
     prog_png = output_dir / f"reputation_scaling_progression_{args.mode}.png"
     curve_png = output_dir / f"reputation_scaling_top_followers_{args.mode}.png"
     paper_png = output_dir / f"reputation_scaling_paper_style_{args.mode}.png"
@@ -1215,7 +1377,7 @@ def main() -> None:
         for seed in seeds:
             job += 1
             print(f"[{job:03d}/{total_jobs:03d}] mode={args.mode} gamma={gamma:g} seed={seed}", flush=True)
-            rec, top_series, leader_series, detailed_trace, async_debug = run_single(
+            rec, top_series, leader_series, detailed_trace, async_debug, run_role_update_rows = run_single(
                 args=args,
                 mode=args.mode,
                 gamma=gamma,
@@ -1253,8 +1415,31 @@ def main() -> None:
                     focus_agents=async_debug["focus_agents"],
                 )
                 async_diagnosis_rows.append(dict(async_debug["diagnosis"]))
+            if run_role_update_rows is not None:
+                enriched_rows = enrich_role_update_diagnostic_rows(
+                    mode=args.mode,
+                    gamma=gamma,
+                    seed=seed,
+                    rows=run_role_update_rows,
+                )
+                role_update_diagnostic_rows.extend(enriched_rows)
+                role_update_diagnostic_summaries.append(
+                    summarize_role_update_diagnostics(
+                        mode=args.mode,
+                        gamma=gamma,
+                        seed=seed,
+                        num_agents=args.num_agents,
+                        record=rec,
+                        top_follower_series=top_series,
+                        rows=enriched_rows,
+                    )
+                )
             # Incremental checkpoint for long sweeps.
             write_csv(runs_csv, [asdict(r) for r in all_records])
+            if role_update_diagnostic_rows:
+                write_csv(role_diag_csv, role_update_diagnostic_rows)
+            if role_update_diagnostic_summaries:
+                write_csv(role_summary_csv, role_update_diagnostic_summaries)
 
     agg_records = aggregate(all_records)
 
@@ -1266,6 +1451,10 @@ def main() -> None:
             output_dir / "reputation_scaling_async_diagnosis_summary.csv",
             async_diagnosis_rows,
         )
+    if role_update_diagnostic_rows:
+        write_csv(role_diag_csv, role_update_diagnostic_rows)
+    if role_update_diagnostic_summaries:
+        write_csv(role_summary_csv, role_update_diagnostic_summaries)
     plot_progression(
         args.mode,
         gammas,
@@ -1310,6 +1499,10 @@ def main() -> None:
     print(f"Per-run CSV:     {runs_csv}", flush=True)
     print(f"Aggregate CSV:   {agg_csv}", flush=True)
     print(f"Table CSV:       {table_csv}", flush=True)
+    if role_update_diagnostic_rows:
+        print(f"Role diag CSV:   {role_diag_csv}", flush=True)
+    if role_update_diagnostic_summaries:
+        print(f"Role sum CSV:    {role_summary_csv}", flush=True)
     print(f"Progression PNG: {prog_png}", flush=True)
     print(f"Curve PNG:       {curve_png}", flush=True)
     print(f"Paper PNG:       {paper_png}", flush=True)
