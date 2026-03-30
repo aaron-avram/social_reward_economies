@@ -342,6 +342,76 @@ def test_role_status_switch_clears_following():
 
 
 # ============================================================
+# Reward model tests
+# ============================================================
+
+def test_reward_shared_good_bad_has_one_shared_good_action_per_state():
+    np.random.seed(0)
+    config = SystemConfig(
+        num_agents=6,
+        num_states=4,
+        num_actions=2,
+        num_time_steps=1,
+        reward_model="shared_good_bad_heterogeneous",
+        reward_good_value=1.0,
+        reward_bad_value=0.1,
+        reward_agent_sigma=0.1,
+        reward_order_gap=0.02,
+    )
+    system = MultiAgentSystem(config)
+
+    print("Shared good actions:", system._shared_good_actions)
+    assert system._shared_good_actions is not None
+    assert len(system._shared_good_actions) == config.num_states
+    assert all(0 <= int(a) < config.num_actions for a in system._shared_good_actions)
+
+
+def test_reward_shared_good_bad_preserves_good_over_bad_ranking():
+    np.random.seed(1)
+    config = SystemConfig(
+        num_agents=8,
+        num_states=5,
+        num_actions=2,
+        num_time_steps=1,
+        reward_model="shared_good_bad_heterogeneous",
+        reward_good_value=1.0,
+        reward_bad_value=0.1,
+        reward_agent_sigma=0.1,
+        reward_order_gap=0.02,
+    )
+    system = MultiAgentSystem(config)
+
+    for state, good_action in enumerate(system._shared_good_actions):
+        bad_action = 1 - int(good_action)
+        good_rewards = system._reward_tables[:, state, int(good_action)]
+        bad_rewards = system._reward_tables[:, state, bad_action]
+        print(f"State {state} min good-bad gap:", float(np.min(good_rewards - bad_rewards)))
+        assert np.all(good_rewards >= bad_rewards + config.reward_order_gap - 1e-12)
+
+
+def test_reward_shared_good_bad_keeps_agent_heterogeneity():
+    np.random.seed(2)
+    config = SystemConfig(
+        num_agents=10,
+        num_states=4,
+        num_actions=2,
+        num_time_steps=1,
+        reward_model="shared_good_bad_heterogeneous",
+        reward_good_value=1.0,
+        reward_bad_value=0.1,
+        reward_agent_sigma=0.1,
+        reward_order_gap=0.02,
+    )
+    system = MultiAgentSystem(config)
+
+    state = 0
+    good_action = int(system._shared_good_actions[state])
+    rewards = system._reward_tables[:, state, good_action]
+    print("Heterogeneous rewards for state 0 good action:", rewards)
+    assert np.ptp(rewards) > 1e-9, "Agents should not all have identical rewards under the heterogeneous model."
+
+
+# ============================================================
 # Estimates tracking tests (Section 6.3 / 6.4 / 6.6)
 # ============================================================
 

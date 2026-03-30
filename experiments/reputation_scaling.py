@@ -863,6 +863,7 @@ def plot_progression(
         ax = axes[r][c]
         series_list = top_series_by_gamma[gamma]
         stack = np.stack(series_list, axis=0)  # [seeds, T]
+        is_single_run = stack.shape[0] == 1
         mean = np.mean(stack, axis=0)
         std = np.std(stack, axis=0)
         x = np.arange(1, stack.shape[1] + 1)
@@ -875,7 +876,8 @@ def plot_progression(
             std = std[sample_mask]
 
         ax.plot(x, mean, linewidth=1.6, label=f"gamma={gamma:g}")
-        ax.fill_between(x, mean - std, mean + std, alpha=0.25)
+        if not is_single_run:
+            ax.fill_between(x, mean - std, mean + std, alpha=0.25)
         for idx_line, step in enumerate(role_update_times):
             ax.axvline(
                 int(step),
@@ -914,9 +916,13 @@ def plot_top_followers_curve(
     gammas = np.array([r.gamma for r in rows], dtype=float)
     means = np.array([r.mean_final_top_followers for r in rows], dtype=float)
     cis = np.array([r.ci95_final_top_followers for r in rows], dtype=float)
+    is_single_run = all(int(r.n_runs) == 1 for r in rows)
 
     plt.figure(figsize=(7.5, 4.5))
-    plt.errorbar(gammas, means, yerr=cis, fmt="-o", capsize=4, linewidth=1.8)
+    if is_single_run:
+        plt.plot(gammas, means, "-o", linewidth=1.8)
+    else:
+        plt.errorbar(gammas, means, yerr=cis, fmt="-o", capsize=4, linewidth=1.8)
     plt.title(f"Final Top Followers vs Gamma ({mode})", fontsize=12, fontweight="bold")
     plt.xlabel("gamma")
     plt.ylabel("Final top followers")
@@ -1290,13 +1296,13 @@ def main() -> None:
         plot_agent_estimate_trajectories(
             trace,
             full_png,
-            title=f"Experiment B traces: gamma={gamma:g}, seed={seed} (full)",
+            title=f"Experiment B traces: gamma={gamma:g} (full)",
             zoom_to_follow_window=False,
         )
         plot_agent_estimate_trajectories(
             trace,
             zoom_png,
-            title=f"Experiment B traces: gamma={gamma:g}, seed={seed} (zoomed to rep > PU)",
+            title=f"Experiment B traces: gamma={gamma:g} (zoomed to rep > PU)",
             zoom_to_follow_window=True,
         )
 

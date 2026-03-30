@@ -8,7 +8,7 @@ Experiments:
   A: γ=0, κ=0 — Pure personal utility. Expect: no leader, all independent.
   B: γ>0, κ=0 — Reputation only. Expect: opinion leader may emerge (Proposition 1).
   C: γ>0, κ>0 — Full algorithm. Expect: welfare-optimal common norm (Propositions 2&3).
-  D: Perturbation test. Expect: leader loses followers after perturbation.
+  D: Toy perturbation baseline. Expect: leader loses followers after perturbation.
 """
 
 import sys
@@ -24,10 +24,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from src.code_debugged import SystemConfig, MultiAgentSystem, AgentRole
 try:
-    from experiments.perturbation_recovery import run_experiment as run_perturbation_recovery
+    from experiments.perturbation_recovery import (
+        derive_interval_scaled_windows,
+        run_experiment as run_perturbation_recovery,
+    )
 except ImportError:
     # Supports direct execution: python3 experiments/experiments.py
-    from perturbation_recovery import run_experiment as run_perturbation_recovery
+    from perturbation_recovery import (
+        derive_interval_scaled_windows,
+        run_experiment as run_perturbation_recovery,
+    )
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -321,13 +327,15 @@ def experiment_C():
 
 # ─── Experiment D: Perturbation test ────────────────────────────────────────
 
-def experiment_D():
+def experiment_D_toy_baseline():
     """
-    Experiment D wrapper around the reproducible perturbation/recovery harness.
-    Produces the legacy PNG plus CSV summaries for traceability.
+    Legacy toy Experiment D baseline around the reproducible perturbation harness.
+
+    This preserves the original 8-agent, 3-state seed-25 setup for comparison.
+    It is intentionally not the scaled Exp-B-like Experiment D regime.
     """
     print("\n" + "#"*60)
-    print("# Experiment D: Perturbation test")
+    print("# Experiment D: Perturbation test (toy baseline)")
     print("#"*60)
 
     result = run_perturbation_recovery(
@@ -418,6 +426,323 @@ def experiment_D():
     }
 
     return results_phase1, results_phase2
+
+
+def experiment_D():
+    """Backward-compatible alias for the toy Experiment D baseline."""
+    return experiment_D_toy_baseline()
+
+
+def experiment_D_scaled_expB():
+    """
+    Scaled Experiment D aligned with the Experiment B environment.
+
+    This helper is intentionally not invoked from __main__ because it is a
+    long-running diagnostic sweep rather than the legacy toy baseline.
+    """
+    return run_perturbation_recovery(
+        mode="static",
+        num_agents=100,
+        num_states=10,
+        num_actions=2,
+        num_steps_max=50000,
+        gamma=5.0,
+        kappa=2.0,
+        B_R=0.3,
+        B_F=0.15,
+        c_threshold=0.1,
+        seeds=10,
+        seed_start=0,
+        role_update_base_interval=3000,
+        fixed_role_update_interval=True,
+        perturb_strength=12.0,
+        perturb_duration=9000,
+        collapse_followers_on_perturb=False,
+        reputation_shock_factor=1.0,
+        post_window=50000,
+        conv_threshold=1.0,
+        conv_hold_steps=3600,
+        recovery_threshold=1.0,
+        recovery_hold_steps=2400,
+        stable_tail_window=6000,
+        dominant_threshold=0.5,
+        drop_fraction_threshold=0.5,
+        output_dir=str(OUTPUT_DIR),
+        run_label="exp_D_perturbation_gamma5_expB_10seeds",
+        auto_run_subdir=True,
+        plot_sample_interval=250,
+        tracking_mode="light",
+        initial_actor_rate=0.7,
+        initial_participant_rate=0.7,
+        reward_model="shared_base_gaussian",
+        reward_base_mu=0.5,
+        reward_base_sigma=0.08,
+        reward_agent_sigma=0.1,
+        reward_clip_min=0.01,
+        reward_clip_max=2.5,
+        output_prefix="exp_D_perturbation_gamma5_expB",
+    )
+
+
+def experiment_D_scaled_expB_good_bad():
+    """
+    Scaled Experiment D with a shared good/bad reward structure plus heterogeneity.
+
+    This keeps the Exp-B-sized environment but replaces the Gaussian reward table
+    with a shared good-vs-bad action structure in every state.
+    """
+    return run_perturbation_recovery(
+        mode="static",
+        num_agents=100,
+        num_states=10,
+        num_actions=2,
+        num_steps_max=50000,
+        gamma=5.0,
+        kappa=2.0,
+        B_R=0.3,
+        B_F=0.15,
+        c_threshold=0.1,
+        seeds=10,
+        seed_start=0,
+        role_update_base_interval=3000,
+        fixed_role_update_interval=True,
+        perturb_strength=12.0,
+        perturb_duration=9000,
+        perturb_policy_mode="force_bad_action",
+        collapse_followers_on_perturb=False,
+        reputation_shock_factor=1.0,
+        post_window=50000,
+        conv_threshold=1.0,
+        conv_hold_steps=3600,
+        recovery_threshold=1.0,
+        recovery_hold_steps=2400,
+        stable_tail_window=6000,
+        dominant_threshold=0.5,
+        drop_fraction_threshold=0.5,
+        output_dir=str(OUTPUT_DIR),
+        run_label="exp_D_perturbation_gamma5_expB_good_bad_10seeds",
+        auto_run_subdir=True,
+        plot_sample_interval=250,
+        tracking_mode="light",
+        initial_actor_rate=0.7,
+        initial_participant_rate=0.7,
+        reward_model="shared_good_bad_heterogeneous",
+        reward_good_value=1.0,
+        reward_bad_value=0.1,
+        reward_agent_sigma=0.1,
+        reward_order_gap=0.02,
+        reward_clip_min=0.01,
+        reward_clip_max=2.5,
+        output_prefix="exp_D_perturbation_gamma5_expB_good_bad",
+    )
+
+
+def experiment_D_scaled_expB_good_bad_gamma10_smoke():
+    """
+    Scaled Experiment D good/bad smoke run with gamma=10.
+
+    This keeps the action-only collapse mechanism unchanged and tests whether a
+    moderate increase in reputation weight helps recovery.
+    """
+    return run_perturbation_recovery(
+        mode="static",
+        num_agents=100,
+        num_states=10,
+        num_actions=2,
+        num_steps_max=50000,
+        gamma=10.0,
+        kappa=2.0,
+        B_R=0.3,
+        B_F=0.15,
+        c_threshold=0.1,
+        seeds=3,
+        seed_start=0,
+        role_update_base_interval=3000,
+        fixed_role_update_interval=True,
+        perturb_strength=12.0,
+        perturb_duration=9000,
+        perturb_policy_mode="force_bad_action",
+        collapse_followers_on_perturb=False,
+        reputation_shock_factor=1.0,
+        post_window=50000,
+        conv_threshold=1.0,
+        conv_hold_steps=3600,
+        recovery_threshold=1.0,
+        recovery_hold_steps=2400,
+        stable_tail_window=6000,
+        dominant_threshold=0.5,
+        drop_fraction_threshold=0.5,
+        output_dir=str(OUTPUT_DIR),
+        run_label="exp_D_perturbation_gamma10_expB_good_bad_smoke3",
+        auto_run_subdir=True,
+        plot_sample_interval=250,
+        tracking_mode="light",
+        initial_actor_rate=0.7,
+        initial_participant_rate=0.7,
+        reward_model="shared_good_bad_heterogeneous",
+        reward_good_value=1.0,
+        reward_bad_value=0.1,
+        reward_agent_sigma=0.1,
+        reward_order_gap=0.02,
+        reward_clip_min=0.01,
+        reward_clip_max=2.5,
+        output_prefix="exp_D_perturbation_gamma10_expB_good_bad",
+    )
+
+
+def experiment_D_scaled_expB_good_bad_gamma10_gap_smoke():
+    """
+    Scaled Experiment D good/bad smoke run with gamma=10 and a sharper
+    good-versus-bad reward contrast to preserve action-only collapse.
+    """
+    return run_perturbation_recovery(
+        mode="static",
+        num_agents=100,
+        num_states=10,
+        num_actions=2,
+        num_steps_max=50000,
+        gamma=10.0,
+        kappa=2.0,
+        B_R=0.3,
+        B_F=0.15,
+        c_threshold=0.1,
+        seeds=3,
+        seed_start=0,
+        role_update_base_interval=3000,
+        fixed_role_update_interval=True,
+        perturb_strength=12.0,
+        perturb_duration=9000,
+        perturb_policy_mode="force_bad_action",
+        collapse_followers_on_perturb=False,
+        reputation_shock_factor=1.0,
+        post_window=50000,
+        conv_threshold=1.0,
+        conv_hold_steps=3600,
+        recovery_threshold=1.0,
+        recovery_hold_steps=2400,
+        stable_tail_window=6000,
+        dominant_threshold=0.5,
+        drop_fraction_threshold=0.5,
+        output_dir=str(OUTPUT_DIR),
+        run_label="exp_D_perturbation_gamma10_expB_good_bad_gap_smoke3",
+        auto_run_subdir=True,
+        plot_sample_interval=250,
+        tracking_mode="light",
+        initial_actor_rate=0.7,
+        initial_participant_rate=0.7,
+        reward_model="shared_good_bad_heterogeneous",
+        reward_good_value=1.09,
+        reward_bad_value=0.01,
+        reward_agent_sigma=0.1,
+        reward_order_gap=0.02,
+        reward_clip_min=0.01,
+        reward_clip_max=2.5,
+        output_prefix="exp_D_perturbation_gamma10_expB_good_bad_gap",
+    )
+
+
+def experiment_D_scaled_expB_good_bad_gamma10_h80000_selected_converged():
+    """
+    Horizon-only recovery check for the six gamma=10 seeds that already converged.
+    """
+    return run_perturbation_recovery(
+        mode="static",
+        num_agents=100,
+        num_states=10,
+        num_actions=2,
+        num_steps_max=80000,
+        gamma=10.0,
+        kappa=2.0,
+        B_R=0.3,
+        B_F=0.15,
+        c_threshold=0.1,
+        seeds=6,
+        seed_start=0,
+        selected_seeds=[0, 1, 3, 4, 5, 8],
+        role_update_base_interval=3000,
+        fixed_role_update_interval=True,
+        perturb_strength=12.0,
+        perturb_duration=9000,
+        perturb_policy_mode="force_bad_action",
+        collapse_followers_on_perturb=False,
+        reputation_shock_factor=1.0,
+        post_window=80000,
+        conv_threshold=1.0,
+        conv_hold_steps=3600,
+        recovery_threshold=1.0,
+        recovery_hold_steps=2400,
+        stable_tail_window=6000,
+        dominant_threshold=0.5,
+        drop_fraction_threshold=0.5,
+        output_dir=str(OUTPUT_DIR),
+        run_label="exp_D_perturbation_gamma10_expB_good_bad_h80000_converged6",
+        auto_run_subdir=True,
+        plot_sample_interval=250,
+        tracking_mode="light",
+        initial_actor_rate=0.7,
+        initial_participant_rate=0.7,
+        reward_model="shared_good_bad_heterogeneous",
+        reward_good_value=1.0,
+        reward_bad_value=0.1,
+        reward_agent_sigma=0.1,
+        reward_order_gap=0.02,
+        reward_clip_min=0.01,
+        reward_clip_max=2.5,
+        output_prefix="exp_D_perturbation_gamma10_expB_good_bad_h80000_converged6",
+    )
+
+
+def experiment_D_scaled_expB_good_bad_recovery_debug():
+    """
+    Scaled Experiment D recovery-debug variant with faster fixed role updates.
+
+    The collapse mechanism is unchanged; only the coordination cadence is faster.
+    """
+    windows = derive_interval_scaled_windows(1000)
+    return run_perturbation_recovery(
+        mode="static",
+        num_agents=100,
+        num_states=10,
+        num_actions=2,
+        num_steps_max=50000,
+        gamma=5.0,
+        kappa=2.0,
+        B_R=0.3,
+        B_F=0.15,
+        c_threshold=0.1,
+        seeds=3,
+        seed_start=0,
+        role_update_base_interval=1000,
+        fixed_role_update_interval=True,
+        perturb_strength=12.0,
+        perturb_duration=windows["perturb_duration"],
+        perturb_policy_mode="force_bad_action",
+        collapse_followers_on_perturb=False,
+        reputation_shock_factor=1.0,
+        post_window=50000,
+        conv_threshold=1.0,
+        conv_hold_steps=windows["conv_hold_steps"],
+        recovery_threshold=1.0,
+        recovery_hold_steps=windows["recovery_hold_steps"],
+        stable_tail_window=windows["stable_tail_window"],
+        dominant_threshold=0.5,
+        drop_fraction_threshold=0.5,
+        output_dir=str(OUTPUT_DIR),
+        run_label="exp_D_perturbation_gamma5_expB_good_bad_recovery_debug_1000_smoke3",
+        auto_run_subdir=True,
+        plot_sample_interval=250,
+        tracking_mode="light",
+        initial_actor_rate=0.7,
+        initial_participant_rate=0.7,
+        reward_model="shared_good_bad_heterogeneous",
+        reward_good_value=1.0,
+        reward_bad_value=0.1,
+        reward_agent_sigma=0.1,
+        reward_order_gap=0.02,
+        reward_clip_min=0.01,
+        reward_clip_max=2.5,
+        output_prefix="exp_D_perturbation_gamma5_expB_good_bad_recovery_debug_1000",
+    )
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────

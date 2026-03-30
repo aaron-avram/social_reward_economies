@@ -93,12 +93,15 @@ class SystemConfig:
     use_numpy_fast_path: bool = False  # Enable vectorized reputation updates for large-N sweeps
     initial_actor_interaction_rate: float = 0.7
     initial_participant_interaction_rate: float = 0.7
-    reward_model: str = "simple_preferred_action"  # "simple_preferred_action" or "shared_base_gaussian"
+    reward_model: str = "simple_preferred_action"  # "simple_preferred_action", "shared_base_gaussian", or "shared_good_bad_heterogeneous"
     reward_base_mu: float = 0.5
     reward_base_sigma: float = 0.08
     reward_agent_sigma: float = 0.1
     reward_clip_min: float = 0.01
     reward_clip_max: float = 2.5
+    reward_good_value: float = 1.0
+    reward_bad_value: float = 0.1
+    reward_order_gap: float = 0.02
 
 
 @dataclass
@@ -418,10 +421,15 @@ class MultiAgentSystem:
     
     def __init__(self, config: SystemConfig):
         self.config = config
-        if self.config.reward_model not in {"simple_preferred_action", "shared_base_gaussian"}:
+        if self.config.reward_model not in {
+            "simple_preferred_action",
+            "shared_base_gaussian",
+            "shared_good_bad_heterogeneous",
+        }:
             raise ValueError(
                 f"Unsupported reward_model='{self.config.reward_model}'. "
-                "Use 'simple_preferred_action' or 'shared_base_gaussian'."
+                "Use 'simple_preferred_action', 'shared_base_gaussian', or "
+                "'shared_good_bad_heterogeneous'."
             )
         self.agents = [Agent(i, config, self) for i in range(config.num_agents)]
         self.time_step = 0
@@ -460,8 +468,11 @@ class MultiAgentSystem:
 
         # Optional reward table r_i(s,a) for richer state/action-dependent experiments.
         self._reward_tables = None
+        self._shared_good_actions = None
         if self.config.reward_model == "shared_base_gaussian":
             self._initialize_shared_base_gaussian_rewards()
+        elif self.config.reward_model == "shared_good_bad_heterogeneous":
+            self._initialize_shared_good_bad_heterogeneous_rewards()
 
         # Optional vectorized caches used by the large-scale experiment harness.
         self._v_matrix = None
@@ -499,6 +510,67 @@ class MultiAgentSystem:
             size=(self.config.num_agents, self.config.num_states, self.config.num_actions),
         )
         self._reward_tables = np.clip(tables, self.config.reward_clip_min, self.config.reward_clip_max)
+
+    def _initialize_shared_good_bad_heterogeneous_rewards(self):
+        """
+        Build reward table r_i(s,a) with one shared good action per state and
+        agent-specific payoff heterogeneity around that shared structure.
+
+        For each state s:
+        - sample a designated good action g_hat(s);
+        - draw each agent's rewards around a shared good/bad base;
+        - enforce that the good action remains at least reward_order_gap above
+          every bad action after sampling and clipping.
+        """
+        clip_min = float(self.config.reward_clip_min)
+        clip_max = float(self.config.reward_clip_max)
+        gap = float(self.config.reward_order_gap)
+        if gap < 0.0:
+            raise ValueError("reward_order_gap must be non-negative.")
+        if gap >= (clip_max - clip_min):
+            raise ValueError("reward_order_gap must be smaller than reward_clip_max - reward_clip_min.")
+
+        num_states = int(self.config.num_states)
+        num_actions = int(self.config.num_actions)
+        num_agents = int(self.config.num_agents)
+
+        good_actions = np.random.randint(0, num_actions, size=num_states, dtype=int)
+        base = np.full((num_states, num_actions), float(self.config.reward_bad_value), dtype=float)
+        base[np.arange(num_states), good_actions] = float(self.config.reward_good_value)
+
+        tables = np.random.normal(
+            loc=base[np.newaxis, :, :],
+            scale=float(self.config.reward_agent_sigma),
+            size=(num_agents, num_states, num_actions),
+        )
+        tables = np.clip(tables, clip_min, clip_max)
+
+        for agent_id in range(num_agents):
+            for state in range(num_states):
+                good_action = int(good_actions[state])
+                bad_actions = [a for a in range(num_actions) if a != good_action]
+                if not bad_actions:
+                    continue
+
+                good_val = float(np.clip(tables[agent_id, state, good_action], clip_min + gap, clip_max))
+                bad_vals = np.clip(tables[agent_id, state, bad_actions], clip_min, clip_max)
+
+                max_bad = float(np.max(bad_vals))
+                if good_val < max_bad + gap:
+                    good_val = min(clip_max, max_bad + gap)
+                bad_cap = good_val - gap
+                bad_vals = np.minimum(bad_vals, bad_cap)
+
+                max_bad = float(np.max(bad_vals))
+                if good_val < max_bad + gap:
+                    good_val = min(clip_max, max_bad + gap)
+                    bad_vals = np.minimum(bad_vals, good_val - gap)
+
+                tables[agent_id, state, good_action] = good_val
+                tables[agent_id, state, bad_actions] = bad_vals
+
+        self._shared_good_actions = good_actions
+        self._reward_tables = tables
 
     def _build_role_update_epochs(self) -> List[int]:
         """
@@ -662,7 +734,7 @@ class MultiAgentSystem:
         This is used both for the actor's own payoff and for Section 6.4.2 personal-benefit
         learning by observers.
         """
-        if self.config.reward_model == "shared_base_gaussian":
+        if self._reward_tables is not None:
             return float(self._reward_tables[observer_id, state, action])
 
         agent = self.agents[observer_id]
@@ -672,7 +744,7 @@ class MultiAgentSystem:
 
     def compute_observer_utility_vector(self, state: int, action: int) -> np.ndarray:
         """Vectorized u_i(s, x) over all observers i for one realized (state, action)."""
-        if self.config.reward_model == "shared_base_gaussian":
+        if self._reward_tables is not None:
             return np.array(self._reward_tables[:, state, action], dtype=float, copy=True)
 
         return np.array(
