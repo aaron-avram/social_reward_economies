@@ -104,6 +104,14 @@ class SystemConfig:
     reward_bad_value: float = 0.1
     reward_order_gap: float = 0.02
 
+    reward_consensus_high: float = 0.85
+    reward_consensus_low: float = 0.65
+    reward_welfare_high: float = 0.82
+    reward_welfare_low: float = 0.60
+
+    reward_lambda_min: float = 0.55
+    reward_lambda_max: float = 0.85
+
 
 @dataclass
 class AgentState:
@@ -426,6 +434,7 @@ class MultiAgentSystem:
             "simple_preferred_action",
             "shared_base_gaussian",
             "shared_good_bad_heterogeneous",
+             "consensus_welfare_gaussian",
         }:
             raise ValueError(
                 f"Unsupported reward_model='{self.config.reward_model}'. "
@@ -475,6 +484,8 @@ class MultiAgentSystem:
             self._initialize_shared_base_gaussian_rewards()
         elif self.config.reward_model == "shared_good_bad_heterogeneous":
             self._initialize_shared_good_bad_heterogeneous_rewards()
+        elif self.config.reward_model == "consensus_welfare_gaussian":
+            self._initialize_consensus_welfare_gaussian_rewards()
 
         # Optional vectorized caches used by the large-scale experiment harness.
         self._v_matrix = None
@@ -572,6 +583,47 @@ class MultiAgentSystem:
                 tables[agent_id, state, bad_actions] = bad_vals
 
         self._shared_good_actions = good_actions
+        self._reward_tables = tables
+
+    def _initialize_consensus_welfare_gaussian_rewards(self):
+        num_agents = self.config.num_agents
+        num_states = self.config.num_states
+        num_actions = self.config.num_actions
+
+        if num_actions != 2:
+            raise ValueError("consensus_welfare_gaussian currently requires num_actions=2")
+
+        tables = np.zeros((num_agents, num_states, num_actions), dtype=float)
+
+        lambda_vals = np.random.uniform(
+            self.config.reward_lambda_min,
+            self.config.reward_lambda_max,
+            size=num_agents,
+        )
+
+        C = np.zeros((num_states, num_actions), dtype=float)
+        W = np.zeros((num_states, num_actions), dtype=float)
+
+        for s in range(num_states):
+            # action 0 = consensus-easy, action 1 = welfare-better
+            C[s, 0] = np.random.normal(self.config.reward_consensus_high, 0.02)
+            C[s, 1] = np.random.normal(self.config.reward_consensus_low, 0.02)
+
+            W[s, 0] = np.random.normal(self.config.reward_welfare_low, 0.02)
+            W[s, 1] = np.random.normal(self.config.reward_welfare_high, 0.02)
+
+        for i in range(num_agents):
+            lam = lambda_vals[i]
+            for s in range(num_states):
+                base = lam * C[s, :] + (1.0 - lam) * W[s, :]
+                vals = np.random.normal(
+                    loc=base,
+                    scale=self.config.reward_agent_sigma,
+                    size=num_actions,
+                )
+                vals = np.clip(vals, self.config.reward_clip_min, self.config.reward_clip_max)
+                tables[i, s, :] = vals
+
         self._reward_tables = tables
 
     def _build_role_update_epochs(self) -> List[int]:
