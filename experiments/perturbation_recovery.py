@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+from collections import Counter
 from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -107,6 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--B-R", dest="B_R", type=float, default=0.3)
     parser.add_argument("--B-F", dest="B_F", type=float, default=0.15)
     parser.add_argument("--c-threshold", dest="c_threshold", type=float, default=0.1)
+    parser.add_argument("--delta", type=float, default=0.15)
     parser.add_argument("--seeds", type=int, default=10)
     parser.add_argument("--seed-start", type=int, default=0)
     parser.add_argument(
@@ -114,6 +116,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Optional comma-separated explicit seed list. Overrides --seeds/--seed-start when provided.",
+    )
+    parser.add_argument(
+        "--decision-audit-seeds",
+        type=str,
+        default="",
+        help="Optional comma-separated seed list for per-agent decision-audit export.",
+    )
+    parser.add_argument(
+        "--decision-audit-role-update-steps",
+        type=str,
+        default="",
+        help="Optional comma-separated role-update timesteps to retain in decision-audit exports.",
     )
 
     parser.add_argument("--role-update-s0", type=int, default=0)
@@ -275,6 +289,21 @@ def parse_selected_seeds(seed_text: str) -> List[int]:
     return seeds
 
 
+def parse_positive_int_list(int_text: str) -> List[int]:
+    if not str(int_text).strip():
+        return []
+    values: List[int] = []
+    seen = set()
+    for part in [p.strip() for p in str(int_text).split(",") if p.strip()]:
+        value = int(part)
+        if value <= 0:
+            raise ValueError(f"expected positive integers, got {value}")
+        if value not in seen:
+            seen.add(value)
+            values.append(value)
+    return values
+
+
 def _normalize_selected_seeds(selected_seeds: Optional[Sequence[int] | str]) -> List[int]:
     if selected_seeds is None:
         return []
@@ -293,11 +322,36 @@ def _normalize_selected_seeds(selected_seeds: Optional[Sequence[int] | str]) -> 
     return normalized
 
 
+def _normalize_positive_int_sequence(values: Optional[Sequence[int] | str]) -> List[int]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        return parse_positive_int_list(values)
+    normalized: List[int] = []
+    seen = set()
+    for value_like in values:
+        value = int(value_like)
+        if value <= 0:
+            raise ValueError(f"expected positive integers, got {value}")
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return normalized
+
+
 def _resolve_seed_list(args: argparse.Namespace) -> List[int]:
     explicit_seeds = _normalize_selected_seeds(getattr(args, "selected_seeds", None))
     if explicit_seeds:
         return explicit_seeds
     return list(range(int(args.seed_start), int(args.seed_start) + int(args.seeds)))
+
+
+def _resolve_decision_audit_seed_set(args: argparse.Namespace) -> set[int]:
+    return set(_normalize_selected_seeds(getattr(args, "decision_audit_seeds", None)))
+
+
+def _resolve_decision_audit_steps(args: argparse.Namespace) -> List[int]:
+    return parse_positive_int_list(getattr(args, "decision_audit_role_update_steps", ""))
 
 
 def _interval_seq_from_epochs(s0: int, epochs: Sequence[int]) -> List[int]:
@@ -655,7 +709,7 @@ def make_config(args: argparse.Namespace, mode: str) -> SystemConfig:
         c_threshold=float(args.c_threshold),
         B_R=float(args.B_R),
         B_F=float(args.B_F),
-        delta=0.15,
+        delta=float(args.delta),
         alpha_pu_base=0.05,
         beta_status_base=0.05,
         eta_v_base=0.1,
@@ -787,6 +841,58 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
         writer.writerows(rows)
 
 
+def _format_follower_count_map(counts: Counter[int]) -> str:
+    if not counts:
+        return ""
+    ordered = sorted(counts.items(), key=lambda kv: (-int(kv[1]), int(kv[0])))
+    return ";".join(f"{int(leader)}:{int(count)}" for leader, count in ordered)
+
+
+def summarize_decision_audit_rows(
+    audit_rows: Sequence[Dict[str, object]],
+    *,
+    leader_pre: int,
+) -> List[Dict[str, object]]:
+    grouped: Dict[int, List[Dict[str, object]]] = {}
+    for row in audit_rows:
+        grouped.setdefault(int(row["t"]), []).append(row)
+
+    summary_rows: List[Dict[str, object]] = []
+    for step in sorted(grouped):
+        rows = grouped[step]
+        following_counts: Counter[int] = Counter(
+            int(row["following_after"]) for row in rows if int(row["following_after"]) >= 0
+        )
+        highest_pre_hits = sum(int(int(row["highest_rep_agent_estimate"]) == int(leader_pre)) for row in rows)
+        finite_rep_to_preleader = [
+            float(row["rep_to_preleader_raw"])
+            for row in rows
+            if np.isfinite(float(row["rep_to_preleader_raw"]))
+        ]
+        top2 = following_counts.most_common(2)
+        summary_rows.append(
+            {
+                "step": int(step),
+                "agent_rows": int(len(rows)),
+                "leader_pre": int(leader_pre),
+                "preleader_follower_count": int(following_counts.get(int(leader_pre), 0)) if leader_pre >= 0 else 0,
+                "top_leader_id": int(top2[0][0]) if top2 else -1,
+                "top_leader_followers": int(top2[0][1]) if top2 else 0,
+                "second_leader_id": int(top2[1][0]) if len(top2) > 1 else -1,
+                "second_leader_followers": int(top2[1][1]) if len(top2) > 1 else 0,
+                "follower_count_by_leader": _format_follower_count_map(following_counts),
+                "share_highest_rep_is_preleader": float(highest_pre_hits / max(1, len(rows))),
+                "mean_selected_reputation_raw": float(np.mean([float(r["selected_reputation_raw"]) for r in rows])),
+                "mean_rep_to_preleader_raw": float(np.mean(finite_rep_to_preleader)) if finite_rep_to_preleader else float("nan"),
+                "mean_estimated_reward_pu": float(np.mean([float(r["estimated_reward_pu"]) for r in rows])),
+                "share_step1_condition_met": float(
+                    np.mean([1.0 if bool(r["step1_condition_met"]) else 0.0 for r in rows])
+                ),
+            }
+        )
+    return summary_rows
+
+
 def _downsample(x: np.ndarray, y: np.ndarray, sample_interval: int) -> Tuple[np.ndarray, np.ndarray]:
     sample_interval = max(1, int(sample_interval))
     if sample_interval <= 1:
@@ -904,6 +1010,11 @@ def run_single(args: argparse.Namespace, seed: int) -> Tuple[RunRecord, Dict[str
     np.random.seed(int(seed))
     config = make_config(args, mode=args.mode)
     system = MultiAgentSystem(config)
+    decision_audit_enabled = int(seed) in _resolve_decision_audit_seed_set(args)
+    decision_audit_steps = set(_resolve_decision_audit_steps(args))
+    if decision_audit_enabled:
+        system.enable_async_decision_audit()
+        system.set_decision_audit_preleader(None)
 
     n = int(args.num_agents)
     n_minus_1 = max(1, n - 1)
@@ -1018,6 +1129,7 @@ def run_single(args: argparse.Namespace, seed: int) -> Tuple[RunRecord, Dict[str
             if conv_streak >= conv_hold:
                 t_conv = int(system.time_step)
                 leader_pre = leader
+                system.set_decision_audit_preleader(leader_pre)
                 pre_followers = top_followers
                 if t_conv < int(args.num_steps_max):
                     t_perturb_start = t_conv + 1
@@ -1140,7 +1252,7 @@ def run_single(args: argparse.Namespace, seed: int) -> Tuple[RunRecord, Dict[str
 
     if t_perturb_start > 0 and leader_pre >= 0:
         start_idx = t_perturb_start - 1
-        end_idx = min(len(top_arr) - 1, start_idx + post_window - 1)
+        end_idx = len(top_arr) - 1
 
         ex_window = ex_arr[start_idx:end_idx + 1]
         valid_ex_window = ex_window[np.isfinite(ex_window)]
@@ -1257,6 +1369,15 @@ def run_single(args: argparse.Namespace, seed: int) -> Tuple[RunRecord, Dict[str
         "recovery_threshold": recovery_threshold,
         "dominant_threshold": dominant_threshold,
     }
+    if decision_audit_enabled:
+        audit_rows = system.get_async_decision_audit_rows()
+        if decision_audit_steps:
+            audit_rows = [row for row in audit_rows if int(row["t"]) in decision_audit_steps]
+        details["decision_audit_rows"] = audit_rows
+        details["decision_audit_checkpoint_summary_rows"] = summarize_decision_audit_rows(
+            audit_rows,
+            leader_pre=int(leader_pre),
+        )
     return record, details
 
 
@@ -1272,6 +1393,7 @@ def run_experiment(
     B_R: float = 0.3,
     B_F: float = 0.15,
     c_threshold: float = 0.1,
+    delta: float = 0.15,
     seeds: int = 10,
     seed_start: int = 0,
     selected_seeds: Optional[Sequence[int] | str] = None,
@@ -1311,6 +1433,8 @@ def run_experiment(
     reward_good_value: float = 1.0,
     reward_bad_value: float = 0.1,
     reward_order_gap: float = 0.02,
+    decision_audit_seeds: Optional[Sequence[int] | str] = None,
+    decision_audit_role_update_steps: Optional[Sequence[int] | str] = None,
     numpy_fast_path: bool = True,
     output_prefix: str = "perturbation_recovery",
 ) -> Dict[str, object]:
@@ -1325,9 +1449,14 @@ def run_experiment(
         B_R=B_R,
         B_F=B_F,
         c_threshold=c_threshold,
+        delta=delta,
         seeds=seeds,
         seed_start=seed_start,
         selected_seeds=_normalize_selected_seeds(selected_seeds),
+        decision_audit_seeds=_normalize_selected_seeds(decision_audit_seeds),
+        decision_audit_role_update_steps=",".join(
+            str(step) for step in _normalize_positive_int_sequence(decision_audit_role_update_steps)
+        ),
         role_update_s0=role_update_s0,
         role_update_T_seq=role_update_T_seq,
         role_update_base_interval=role_update_base_interval,
@@ -1394,6 +1523,8 @@ def run_experiment(
 
     plot_files: Dict[int, str] = {}
     diagnostic_csvs: Dict[int, str] = {}
+    decision_audit_csvs: Dict[int, str] = {}
+    checkpoint_leader_summary_csvs: Dict[int, str] = {}
     single_run = len(seeds_list) == 1
     for rec in run_records:
         if single_run:
@@ -1418,6 +1549,18 @@ def run_experiment(
             write_csv(diag_csv, diag_rows)
             diagnostic_csvs[rec.seed] = str(diag_csv)
 
+        decision_audit_rows = det.get("decision_audit_rows", [])
+        if decision_audit_rows:
+            audit_csv = out_dir / f"{args.output_prefix}_seed{rec.seed}_{args.mode}_decision_audit.csv"
+            write_csv(audit_csv, decision_audit_rows)
+            decision_audit_csvs[rec.seed] = str(audit_csv)
+
+        checkpoint_summary_rows = det.get("decision_audit_checkpoint_summary_rows", [])
+        if checkpoint_summary_rows:
+            summary_csv = out_dir / f"{args.output_prefix}_seed{rec.seed}_{args.mode}_checkpoint_leader_summary.csv"
+            write_csv(summary_csv, checkpoint_summary_rows)
+            checkpoint_leader_summary_csvs[rec.seed] = str(summary_csv)
+
     return {
         "args": args,
         "output_dir": str(out_dir),
@@ -1428,6 +1571,8 @@ def run_experiment(
         "aggregate_csv": str(agg_csv),
         "plot_files": plot_files,
         "diagnostic_csvs": diagnostic_csvs,
+        "decision_audit_csvs": decision_audit_csvs,
+        "checkpoint_leader_summary_csvs": checkpoint_leader_summary_csvs,
     }
 
 
@@ -1445,6 +1590,10 @@ def _print_summary(result: Dict[str, object]) -> None:
         print(f"plot (seed {seed}): {plot}")
     for seed, diag_csv in result.get("diagnostic_csvs", {}).items():
         print(f"exit diagnostics (seed {seed}): {diag_csv}")
+    for seed, audit_csv in result.get("decision_audit_csvs", {}).items():
+        print(f"decision audit (seed {seed}): {audit_csv}")
+    for seed, summary_csv in result.get("checkpoint_leader_summary_csvs", {}).items():
+        print(f"checkpoint leader summary (seed {seed}): {summary_csv}")
 
     print("\nPer-seed:")
     for r in run_records:
@@ -1485,6 +1634,7 @@ def main() -> None:
         B_R=args.B_R,
         B_F=args.B_F,
         c_threshold=args.c_threshold,
+        delta=args.delta,
         seeds=args.seeds,
         seed_start=args.seed_start,
         selected_seeds=args.selected_seeds,

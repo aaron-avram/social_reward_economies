@@ -176,6 +176,131 @@ def test_ir_eq13_uses_weighted_max_gamma_kappa(model_module):
     assert agent.state.actor_interaction_rate != pytest.approx(expected_unweighted, abs=1e-6)
 
 
+def test_actor_rate_driver_standard_mode_ignores_status_override_even_with_followers(model_module):
+    system = make_system(
+        model_module,
+        num_agents=12,
+        extra_config=dict(
+            M=1.0,
+            u_0=0.1,
+            gamma=2.0,
+            kappa=0.0,
+            actor_rate_driver_mode="standard",
+            actor_rate_status_override_min_followers=10,
+        ),
+    )
+    agent = system.agents[0]
+    agent.state.followers = set(range(1, 11))
+    agent.state.actor_interaction_rate = 0.4
+    agent.state.estimated_reward_pu = 0.9
+    agent.state.estimated_reward_rep = 0.4
+    agent.state.estimated_reward_status = 0.3
+
+    rate_terms = agent.get_actor_rate_terms()
+
+    assert rate_terms["status_override_active"] == 0
+    assert rate_terms["driver"] == pytest.approx(0.9, abs=1e-12)
+    assert rate_terms["driver_label"] == "pu"
+
+
+def test_actor_rate_status_override_kappa0_below_threshold_uses_standard_driver(model_module):
+    system = make_system(
+        model_module,
+        num_agents=12,
+        extra_config=dict(
+            M=1.0,
+            u_0=0.1,
+            gamma=2.0,
+            kappa=0.0,
+            actor_rate_driver_mode="status_if_followers_kappa0",
+            actor_rate_status_override_min_followers=10,
+        ),
+    )
+    agent = system.agents[0]
+    agent.state.followers = set(range(1, 10))
+    agent.state.actor_interaction_rate = 0.4
+    agent.state.estimated_reward_pu = 0.9
+    agent.state.estimated_reward_rep = 0.4
+    agent.state.estimated_reward_status = 0.3
+
+    rate_terms = agent.get_actor_rate_terms()
+
+    assert rate_terms["follower_count"] == 9
+    assert rate_terms["status_override_active"] == 0
+    assert rate_terms["driver"] == pytest.approx(0.9, abs=1e-12)
+    assert rate_terms["driver_label"] == "pu"
+
+
+def test_actor_rate_status_override_kappa0_at_threshold_uses_unweighted_status(model_module):
+    system = make_system(
+        model_module,
+        num_agents=12,
+        extra_config=dict(
+            M=1.0,
+            u_0=0.1,
+            gamma=2.0,
+            kappa=0.0,
+            actor_rate_driver_mode="status_if_followers_kappa0",
+            actor_rate_status_override_min_followers=10,
+        ),
+    )
+    agent = system.agents[0]
+    agent.state.followers = set(range(1, 11))
+    mu_prev = 0.4
+    alpha_rate = 0.2
+    agent.state.actor_interaction_rate = mu_prev
+    agent.state.estimated_reward_pu = 0.9
+    agent.state.estimated_reward_rep = 0.4
+    agent.state.estimated_reward_status = 0.3
+
+    rate_terms = agent.get_actor_rate_terms()
+    expected = np.clip(
+        mu_prev
+        + alpha_rate
+        * (
+            -np.exp(-(system.config.M - mu_prev)) * system.config.u_0
+            + np.exp(-mu_prev) * agent.state.estimated_reward_status
+        ),
+        0.0,
+        system.config.M,
+    )
+
+    assert rate_terms["follower_count"] == 10
+    assert rate_terms["status_override_active"] == 1
+    assert rate_terms["driver"] == pytest.approx(agent.state.estimated_reward_status, abs=1e-12)
+    assert rate_terms["driver_label"] == "status_override"
+
+    agent.update_actor_interaction_rate(alpha_rate)
+    assert agent.state.actor_interaction_rate == pytest.approx(expected, abs=1e-12)
+
+
+def test_actor_rate_status_override_does_not_activate_when_kappa_positive(model_module):
+    system = make_system(
+        model_module,
+        num_agents=12,
+        extra_config=dict(
+            M=1.0,
+            u_0=0.1,
+            gamma=2.0,
+            kappa=1.0,
+            actor_rate_driver_mode="status_if_followers_kappa0",
+            actor_rate_status_override_min_followers=10,
+        ),
+    )
+    agent = system.agents[0]
+    agent.state.followers = set(range(1, 11))
+    agent.state.actor_interaction_rate = 0.4
+    agent.state.estimated_reward_pu = 0.9
+    agent.state.estimated_reward_rep = 0.4
+    agent.state.estimated_reward_status = 0.3
+
+    rate_terms = agent.get_actor_rate_terms()
+
+    assert rate_terms["status_override_active"] == 0
+    assert rate_terms["driver"] == pytest.approx(0.9, abs=1e-12)
+    assert rate_terms["driver_label"] == "pu"
+
+
 def test_ir_participant_rate_remains_constant_over_steps(model_module):
     """Section 6.2/6.1.2 assumption: participant rates mu_p,i are fixed over time."""
     system = make_system(
@@ -285,6 +410,93 @@ def test_rep1_highest_reputation_selection_excludes_self(model_module):
     assert agent.state.highest_rep_agent_estimate != 0
 
 
+def test_true_reputation_helper_uses_theta_and_expected_group_utility(model_module):
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(
+            num_states=1,
+            num_actions=2,
+            reward_model="shared_base_gaussian",
+        ),
+    )
+
+    system._reward_tables = np.array(
+        [
+            [[2.0, 0.0]],
+            [[3.0, 1.0]],
+            [[4.0, 1.0]],
+        ],
+        dtype=float,
+    )
+
+    for agent in system.agents:
+        agent.state.weights_pu[:] = np.array([[-20.0, 20.0]])
+        agent.state.role = model_module.AgentRole.PERSONAL_UTILITY
+        agent.state.actor_interaction_rate = 1.0
+
+    system.agents[0].state.weights_pu[:] = np.array([[20.0, -20.0]])  # deterministic action 0
+
+    rows = system._build_true_reputation_checkpoint_rows(
+        checkpoint_kind="final",
+        role_update_index=0,
+    )
+    by_agent = {int(row["agent_id"]): row for row in rows}
+    theta = 1.0 - np.exp(-1.0)
+
+    assert by_agent[0]["sum_expected_utility_others"] == pytest.approx(7.0, abs=1e-6)
+    assert by_agent[0]["true_reputation"] == pytest.approx(theta * 7.0, abs=1e-6)
+    assert by_agent[0]["true_rank"] == 1
+    assert by_agent[0]["unique_true_top_agent"] == 0
+    assert by_agent[1]["gap_to_true_top"] > 0.0
+    assert by_agent[2]["gap_to_true_top"] > 0.0
+
+
+def test_rep1_tie_selection_is_uniform_for_dict_path(model_module):
+    system = make_system(model_module, num_agents=4, extra_config=dict(delta=0.0))
+    agent = system.agents[3]
+    agent.state.reputation_estimates = {
+        0: 1.0,
+        1: 1.0,
+        2: 0.2,
+        3: 999.0,
+    }
+
+    draws = []
+    np.random.seed(77)
+    for _ in range(1000):
+        agent.identify_highest_reputation_agent()
+        draws.append(int(agent.state.highest_rep_agent_estimate))
+
+    count_0 = draws.count(0)
+    count_1 = draws.count(1)
+    assert count_0 + count_1 == 1000
+    share_0 = count_0 / 1000.0
+    assert 0.40 <= share_0 <= 0.60
+
+
+def test_rep1_tie_selection_is_uniform_for_matrix_path(model_module):
+    system = make_system(
+        model_module,
+        num_agents=4,
+        extra_config=dict(delta=0.0, use_numpy_fast_path=True),
+    )
+
+    system._s_matrix[3, :] = np.array([1.0, 1.0, 0.2, 999.0], dtype=float)
+
+    draws = []
+    np.random.seed(88)
+    for _ in range(1000):
+        system._identify_highest_reputation_agent_from_matrix(3)
+        draws.append(int(system.agents[3].state.highest_rep_agent_estimate))
+
+    count_0 = draws.count(0)
+    count_1 = draws.count(1)
+    assert count_0 + count_1 == 1000
+    share_0 = count_0 / 1000.0
+    assert 0.40 <= share_0 <= 0.60
+
+
 def test_rep2_reputation_update_matches_eq9_additive_structure(model_module):
     system = make_system(model_module, num_agents=2)
     agent_i = system.agents[0]
@@ -299,7 +511,7 @@ def test_rep2_reputation_update_matches_eq9_additive_structure(model_module):
     eta_v_t = 0.5
 
     v_old = agent_i.state.personal_benefit_estimates[k]
-    deltas = agent_i.update_personal_benefit_estimates(observed_payoffs, eta_v_t)
+    deltas = agent_i.update_personal_benefit_estimates(observed_payoffs, eta_v_t, active_actor_ids=[k])
     v_new = agent_i.state.personal_benefit_estimates[k]
 
     agent_i.update_reputation_estimates_gossip(deltas, [agent_j], eta_s_t=1.0)
@@ -331,7 +543,7 @@ def test_estimates_personal_benefit_delta_active(model_module):
 
     agent.state.personal_benefit_estimates[1] = 4.0
     observed_payoffs = {0: 0.0, 1: 10.0, 2: 0.0}
-    deltas = agent.update_personal_benefit_estimates(observed_payoffs, eta_v_t=eta)
+    deltas = agent.update_personal_benefit_estimates(observed_payoffs, eta_v_t=eta, active_actor_ids=[1])
 
     expected_new = 4.0 + eta * (10.0 - 4.0)
     expected_delta = expected_new - 4.0
@@ -348,7 +560,7 @@ def test_estimates_personal_benefit_decay_inactive(model_module):
 
     agent.state.personal_benefit_estimates[2] = 5.0
     observed_payoffs = {0: 0.0, 1: 0.0, 2: 0.0}
-    deltas = agent.update_personal_benefit_estimates(observed_payoffs, eta_v_t=eta)
+    deltas = agent.update_personal_benefit_estimates(observed_payoffs, eta_v_t=eta, active_actor_ids=[])
 
     expected_new = 5.0 * (1.0 - eta)
     expected_delta = expected_new - 5.0
@@ -363,7 +575,7 @@ def test_rep642_inactive_decay_matches_formula(model_module):
 
     agent.state.personal_benefit_estimates[1] = 0.5
     eta_v_t = 0.2
-    agent.update_personal_benefit_estimates({1: 0.0}, eta_v_t=eta_v_t)
+    agent.update_personal_benefit_estimates({1: 0.0}, eta_v_t=eta_v_t, active_actor_ids=[])
 
     assert agent.state.personal_benefit_estimates[1] == pytest.approx(
         0.5 * (1.0 - eta_v_t), abs=1e-12

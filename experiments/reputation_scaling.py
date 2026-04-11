@@ -71,7 +71,7 @@ class AggregateRecord:
     ci95_tail_welfare: float
 
 
-DetailedTrace = Dict[str, np.ndarray]
+DetailedTrace = Dict[str, object]
 AsyncDebugArtifacts = Dict[str, object]
 
 
@@ -92,6 +92,19 @@ def parse_args() -> argparse.Namespace:
         help="Optional explicit comma-separated seed list (e.g. \"2,7,9\"). Overrides --seeds/--seed-start.",
     )
     parser.add_argument("--kappa", type=float, default=0.0)
+    parser.add_argument("--delta", type=float, default=0.15)
+    parser.add_argument(
+        "--actor-rate-driver-mode",
+        choices=["standard", "status_if_followers_kappa0"],
+        default="standard",
+        help="Actor-rate driver mode for Eq. (13): paper-faithful standard or experimental status override at kappa=0.",
+    )
+    parser.add_argument(
+        "--actor-rate-status-override-min-followers",
+        type=int,
+        default=10,
+        help="Follower-count threshold for the experimental status-driven actor-rate override.",
+    )
     parser.add_argument("--output-dir", type=str, default=str(Path(__file__).resolve().parent / "outputs"))
     parser.add_argument("--tail-window", type=int, default=500)
     parser.add_argument(
@@ -135,6 +148,18 @@ def parse_args() -> argparse.Namespace:
         default="first",
         help="When tracking-mode=full, export per-agent PU/reputation traces for none, the first seed, or all seeds.",
     )
+    parser.add_argument(
+        "--small-n-trace-export",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For small-N debug runs only, export dense per-timestep reputation matrices in long-form CSVs.",
+    )
+    parser.add_argument(
+        "--force-all-active-debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Debug override: force all agents to be active as both actors and participants every step.",
+    )
     parser.add_argument("--initial-actor-rate", type=float, default=0.2)
     parser.add_argument("--initial-participant-rate", type=float, default=0.2)
     parser.add_argument(
@@ -148,6 +173,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-agent-sigma", type=float, default=0.1)
     parser.add_argument("--reward-clip-min", type=float, default=0.01)
     parser.add_argument("--reward-clip-max", type=float, default=2.5)
+    parser.add_argument(
+        "--eq9-averaging-mode",
+        choices=["participants_only", "all_agents"],
+        default="participants_only",
+        help="Eq. (9) observed-reputation averaging set.",
+    )
+    parser.add_argument(
+        "--leader-update-mode",
+        choices=["participants_only_post_eq9", "all_agents_post_eq9", "participants_only_pre_eq9"],
+        default="participants_only_post_eq9",
+        help="Section 6.4.4 timing/scope for updating L_i(t+1).",
+    )
     parser.add_argument(
         "--numpy-fast-path",
         action=argparse.BooleanOptionalAction,
@@ -256,6 +293,12 @@ def make_config(args: argparse.Namespace, gamma: float, mode: str) -> SystemConf
     role_s0 = int(args.role_update_s0)
     role_t_seq = parse_role_update_T_seq(args.role_update_T_seq)
     role_epochs = parse_role_update_epochs(args.role_update_epochs)
+    eq9_averaging_mode = getattr(args, "eq9_averaging_mode", "participants_only")
+    leader_update_mode = getattr(args, "leader_update_mode", "participants_only_post_eq9")
+    actor_rate_driver_mode = getattr(args, "actor_rate_driver_mode", "standard")
+    actor_rate_status_override_min_followers = int(
+        getattr(args, "actor_rate_status_override_min_followers", 10)
+    )
     if mode == "async":
         # Disable built-in synchronized periodic update; async mode runs external
         # stochastic update events after each step.
@@ -271,12 +314,16 @@ def make_config(args: argparse.Namespace, gamma: float, mode: str) -> SystemConf
         num_time_steps=args.num_steps,
         M=1.0,
         u_0=0.1,
+        actor_rate_driver_mode=actor_rate_driver_mode,
+        actor_rate_status_override_min_followers=actor_rate_status_override_min_followers,
         gamma=gamma,
         kappa=args.kappa,
         c_threshold=0.1,
         B_R=0.3,
         B_F=1_000_000.0,  # Disable hysteresis in Experiment B family; only Experiment D uses it.
-        delta=0.15,
+        delta=args.delta,
+        eq9_averaging_mode=eq9_averaging_mode,
+        leader_update_mode=leader_update_mode,
         alpha_pu_base=0.05,
         beta_status_base=0.05,
         eta_v_base=0.1,
@@ -291,6 +338,7 @@ def make_config(args: argparse.Namespace, gamma: float, mode: str) -> SystemConf
         gossip_alpha=0.5,
         tracking_mode=args.tracking_mode,
         use_numpy_fast_path=args.numpy_fast_path,
+        force_all_active_debug=getattr(args, "force_all_active_debug", False),
         initial_actor_interaction_rate=args.initial_actor_rate,
         initial_participant_interaction_rate=args.initial_participant_rate,
         reward_model=args.reward_model,
@@ -339,21 +387,66 @@ def _serialize_int_array(values: np.ndarray) -> str:
 
 def _extract_trace_bundle(results: Dict[str, object]) -> Optional[DetailedTrace]:
     pu_history = np.asarray(results.get("estimated_reward_pu_history", []), dtype=float)
+    rep_reward_history = np.asarray(results.get("estimated_reward_rep_history", []), dtype=float)
+    status_reward_history = np.asarray(results.get("estimated_reward_status_history", []), dtype=float)
+    actor_rate_history = np.asarray(results.get("actor_interaction_rate_history", []), dtype=float)
     rep_history = np.asarray(results.get("weighted_selected_reputation_history", []), dtype=float)
     raw_rep_history = np.asarray(results.get("selected_reputation_history", []), dtype=float)
     highest_rep_history = np.asarray(results.get("highest_rep_agent_history", []), dtype=int)
     following_history = np.asarray(results.get("following_history", []), dtype=int)
     role_label_history = np.asarray(results.get("role_label_history", []), dtype=object)
+    dense_reputation_history = np.asarray(results.get("dense_reputation_history", []), dtype=float)
+    dense_personal_benefit_history = np.asarray(results.get("dense_personal_benefit_history", []), dtype=float)
+    true_reputation_history = np.asarray(results.get("true_reputation_history", []), dtype=float)
+    true_reputation_rank_history = np.asarray(results.get("true_reputation_rank_history", []), dtype=int)
+    true_reputation_theta_history = np.asarray(results.get("true_reputation_theta_history", []), dtype=float)
+    true_reputation_sum_expected_history = np.asarray(
+        results.get("true_reputation_sum_expected_history", []),
+        dtype=float,
+    )
+    follower_count_history = np.asarray(results.get("follower_counts", []), dtype=int)
+    active_actor_ids_history = list(results.get("active_actor_ids_history", []))
+    active_participant_ids_history = list(results.get("active_participant_ids_history", []))
+    observed_utility_matrix_history = [
+        np.asarray(x, dtype=float) if x is not None else None
+        for x in results.get("observed_utility_matrix_history", [])
+    ]
+    eta_v_history = [float(x) for x in results.get("eta_v_history", [])]
+    gossip_target_ids_history = list(results.get("gossip_target_ids_history", []))
+    averaging_agent_ids_history = list(results.get("averaging_agent_ids_history", []))
+    avg_s_by_target_history = list(results.get("avg_s_by_target_history", []))
+    delta_v_matrix_history = [
+        np.asarray(x, dtype=float)
+        for x in results.get("delta_v_matrix_history", [])
+    ]
     if pu_history.size == 0 or rep_history.size == 0:
         return None
     return {
         "estimated_reward_pu_history": pu_history,
+        "estimated_reward_rep_history": rep_reward_history,
+        "estimated_reward_status_history": status_reward_history,
+        "actor_interaction_rate_history": actor_rate_history,
         "weighted_selected_reputation_history": rep_history,
         "selected_reputation_history": raw_rep_history,
         "highest_rep_agent_history": highest_rep_history,
         "following_history": following_history,
         "role_label_history": role_label_history,
+        "dense_reputation_history": dense_reputation_history,
+        "dense_personal_benefit_history": dense_personal_benefit_history,
+        "true_reputation_history": true_reputation_history,
+        "true_reputation_rank_history": true_reputation_rank_history,
+        "true_reputation_theta_history": true_reputation_theta_history,
+        "true_reputation_sum_expected_history": true_reputation_sum_expected_history,
+        "follower_count_history": follower_count_history,
         "role_update_times": np.asarray(results.get("role_update_times", []), dtype=int),
+        "active_actor_ids_history": active_actor_ids_history,
+        "active_participant_ids_history": active_participant_ids_history,
+        "observed_utility_matrix_history": observed_utility_matrix_history,
+        "eta_v_history": eta_v_history,
+        "gossip_target_ids_history": gossip_target_ids_history,
+        "averaging_agent_ids_history": averaging_agent_ids_history,
+        "avg_s_by_target_history": avg_s_by_target_history,
+        "delta_v_matrix_history": delta_v_matrix_history,
     }
 
 
@@ -637,6 +730,7 @@ def run_single(
     Optional[DetailedTrace],
     Optional[AsyncDebugArtifacts],
     Optional[List[dict]],
+    Optional[Dict[str, List[dict]]],
 ]:
     np.random.seed(seed)
     config = make_config(args, gamma=gamma, mode=mode)
@@ -644,6 +738,11 @@ def run_single(
     async_debug_enabled = bool(mode == "async" and args.async_decision_audit)
     if async_debug_enabled:
         system.enable_async_decision_audit()
+    small_n_trace_export_enabled = bool(
+        getattr(args, "small_n_trace_export", False) and int(args.num_agents) <= 12
+    )
+    if small_n_trace_export_enabled:
+        system.enable_small_n_trace_export()
     role_update_diagnostics_enabled = bool(mode == "static" and getattr(args, "role_update_diagnostics", False))
     if role_update_diagnostics_enabled:
         system.enable_role_update_diagnostics()
@@ -752,8 +851,12 @@ def run_single(
         tail_welfare=tail_welfare,
     )
     detailed_trace: Optional[DetailedTrace] = None
-    if str(args.tracking_mode).lower() == "full":
+    if str(args.tracking_mode).lower() == "full" or small_n_trace_export_enabled:
         detailed_trace = _extract_trace_bundle(results)
+        if detailed_trace is not None:
+            detailed_trace["B_R"] = float(system.config.B_R)
+            detailed_trace["B_F"] = float(system.config.B_F)
+            detailed_trace["delta"] = float(system.config.delta)
 
     async_debug: Optional[AsyncDebugArtifacts] = None
     if async_debug_enabled:
@@ -776,8 +879,29 @@ def run_single(
             "trace_bundle": trace_bundle,
         }
     role_update_diagnostics = system.get_role_update_diagnostic_rows() if role_update_diagnostics_enabled else None
+    checkpoint_audit_rows: Optional[Dict[str, List[dict]]] = None
+    if role_update_diagnostics_enabled:
+        checkpoint_audit_rows = {
+            "true_reputation_checkpoints": list(system.get_true_reputation_checkpoint_rows()),
+            "estimate_consensus_checkpoints": list(system.get_estimate_consensus_checkpoint_rows()),
+            "rate_audit_checkpoints": list(system.get_rate_audit_checkpoint_rows()),
+        }
+        final_bundle = system.build_expb_checkpoint_audit_bundle(
+            checkpoint_kind="final",
+            role_update_index=len(results.get("role_update_times", [])),
+        )
+        for key, final_rows in final_bundle.items():
+            checkpoint_audit_rows.setdefault(key, []).extend(final_rows)
 
-    return record, top_follower_series, leader_series, detailed_trace, async_debug, role_update_diagnostics
+    return (
+        record,
+        top_follower_series,
+        leader_series,
+        detailed_trace,
+        async_debug,
+        role_update_diagnostics,
+        checkpoint_audit_rows,
+    )
 
 
 def _mean_std_ci(values: Sequence[float]) -> Tuple[float, float, float]:
@@ -841,6 +965,172 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def enrich_checkpoint_rows(
+    *,
+    mode: str,
+    gamma: float,
+    seed: int,
+    rows: Sequence[dict],
+) -> List[dict]:
+    enriched: List[dict] = []
+    for row in rows:
+        out = dict(row)
+        out["mode"] = str(mode)
+        out["gamma"] = float(gamma)
+        out["seed"] = int(seed)
+        enriched.append(out)
+    return enriched
+
+
+def _mode_with_share(values: Sequence[int]) -> Tuple[int, float]:
+    if not values:
+        return -1, 0.0
+    counts: Dict[int, int] = {}
+    for value in values:
+        counts[int(value)] = counts.get(int(value), 0) + 1
+    mode_value = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+    share = float(counts[mode_value] / max(1, len(values)))
+    return int(mode_value), share
+
+
+def summarize_rank_alignment_checkpoints(
+    *,
+    true_rows: Sequence[dict],
+    estimate_rows: Sequence[dict],
+) -> List[dict]:
+    grouped_true: Dict[Tuple[str, float, int, int, str, int], List[dict]] = {}
+    grouped_estimate: Dict[Tuple[str, float, int, int, str, int], List[dict]] = {}
+
+    def _group_key(row: dict) -> Tuple[str, float, int, int, str, int]:
+        return (
+            str(row["mode"]),
+            float(row["gamma"]),
+            int(row["seed"]),
+            int(row["t"]),
+            str(row["checkpoint_kind"]),
+            int(row["role_update_index"]),
+        )
+
+    for row in true_rows:
+        grouped_true.setdefault(_group_key(row), []).append(row)
+    for row in estimate_rows:
+        grouped_estimate.setdefault(_group_key(row), []).append(row)
+
+    out_rows: List[dict] = []
+    for key in sorted(set(grouped_true.keys()) & set(grouped_estimate.keys())):
+        true_group = grouped_true[key]
+        estimate_group = grouped_estimate[key]
+        mode, gamma, seed, t, checkpoint_kind, role_update_index = key
+
+        unique_true_candidates = sorted(
+            {
+                int(row["unique_true_top_agent"])
+                for row in true_group
+                if int(row.get("true_top_unique", 0)) == 1 and int(row["unique_true_top_agent"]) >= 0
+            }
+        )
+        unique_true_top_agent = unique_true_candidates[0] if len(unique_true_candidates) == 1 else -1
+        top_estimate_agents = [int(row["top_estimate_agent"]) for row in estimate_group if int(row["top_estimate_agent"]) >= 0]
+        selected_target_agents = [
+            int(row["highest_rep_agent_estimate"])
+            for row in estimate_group
+            if int(row["highest_rep_agent_estimate"]) >= 0
+        ]
+        current_root_leaders = [
+            int(row["current_root_leader"])
+            for row in estimate_group
+            if int(row["current_root_leader"]) >= 0
+        ]
+        top_estimate_mode_agent, top_estimate_mode_share = _mode_with_share(top_estimate_agents)
+        selected_target_mode_agent, selected_target_mode_share = _mode_with_share(selected_target_agents)
+
+        top_estimate_match_share = 0.0
+        selected_match_share = 0.0
+        if unique_true_top_agent >= 0 and estimate_group:
+            top_estimate_match_share = float(
+                np.mean(
+                    np.asarray(
+                        [int(row["top_estimate_agent"]) == unique_true_top_agent for row in estimate_group],
+                        dtype=float,
+                    )
+                )
+            )
+            selected_match_share = float(
+                np.mean(
+                    np.asarray(
+                        [int(row["highest_rep_agent_estimate"]) == unique_true_top_agent for row in estimate_group],
+                        dtype=float,
+                    )
+                )
+            )
+
+        out_rows.append(
+            {
+                "mode": str(mode),
+                "gamma": float(gamma),
+                "seed": int(seed),
+                "t": int(t),
+                "checkpoint_kind": str(checkpoint_kind),
+                "role_update_index": int(role_update_index),
+                "eq9_averaging_mode": str(
+                    estimate_group[0].get("eq9_averaging_mode", true_group[0].get("eq9_averaging_mode", "unknown"))
+                ),
+                "leader_update_mode": str(
+                    estimate_group[0].get("leader_update_mode", true_group[0].get("leader_update_mode", "unknown"))
+                ),
+                "true_top_unique": int(unique_true_top_agent >= 0),
+                "unique_true_top_agent": int(unique_true_top_agent),
+                "top_estimate_mode_agent": int(top_estimate_mode_agent),
+                "top_estimate_mode_share": float(top_estimate_mode_share),
+                "selected_target_mode_agent": int(selected_target_mode_agent),
+                "selected_target_mode_share": float(selected_target_mode_share),
+                "top_estimate_matches_true_top_share": float(top_estimate_match_share),
+                "selected_matches_true_top_share": float(selected_match_share),
+                "candidate_count_mean": float(
+                    np.mean([float(row["candidate_count_within_delta"]) for row in estimate_group])
+                    if estimate_group
+                    else 0.0
+                ),
+                "candidate_count_max": int(
+                    max((int(row["candidate_count_within_delta"]) for row in estimate_group), default=0)
+                ),
+                "mean_gap_top2": float(
+                    np.mean([float(row["gap_top2"]) for row in estimate_group]) if estimate_group else 0.0
+                ),
+                "distinct_top_estimate_agents": int(len(set(top_estimate_agents))),
+                "distinct_selected_targets": int(len(set(selected_target_agents))),
+                "distinct_root_count": int(len(set(current_root_leaders))),
+            }
+        )
+    return out_rows
+
+
+def build_paper_gossip_scope(highest_rep_agents: Sequence[int]) -> List[int]:
+    return sorted({int(agent_id) for agent_id in highest_rep_agents if int(agent_id) >= 0})
+
+
+def characterize_changed_gossip_columns(
+    rep_before: np.ndarray,
+    rep_after: np.ndarray,
+    paper_scope: Sequence[int],
+) -> dict:
+    before = np.asarray(rep_before, dtype=float)
+    after = np.asarray(rep_after, dtype=float)
+    if before.shape != after.shape:
+        raise ValueError("rep_before and rep_after must have the same shape.")
+
+    changed_mask = np.any(~np.isclose(after, before, atol=1e-12, rtol=0.0), axis=0)
+    changed_columns = np.where(changed_mask)[0].astype(int).tolist()
+    paper_scope_set = set(int(col) for col in paper_scope)
+    off_scope_columns = [int(col) for col in changed_columns if int(col) not in paper_scope_set]
+    return {
+        "paper_scope_columns": [int(col) for col in sorted(paper_scope_set)],
+        "changed_columns": changed_columns,
+        "off_scope_changed_columns": off_scope_columns,
+        "implementation_updates_only_paper_scope": int(len(off_scope_columns) == 0),
+    }
 
 
 def enrich_role_update_diagnostic_rows(
@@ -1137,6 +1427,1190 @@ def write_agent_trace_csv(
     write_csv(output_file, rows)
 
 
+def write_small_n_reputation_trace_long_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        dense_history = np.asarray(trace.get("dense_reputation_history", []), dtype=float)
+        if dense_history.size == 0:
+            continue
+        n_steps, n_observers, n_targets = dense_history.shape
+        for t in range(n_steps):
+            for observer_id in range(n_observers):
+                for target_id in range(n_targets):
+                    rows.append(
+                        {
+                            "t": int(t + 1),
+                            "seed": int(seed),
+                            "gamma": float(gamma),
+                            "observer_id": int(observer_id),
+                            "target_id": int(target_id),
+                            "reputation_estimate": float(dense_history[t, observer_id, target_id]),
+                        }
+                    )
+    write_csv(output_file, rows)
+
+
+def write_small_n_agent_state_trace_long_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        pu_history = np.asarray(trace.get("estimated_reward_pu_history", []), dtype=float)
+        rep_history = np.asarray(trace.get("estimated_reward_rep_history", []), dtype=float)
+        status_history = np.asarray(trace.get("estimated_reward_status_history", []), dtype=float)
+        actor_rate_history = np.asarray(trace.get("actor_interaction_rate_history", []), dtype=float)
+        highest_rep_history = np.asarray(trace.get("highest_rep_agent_history", []), dtype=int)
+        following_history = np.asarray(trace.get("following_history", []), dtype=int)
+        role_label_history = np.asarray(trace.get("role_label_history", []), dtype=object)
+        if pu_history.size == 0:
+            continue
+        n_steps, n_agents = pu_history.shape
+        for t in range(n_steps):
+            for agent_id in range(n_agents):
+                rows.append(
+                    {
+                        "t": int(t + 1),
+                        "seed": int(seed),
+                        "gamma": float(gamma),
+                        "agent_id": int(agent_id),
+                        "estimated_reward_pu": float(pu_history[t, agent_id]),
+                        "estimated_reward_rep": float(rep_history[t, agent_id]) if rep_history.size else 0.0,
+                        "estimated_reward_status": float(status_history[t, agent_id]) if status_history.size else 0.0,
+                        "highest_rep_agent_estimate": int(highest_rep_history[t, agent_id]) if highest_rep_history.size else -1,
+                        "following": int(following_history[t, agent_id]) if following_history.size else -1,
+                        "role": str(role_label_history[t, agent_id]) if role_label_history.size else "",
+                        "actor_interaction_rate": float(actor_rate_history[t, agent_id]) if actor_rate_history.size else 0.0,
+                    }
+                )
+    write_csv(output_file, rows)
+
+
+def _rank_desc(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    ranked = sorted(range(arr.size), key=lambda idx: (-float(arr[idx]), int(idx)))
+    out = np.zeros(arr.size, dtype=int)
+    for pos, agent_id in enumerate(ranked, start=1):
+        out[int(agent_id)] = int(pos)
+    return out
+
+
+def _top_agent_id(values: np.ndarray) -> int:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return -1
+    return int(max(range(arr.size), key=lambda idx: (float(arr[idx]), -int(idx))))
+
+
+def _mode_int(values: Sequence[int]) -> int:
+    counts: Dict[int, int] = {}
+    for value in values:
+        counts[int(value)] = counts.get(int(value), 0) + 1
+    if not counts:
+        return -1
+    return int(max(counts.items(), key=lambda kv: (int(kv[1]), -int(kv[0])))[0])
+
+
+def _safe_pearson(values_a: np.ndarray, values_b: np.ndarray) -> float:
+    a = np.asarray(values_a, dtype=float).reshape(-1)
+    b = np.asarray(values_b, dtype=float).reshape(-1)
+    if a.size == 0 or b.size == 0 or a.size != b.size:
+        return float("nan")
+    a_centered = a - float(np.mean(a))
+    b_centered = b - float(np.mean(b))
+    denom = float(np.linalg.norm(a_centered) * np.linalg.norm(b_centered))
+    if denom <= 1e-15:
+        return float("nan")
+    return float(np.dot(a_centered, b_centered) / denom)
+
+
+def _dominant_alignment_target(
+    *,
+    corr_true_reputation: float,
+    corr_sum_expected_utility: float,
+    corr_theta_mu: float,
+    corr_mean_incoming_v: float,
+) -> str:
+    candidates = {
+        "true_reputation": float(corr_true_reputation),
+        "sum_expected_utility": float(corr_sum_expected_utility),
+        "theta_mu": float(corr_theta_mu),
+        "mean_incoming_v": float(corr_mean_incoming_v),
+    }
+    filtered = {
+        label: value
+        for label, value in candidates.items()
+        if np.isfinite(value)
+    }
+    if not filtered:
+        return "other_or_none"
+    best_label, best_value = max(filtered.items(), key=lambda kv: (float(kv[1]), kv[0]))
+    if float(best_value) <= 0.0:
+        return "other_or_none"
+    return str(best_label)
+
+
+def _classify_toy_failure_stage(
+    *,
+    true_top_agent: int,
+    observed_top_agent: int,
+    modal_highest_rep_agent_estimate: int,
+    modal_selected_target: int,
+    dominant_alignment_target: str,
+    share_step1_margin_positive: float,
+    top_followers: int,
+) -> str:
+    if int(true_top_agent) != int(observed_top_agent) or str(dominant_alignment_target) != "true_reputation":
+        return "learning_target_mismatch"
+    if int(modal_highest_rep_agent_estimate) != int(observed_top_agent) or int(modal_selected_target) != int(modal_highest_rep_agent_estimate):
+        return "ranking_selection_mismatch"
+    if float(share_step1_margin_positive) <= 0.0:
+        return "step1_conversion_mismatch"
+    if int(top_followers) <= 0:
+        return "follower_assignment_mismatch"
+    return "mixed_ranking_plus_scale"
+
+
+def _candidate_count_from_row(row: np.ndarray, observer_id: int, delta: float) -> int:
+    rep_row = np.asarray(row, dtype=float).copy()
+    if rep_row.size == 0:
+        return 0
+    rep_row[int(observer_id)] = -np.inf
+    max_rep = float(np.max(rep_row))
+    if not np.isfinite(max_rep):
+        return 0
+    return int(np.sum(rep_row >= (max_rep - float(delta))))
+
+
+def _effective_follow_threshold(role_label: str, follower_count: int, *, B_R: float, B_F: float) -> float:
+    if str(role_label) == "reputation" and int(follower_count) == 0 and float(B_F) < float(B_R):
+        return float(B_F)
+    return float(B_R)
+
+
+def _resolve_root_leaders_from_step(
+    following_row: np.ndarray,
+    follower_count_row: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    following = np.asarray(following_row, dtype=int).reshape(-1)
+    n_agents = int(following.size)
+    follower_counts = (
+        np.zeros(n_agents, dtype=int)
+        if follower_count_row is None
+        else np.asarray(follower_count_row, dtype=int).reshape(-1)
+    )
+    roots = np.full(n_agents, -1, dtype=int)
+
+    for agent_id in range(n_agents):
+        current = int(following[agent_id])
+        if current < 0:
+            if agent_id < follower_counts.size and int(follower_counts[agent_id]) > 0:
+                roots[agent_id] = int(agent_id)
+            continue
+
+        seen = {int(agent_id)}
+        while 0 <= current < n_agents and current not in seen:
+            seen.add(current)
+            next_target = int(following[current])
+            if next_target < 0:
+                roots[agent_id] = int(current)
+                break
+            current = next_target
+
+    return roots
+
+
+def write_small_n_true_rep_vs_estimate_trace_long_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        pu_history = np.asarray(trace.get("estimated_reward_pu_history", []), dtype=float)
+        rep_reward_history = np.asarray(trace.get("estimated_reward_rep_history", []), dtype=float)
+        raw_rep_history = np.asarray(trace.get("selected_reputation_history", []), dtype=float)
+        weighted_selected_rep_history = np.asarray(trace.get("weighted_selected_reputation_history", []), dtype=float)
+        highest_rep_history = np.asarray(trace.get("highest_rep_agent_history", []), dtype=int)
+        following_history = np.asarray(trace.get("following_history", []), dtype=int)
+        role_label_history = np.asarray(trace.get("role_label_history", []), dtype=object)
+        actor_rate_history = np.asarray(trace.get("actor_interaction_rate_history", []), dtype=float)
+        follower_count_history = np.asarray(trace.get("follower_count_history", []), dtype=int)
+        dense_reputation_history = np.asarray(trace.get("dense_reputation_history", []), dtype=float)
+        true_reputation_history = np.asarray(trace.get("true_reputation_history", []), dtype=float)
+        true_rank_history = np.asarray(trace.get("true_reputation_rank_history", []), dtype=int)
+        if pu_history.size == 0 or dense_reputation_history.size == 0 or true_reputation_history.size == 0:
+            continue
+
+        B_R = float(trace.get("B_R", 0.0))
+        B_F = float(trace.get("B_F", 0.0))
+        delta = float(trace.get("delta", 0.0))
+        n_steps, n_agents = pu_history.shape
+        for t in range(n_steps):
+            mean_observed_reputation = np.mean(dense_reputation_history[t], axis=0)
+            observed_rank = _rank_desc(mean_observed_reputation)
+            for agent_id in range(n_agents):
+                selected_raw = float(raw_rep_history[t, agent_id]) if raw_rep_history.size else 0.0
+                gamma_times_selected_rep = (
+                    float(weighted_selected_rep_history[t, agent_id])
+                    if weighted_selected_rep_history.size
+                    else float(gamma) * selected_raw
+                )
+                estimated_reward_pu = float(pu_history[t, agent_id])
+                effective_threshold = _effective_follow_threshold(
+                    str(role_label_history[t, agent_id]) if role_label_history.size else "",
+                    int(follower_count_history[t, agent_id]) if follower_count_history.size else 0,
+                    B_R=B_R,
+                    B_F=B_F,
+                )
+                rows.append(
+                    {
+                        "t": int(t + 1),
+                        "seed": int(seed),
+                        "gamma": float(gamma),
+                        "agent_id": int(agent_id),
+                        "true_reputation": float(true_reputation_history[t, agent_id]),
+                        "true_rank": int(true_rank_history[t, agent_id]) if true_rank_history.size else 0,
+                        "mean_observed_reputation": float(mean_observed_reputation[agent_id]),
+                        "observed_rank": int(observed_rank[agent_id]),
+                        "highest_rep_agent_estimate": int(highest_rep_history[t, agent_id]) if highest_rep_history.size else -1,
+                        "selected_candidate_count": int(
+                            _candidate_count_from_row(
+                                dense_reputation_history[t, agent_id],
+                                agent_id,
+                                delta,
+                            )
+                        ),
+                        "estimated_reward_pu": estimated_reward_pu,
+                        "estimated_reward_rep": float(rep_reward_history[t, agent_id]) if rep_reward_history.size else 0.0,
+                        "gamma_times_estimated_reward_rep": (
+                            float(gamma) * float(rep_reward_history[t, agent_id]) if rep_reward_history.size else 0.0
+                        ),
+                        "selected_reputation_raw": selected_raw,
+                        "gamma_times_selected_reputation": float(gamma_times_selected_rep),
+                        "effective_threshold": float(effective_threshold),
+                        "step1_margin": float(gamma_times_selected_rep - estimated_reward_pu),
+                        "gate_margin": float(gamma_times_selected_rep - max(effective_threshold, estimated_reward_pu)),
+                        "role": str(role_label_history[t, agent_id]) if role_label_history.size else "",
+                        "following": int(following_history[t, agent_id]) if following_history.size else -1,
+                        "actor_interaction_rate": float(actor_rate_history[t, agent_id]) if actor_rate_history.size else 0.0,
+                    }
+                )
+    write_csv(output_file, rows)
+
+
+def write_small_n_true_reputation_decomposition_long_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        actor_rate_history = np.asarray(trace.get("actor_interaction_rate_history", []), dtype=float)
+        dense_reputation_history = np.asarray(trace.get("dense_reputation_history", []), dtype=float)
+        dense_personal_benefit_history = np.asarray(trace.get("dense_personal_benefit_history", []), dtype=float)
+        true_reputation_history = np.asarray(trace.get("true_reputation_history", []), dtype=float)
+        true_rank_history = np.asarray(trace.get("true_reputation_rank_history", []), dtype=int)
+        true_theta_history = np.asarray(trace.get("true_reputation_theta_history", []), dtype=float)
+        true_sum_expected_history = np.asarray(trace.get("true_reputation_sum_expected_history", []), dtype=float)
+        if (
+            actor_rate_history.size == 0
+            or dense_reputation_history.size == 0
+            or dense_personal_benefit_history.size == 0
+            or true_reputation_history.size == 0
+        ):
+            continue
+
+        n_steps, n_targets = true_reputation_history.shape
+        for t in range(n_steps):
+            mean_observed_reputation = np.mean(dense_reputation_history[t], axis=0)
+            observed_rank = _rank_desc(mean_observed_reputation)
+            mean_incoming_v = np.mean(dense_personal_benefit_history[t], axis=0)
+            for target_id in range(n_targets):
+                rows.append(
+                    {
+                        "t": int(t + 1),
+                        "seed": int(seed),
+                        "gamma": float(gamma),
+                        "target_id": int(target_id),
+                        "theta_mu": float(true_theta_history[t, target_id]) if true_theta_history.size else 0.0,
+                        "actor_rate": float(actor_rate_history[t, target_id]),
+                        "sum_expected_utility_others": float(true_sum_expected_history[t, target_id]) if true_sum_expected_history.size else 0.0,
+                        "true_reputation": float(true_reputation_history[t, target_id]),
+                        "mean_observed_reputation": float(mean_observed_reputation[target_id]),
+                        "mean_incoming_v": float(mean_incoming_v[target_id]),
+                        "true_rank": int(true_rank_history[t, target_id]) if true_rank_history.size else 0,
+                        "observed_rank": int(observed_rank[target_id]),
+                    }
+                )
+    write_csv(output_file, rows)
+
+
+def write_small_n_toy_alignment_by_update_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        role_update_times = [int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist()]
+        dense_reputation_history = np.asarray(trace.get("dense_reputation_history", []), dtype=float)
+        dense_personal_benefit_history = np.asarray(trace.get("dense_personal_benefit_history", []), dtype=float)
+        true_reputation_history = np.asarray(trace.get("true_reputation_history", []), dtype=float)
+        true_sum_expected_history = np.asarray(trace.get("true_reputation_sum_expected_history", []), dtype=float)
+        true_theta_history = np.asarray(trace.get("true_reputation_theta_history", []), dtype=float)
+        highest_rep_history = np.asarray(trace.get("highest_rep_agent_history", []), dtype=int)
+        following_history = np.asarray(trace.get("following_history", []), dtype=int)
+        follower_count_history = np.asarray(trace.get("follower_count_history", []), dtype=int)
+        if (
+            dense_reputation_history.size == 0
+            or dense_personal_benefit_history.size == 0
+            or true_reputation_history.size == 0
+            or highest_rep_history.size == 0
+            or not role_update_times
+        ):
+            continue
+
+        for step in role_update_times:
+            idx = int(step) - 1
+            if idx < 0 or idx >= dense_reputation_history.shape[0]:
+                continue
+            mean_observed_reputation = np.mean(dense_reputation_history[idx], axis=0)
+            mean_incoming_v = np.mean(dense_personal_benefit_history[idx], axis=0)
+            true_reputation = np.asarray(true_reputation_history[idx], dtype=float)
+            sum_expected = np.asarray(true_sum_expected_history[idx], dtype=float)
+            theta_mu = np.asarray(true_theta_history[idx], dtype=float)
+            highest_ids = [int(x) for x in np.asarray(highest_rep_history[idx], dtype=int).tolist() if int(x) >= 0]
+            # Step 1 uses the currently selected highest-reputation target L_i(t).
+            current_selected_targets = [
+                int(highest_rep_history[idx, agent_id])
+                for agent_id in range(highest_rep_history.shape[1])
+            ]
+            modal_highest = _mode_int(highest_ids)
+            modal_selected = _mode_int(current_selected_targets)
+            true_top_agent = _top_agent_id(true_reputation)
+            observed_top_agent = _top_agent_id(mean_observed_reputation)
+            corr_true = _safe_pearson(mean_observed_reputation, true_reputation)
+            corr_sum_expected = _safe_pearson(mean_observed_reputation, sum_expected)
+            corr_theta = _safe_pearson(mean_observed_reputation, theta_mu)
+            corr_v = _safe_pearson(mean_observed_reputation, mean_incoming_v)
+            dominant_target = _dominant_alignment_target(
+                corr_true_reputation=corr_true,
+                corr_sum_expected_utility=corr_sum_expected,
+                corr_theta_mu=corr_theta,
+                corr_mean_incoming_v=corr_v,
+            )
+            top_followers = int(np.max(follower_count_history[idx])) if follower_count_history.size else 0
+            share_step1_positive = float(
+                np.mean(
+                    float(gamma) * np.asarray(trace.get("selected_reputation_history", []), dtype=float)[idx]
+                    > np.asarray(trace.get("estimated_reward_pu_history", []), dtype=float)[idx]
+                )
+            ) if np.asarray(trace.get("selected_reputation_history", []), dtype=float).size and np.asarray(trace.get("estimated_reward_pu_history", []), dtype=float).size else 0.0
+            rows.append(
+                {
+                    "gamma": float(gamma),
+                    "seed": int(seed),
+                    "t": int(step),
+                    "true_top_agent": int(true_top_agent),
+                    "observed_top_agent": int(observed_top_agent),
+                    "modal_highest_rep_agent_estimate": int(modal_highest),
+                    "modal_selected_target": int(modal_selected),
+                    "top_match_true_vs_observed": bool(int(true_top_agent) == int(observed_top_agent)),
+                    "top_match_observed_vs_highest": bool(int(observed_top_agent) == int(modal_highest)),
+                    "top_match_highest_vs_selected": bool(int(modal_highest) == int(modal_selected)),
+                    "corr_observed_vs_true_reputation": float(corr_true),
+                    "corr_observed_vs_sum_expected_utility": float(corr_sum_expected),
+                    "corr_observed_vs_theta_mu": float(corr_theta),
+                    "corr_observed_vs_mean_incoming_v": float(corr_v),
+                    "dominant_alignment_target": str(dominant_target),
+                    "failure_stage_label": _classify_toy_failure_stage(
+                        true_top_agent=int(true_top_agent),
+                        observed_top_agent=int(observed_top_agent),
+                        modal_highest_rep_agent_estimate=int(modal_highest),
+                        modal_selected_target=int(modal_selected),
+                        dominant_alignment_target=str(dominant_target),
+                        share_step1_margin_positive=float(share_step1_positive),
+                        top_followers=int(top_followers),
+                    ),
+                }
+            )
+    write_csv(output_file, rows)
+
+
+def write_small_n_toy_v_to_s_by_update_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        role_update_times = [int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist()]
+        dense_reputation_history = np.asarray(trace.get("dense_reputation_history", []), dtype=float)
+        dense_personal_benefit_history = np.asarray(trace.get("dense_personal_benefit_history", []), dtype=float)
+        true_reputation_history = np.asarray(trace.get("true_reputation_history", []), dtype=float)
+        true_sum_expected_history = np.asarray(trace.get("true_reputation_sum_expected_history", []), dtype=float)
+        true_theta_history = np.asarray(trace.get("true_reputation_theta_history", []), dtype=float)
+        if (
+            dense_reputation_history.size == 0
+            or dense_personal_benefit_history.size == 0
+            or true_reputation_history.size == 0
+            or not role_update_times
+        ):
+            continue
+
+        for step in role_update_times:
+            idx = int(step) - 1
+            if idx < 0 or idx >= dense_reputation_history.shape[0]:
+                continue
+            mean_observed_reputation = np.mean(dense_reputation_history[idx], axis=0)
+            mean_incoming_v = np.mean(dense_personal_benefit_history[idx], axis=0)
+            true_reputation = np.asarray(true_reputation_history[idx], dtype=float)
+            sum_expected = np.asarray(true_sum_expected_history[idx], dtype=float)
+            theta_mu = np.asarray(true_theta_history[idx], dtype=float)
+
+            corr_v_true = _safe_pearson(mean_incoming_v, true_reputation)
+            corr_v_sum = _safe_pearson(mean_incoming_v, sum_expected)
+            corr_v_theta = _safe_pearson(mean_incoming_v, theta_mu)
+            corr_s_v = _safe_pearson(mean_observed_reputation, mean_incoming_v)
+            v_alignment_target = _dominant_alignment_target(
+                corr_true_reputation=corr_v_true,
+                corr_sum_expected_utility=corr_v_sum,
+                corr_theta_mu=corr_v_theta,
+                corr_mean_incoming_v=float("nan"),
+            )
+
+            rows.append(
+                {
+                    "gamma": float(gamma),
+                    "seed": int(seed),
+                    "t": int(step),
+                    "true_top_agent": int(_top_agent_id(true_reputation)),
+                    "sum_expected_top_agent": int(_top_agent_id(sum_expected)),
+                    "mean_incoming_v_top_agent": int(_top_agent_id(mean_incoming_v)),
+                    "observed_top_agent": int(_top_agent_id(mean_observed_reputation)),
+                    "corr_mean_incoming_v_vs_true_reputation": float(corr_v_true),
+                    "corr_mean_incoming_v_vs_sum_expected_utility": float(corr_v_sum),
+                    "corr_mean_incoming_v_vs_theta_mu": float(corr_v_theta),
+                    "corr_observed_vs_mean_incoming_v": float(corr_s_v),
+                    "top_match_mean_incoming_v_vs_observed": bool(
+                        int(_top_agent_id(mean_incoming_v)) == int(_top_agent_id(mean_observed_reputation))
+                    ),
+                    "top_match_mean_incoming_v_vs_true": bool(
+                        int(_top_agent_id(mean_incoming_v)) == int(_top_agent_id(true_reputation))
+                    ),
+                    "dominant_v_alignment_target": str(v_alignment_target),
+                }
+            )
+    write_csv(output_file, rows)
+
+
+def write_small_n_toy_v_to_s_recurrence_audit_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        role_update_times = [int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist()]
+        dense_v_history = np.asarray(trace.get("dense_personal_benefit_history", []), dtype=float)
+        dense_s_history = np.asarray(trace.get("dense_reputation_history", []), dtype=float)
+        observed_utility_history = trace.get("observed_utility_matrix_history", [])
+        eta_v_history = [float(x) for x in trace.get("eta_v_history", [])]
+        active_actor_ids_history = trace.get("active_actor_ids_history", [])
+        active_participant_ids_history = trace.get("active_participant_ids_history", [])
+        gossip_target_ids_history = trace.get("gossip_target_ids_history", [])
+        averaging_agent_ids_history = trace.get("averaging_agent_ids_history", [])
+        avg_s_by_target_history = trace.get("avg_s_by_target_history", [])
+        delta_v_matrix_history = trace.get("delta_v_matrix_history", [])
+        if (
+            dense_v_history.size == 0
+            or dense_s_history.size == 0
+            or not role_update_times
+            or len(observed_utility_history) == 0
+        ):
+            continue
+
+        num_steps = dense_v_history.shape[0]
+        num_agents = dense_v_history.shape[1]
+        for step in role_update_times:
+            idx = int(step) - 1
+            if idx < 0 or idx >= num_steps:
+                continue
+            prev_v = np.zeros((num_agents, num_agents), dtype=float) if idx == 0 else np.asarray(dense_v_history[idx - 1], dtype=float)
+            new_v = np.asarray(dense_v_history[idx], dtype=float)
+            prev_s = np.zeros((num_agents, num_agents), dtype=float) if idx == 0 else np.asarray(dense_s_history[idx - 1], dtype=float)
+            new_s = np.asarray(dense_s_history[idx], dtype=float)
+            observed_utility_matrix = np.asarray(observed_utility_history[idx], dtype=float)
+            eta_v_t = float(eta_v_history[idx]) if idx < len(eta_v_history) else 0.0
+            active_actor_ids = {int(x) for x in active_actor_ids_history[idx]} if idx < len(active_actor_ids_history) else set()
+            active_participant_ids = {int(x) for x in active_participant_ids_history[idx]} if idx < len(active_participant_ids_history) else set()
+            gossip_target_ids = {int(x) for x in gossip_target_ids_history[idx]} if idx < len(gossip_target_ids_history) else set()
+            averaging_agent_ids = [int(x) for x in averaging_agent_ids_history[idx]] if idx < len(averaging_agent_ids_history) else []
+            avg_s_by_target = {
+                int(k): float(v) for k, v in (avg_s_by_target_history[idx] or {}).items()
+            } if idx < len(avg_s_by_target_history) else {}
+            delta_v_matrix = np.asarray(delta_v_matrix_history[idx], dtype=float) if idx < len(delta_v_matrix_history) else np.zeros_like(new_v)
+
+            for observer_id in range(num_agents):
+                for target_id in range(num_agents):
+                    prev_v_val = float(prev_v[observer_id, target_id])
+                    actual_v_new = float(new_v[observer_id, target_id])
+                    observed_u = float(observed_utility_matrix[observer_id, target_id])
+                    is_active_actor = bool(target_id in active_actor_ids)
+                    is_active_participant = bool(observer_id in active_participant_ids)
+                    is_gossip_target = bool(target_id in gossip_target_ids)
+                    expected_v_new = (
+                        prev_v_val + eta_v_t * (observed_u - prev_v_val)
+                        if is_active_actor
+                        else prev_v_val * (1.0 - eta_v_t)
+                    )
+                    prev_s_val = float(prev_s[observer_id, target_id])
+                    actual_s_new = float(new_s[observer_id, target_id])
+                    avg_s_target = float(avg_s_by_target.get(target_id, 0.0))
+                    expected_s_new = (
+                        avg_s_target + (expected_v_new - prev_v_val)
+                        if is_active_participant and is_gossip_target
+                        else prev_s_val
+                    )
+                    rows.append(
+                        {
+                            "gamma": float(gamma),
+                            "seed": int(seed),
+                            "t": int(step),
+                            "observer_id": int(observer_id),
+                            "target_id": int(target_id),
+                            "is_active_actor": bool(is_active_actor),
+                            "is_active_participant": bool(is_active_participant),
+                            "is_gossip_target": bool(is_gossip_target),
+                            "eta_v_t": float(eta_v_t),
+                            "observed_utility": float(observed_u),
+                            "prev_v": float(prev_v_val),
+                            "expected_v_new_paper": float(expected_v_new),
+                            "actual_v_new_code": float(actual_v_new),
+                            "delta_v_from_phase4": float(delta_v_matrix[observer_id, target_id]),
+                            "v_matches_paper": bool(np.isclose(actual_v_new, expected_v_new, atol=1e-12, rtol=0.0)),
+                            "prev_s": float(prev_s_val),
+                            "avg_s_target": float(avg_s_target),
+                            "expected_s_new_paper": float(expected_s_new),
+                            "actual_s_new_code": float(actual_s_new),
+                            "s_matches_paper": bool(np.isclose(actual_s_new, expected_s_new, atol=1e-12, rtol=0.0)),
+                            "averaging_agent_count": int(len(averaging_agent_ids)),
+                        }
+                    )
+    write_csv(output_file, rows)
+
+
+def write_small_n_toy_s_to_highest_by_update_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        role_update_times = [int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist()]
+        dense_reputation_history = np.asarray(trace.get("dense_reputation_history", []), dtype=float)
+        highest_rep_history = np.asarray(trace.get("highest_rep_agent_history", []), dtype=int)
+        delta = float(trace.get("delta", 0.0))
+        if dense_reputation_history.size == 0 or highest_rep_history.size == 0 or not role_update_times:
+            continue
+
+        for step in role_update_times:
+            idx = int(step) - 1
+            if idx < 0 or idx >= dense_reputation_history.shape[0]:
+                continue
+
+            row_argmax_targets: List[int] = []
+            stored_targets: List[int] = []
+            candidate_counts: List[int] = []
+            stored_within_delta: List[bool] = []
+            stored_equals_argmax: List[bool] = []
+
+            for agent_id in range(dense_reputation_history.shape[1]):
+                row = np.asarray(dense_reputation_history[idx, agent_id], dtype=float).copy()
+                row[agent_id] = -np.inf
+                argmax_target = int(np.argmax(row)) if np.any(np.isfinite(row)) else -1
+                max_rep = float(np.max(row)) if np.any(np.isfinite(row)) else float("-inf")
+                candidates = np.where(row >= max_rep - delta)[0] if np.isfinite(max_rep) else np.array([], dtype=int)
+                stored_target = int(highest_rep_history[idx, agent_id])
+
+                row_argmax_targets.append(argmax_target)
+                stored_targets.append(stored_target)
+                candidate_counts.append(int(candidates.size))
+                stored_within_delta.append(bool(stored_target in candidates.tolist()))
+                stored_equals_argmax.append(bool(stored_target == argmax_target))
+
+            mean_observed_reputation = np.mean(dense_reputation_history[idx], axis=0)
+            rows.append(
+                {
+                    "gamma": float(gamma),
+                    "seed": int(seed),
+                    "t": int(step),
+                    "observed_top_agent": int(_top_agent_id(mean_observed_reputation)),
+                    "modal_row_argmax_target": int(_mode_int(row_argmax_targets)),
+                    "modal_highest_rep_agent_estimate": int(_mode_int(stored_targets)),
+                    "share_highest_equals_row_argmax": float(np.mean(np.asarray(stored_equals_argmax, dtype=float))),
+                    "share_highest_within_delta_set": float(np.mean(np.asarray(stored_within_delta, dtype=float))),
+                    "mean_candidate_count_within_delta": float(np.mean(np.asarray(candidate_counts, dtype=float))),
+                    "max_candidate_count_within_delta": int(np.max(np.asarray(candidate_counts, dtype=int))),
+                }
+            )
+    write_csv(output_file, rows)
+
+
+def write_small_n_toy_step1_by_update_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        role_update_times = [int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist()]
+        raw_rep_history = np.asarray(trace.get("selected_reputation_history", []), dtype=float)
+        weighted_selected_rep_history = np.asarray(trace.get("weighted_selected_reputation_history", []), dtype=float)
+        pu_history = np.asarray(trace.get("estimated_reward_pu_history", []), dtype=float)
+        rep_reward_history = np.asarray(trace.get("estimated_reward_rep_history", []), dtype=float)
+        dense_reputation_history = np.asarray(trace.get("dense_reputation_history", []), dtype=float)
+        highest_rep_history = np.asarray(trace.get("highest_rep_agent_history", []), dtype=int)
+        role_label_history = np.asarray(trace.get("role_label_history", []), dtype=object)
+        follower_count_history = np.asarray(trace.get("follower_count_history", []), dtype=int)
+        if raw_rep_history.size == 0 or weighted_selected_rep_history.size == 0 or pu_history.size == 0 or not role_update_times:
+            continue
+
+        first_positive_step = None
+        for step in role_update_times:
+            idx = int(step) - 1
+            if idx < 0 or idx >= raw_rep_history.shape[0]:
+                continue
+            if np.any(np.asarray(weighted_selected_rep_history[idx], dtype=float) > np.asarray(pu_history[idx], dtype=float)):
+                first_positive_step = int(step)
+                break
+
+        B_R = float(trace.get("B_R", 0.0))
+        B_F = float(trace.get("B_F", 0.0))
+        for step in role_update_times:
+            idx = int(step) - 1
+            if idx < 0 or idx >= raw_rep_history.shape[0]:
+                continue
+            current_selected_targets = [
+                int(highest_rep_history[idx, agent_id]) if highest_rep_history.size else -1
+                for agent_id in range(raw_rep_history.shape[1])
+            ]
+            effective_thresholds = []
+            selected_rep_matches = []
+            weighted_rep_matches = []
+            for agent_id in range(raw_rep_history.shape[1]):
+                effective_thresholds.append(
+                    _effective_follow_threshold(
+                        str(role_label_history[idx, agent_id]) if role_label_history.size else "",
+                        int(follower_count_history[idx, agent_id]) if follower_count_history.size else 0,
+                        B_R=B_R,
+                        B_F=B_F,
+                    )
+                )
+                target_id = int(current_selected_targets[agent_id])
+                if 0 <= target_id < raw_rep_history.shape[1] and dense_reputation_history.size:
+                    row_value = float(dense_reputation_history[idx, agent_id, target_id])
+                    selected_rep_matches.append(
+                        bool(np.isclose(float(raw_rep_history[idx, agent_id]), row_value, atol=1e-12, rtol=0.0))
+                    )
+                else:
+                    selected_rep_matches.append(bool(np.isclose(float(raw_rep_history[idx, agent_id]), 0.0, atol=1e-12, rtol=0.0)))
+                weighted_rep_matches.append(
+                    bool(
+                        np.isclose(
+                            float(weighted_selected_rep_history[idx, agent_id]),
+                            float(gamma) * float(raw_rep_history[idx, agent_id]),
+                            atol=1e-12,
+                            rtol=0.0,
+                        )
+                    )
+                )
+            step1_margins = np.asarray(weighted_selected_rep_history[idx], dtype=float) - np.asarray(pu_history[idx], dtype=float)
+            gate_margins = np.asarray(weighted_selected_rep_history[idx], dtype=float) - np.maximum(
+                np.asarray(effective_thresholds, dtype=float),
+                np.asarray(pu_history[idx], dtype=float),
+            )
+            rows.append(
+                {
+                    "gamma": float(gamma),
+                    "seed": int(seed),
+                    "t": int(step),
+                    "modal_selected_target": int(_mode_int(current_selected_targets)),
+                    "mean_selected_reputation_raw": float(np.mean(raw_rep_history[idx])),
+                    "max_selected_reputation_raw": float(np.max(raw_rep_history[idx])),
+                    "mean_gamma_times_selected_reputation": float(np.mean(weighted_selected_rep_history[idx])),
+                    "max_gamma_times_selected_reputation": float(np.max(weighted_selected_rep_history[idx])),
+                    "mean_estimated_reward_rep": float(np.mean(rep_reward_history[idx])) if rep_reward_history.size else 0.0,
+                    "mean_gamma_times_estimated_reward_rep": float(np.mean(float(gamma) * rep_reward_history[idx])) if rep_reward_history.size else 0.0,
+                    "mean_estimated_reward_pu": float(np.mean(pu_history[idx])),
+                    "max_estimated_reward_pu": float(np.max(pu_history[idx])),
+                    "effective_threshold": float(np.mean(np.asarray(effective_thresholds, dtype=float))),
+                    "share_selected_reputation_matches_highest_row_value": float(np.mean(np.asarray(selected_rep_matches, dtype=float))),
+                    "share_weighted_signal_matches_gamma_times_selected": float(np.mean(np.asarray(weighted_rep_matches, dtype=float))),
+                    "mean_step1_margin": float(np.mean(step1_margins)),
+                    "max_step1_margin": float(np.max(step1_margins)),
+                    "share_step1_margin_positive": float(np.mean(step1_margins > 0.0)),
+                    "mean_gate_margin": float(np.mean(gate_margins)),
+                    "max_gate_margin": float(np.max(gate_margins)),
+                    "share_gate_margin_positive": float(np.mean(gate_margins > 0.0)),
+                    "first_positive_follow_signal_reached": bool(first_positive_step is not None and int(step) >= int(first_positive_step)),
+                }
+            )
+    write_csv(output_file, rows)
+
+
+def write_small_n_toy_choice_trace_long_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        raw_rep_history = np.asarray(trace.get("selected_reputation_history", []), dtype=float)
+        weighted_selected_rep_history = np.asarray(trace.get("weighted_selected_reputation_history", []), dtype=float)
+        pu_history = np.asarray(trace.get("estimated_reward_pu_history", []), dtype=float)
+        highest_rep_history = np.asarray(trace.get("highest_rep_agent_history", []), dtype=int)
+        following_history = np.asarray(trace.get("following_history", []), dtype=int)
+        role_label_history = np.asarray(trace.get("role_label_history", []), dtype=object)
+        follower_count_history = np.asarray(trace.get("follower_count_history", []), dtype=int)
+        if raw_rep_history.size == 0 or weighted_selected_rep_history.size == 0 or pu_history.size == 0:
+            continue
+
+        B_R = float(trace.get("B_R", 0.0))
+        B_F = float(trace.get("B_F", 0.0))
+        role_update_times = set(int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist())
+        n_steps, n_agents = raw_rep_history.shape
+        for t in range(n_steps):
+            follower_counts_t = (
+                np.asarray(follower_count_history[t], dtype=int)
+                if follower_count_history.size
+                else np.zeros(n_agents, dtype=int)
+            )
+            following_t = (
+                np.asarray(following_history[t], dtype=int)
+                if following_history.size
+                else np.full(n_agents, -1, dtype=int)
+            )
+            roots_t = _resolve_root_leaders_from_step(following_t, follower_counts_t)
+            for agent_id in range(n_agents):
+                role_label = str(role_label_history[t, agent_id]) if role_label_history.size else ""
+                estimated_reward_pu = float(pu_history[t, agent_id])
+                gamma_times_selected_rep = float(weighted_selected_rep_history[t, agent_id])
+                effective_threshold = _effective_follow_threshold(
+                    role_label,
+                    int(follower_counts_t[agent_id]),
+                    B_R=B_R,
+                    B_F=B_F,
+                )
+                step1_margin = float(gamma_times_selected_rep - estimated_reward_pu)
+                gate_margin = float(gamma_times_selected_rep - max(effective_threshold, estimated_reward_pu))
+                rows.append(
+                    {
+                        "t": int(t + 1),
+                        "seed": int(seed),
+                        "gamma": float(gamma),
+                        "role_update_step": int((t + 1) in role_update_times),
+                        "agent_id": int(agent_id),
+                        "role": role_label,
+                        "highest_rep_agent_estimate": int(highest_rep_history[t, agent_id]) if highest_rep_history.size else -1,
+                        "selected_reputation_raw": float(raw_rep_history[t, agent_id]),
+                        "gamma_times_selected_reputation": float(gamma_times_selected_rep),
+                        "estimated_reward_pu": estimated_reward_pu,
+                        "step1_margin": step1_margin,
+                        "gate_margin": gate_margin,
+                        "following": int(following_t[agent_id]),
+                        "root_leader": int(roots_t[agent_id]),
+                        "rep_beats_pu": bool(step1_margin > 0.0),
+                        "rep_beats_gate": bool(gate_margin > 0.0),
+                    }
+                )
+    write_csv(output_file, rows)
+
+
+def write_small_n_toy_consensus_by_step_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        highest_rep_history = np.asarray(trace.get("highest_rep_agent_history", []), dtype=int)
+        following_history = np.asarray(trace.get("following_history", []), dtype=int)
+        follower_count_history = np.asarray(trace.get("follower_count_history", []), dtype=int)
+        raw_rep_history = np.asarray(trace.get("selected_reputation_history", []), dtype=float)
+        weighted_selected_rep_history = np.asarray(trace.get("weighted_selected_reputation_history", []), dtype=float)
+        pu_history = np.asarray(trace.get("estimated_reward_pu_history", []), dtype=float)
+        if highest_rep_history.size == 0 or raw_rep_history.size == 0 or weighted_selected_rep_history.size == 0 or pu_history.size == 0:
+            continue
+
+        B_R = float(trace.get("B_R", 0.0))
+        B_F = float(trace.get("B_F", 0.0))
+        role_label_history = np.asarray(trace.get("role_label_history", []), dtype=object)
+        role_update_times = set(int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist())
+        n_steps, n_agents = highest_rep_history.shape
+        for t in range(n_steps):
+            highest_t = np.asarray(highest_rep_history[t], dtype=int)
+            valid_highest = [int(x) for x in highest_t.tolist() if int(x) >= 0]
+            modal_highest = _mode_int(valid_highest)
+            modal_count = sum(1 for x in highest_t.tolist() if int(x) == int(modal_highest)) if modal_highest >= 0 else 0
+            distinct_highest = len(set(valid_highest))
+            follower_counts_t = (
+                np.asarray(follower_count_history[t], dtype=int)
+                if follower_count_history.size
+                else np.zeros(n_agents, dtype=int)
+            )
+            following_t = (
+                np.asarray(following_history[t], dtype=int)
+                if following_history.size
+                else np.full(n_agents, -1, dtype=int)
+            )
+            roots_t = _resolve_root_leaders_from_step(following_t, follower_counts_t)
+            valid_roots = [int(x) for x in roots_t.tolist() if int(x) >= 0]
+            distinct_root_leaders = len(set(valid_roots))
+            largest_root_size = 0 if not valid_roots else max(sum(1 for root in valid_roots if root == leader) for leader in set(valid_roots))
+            effective_thresholds = np.array(
+                [
+                    _effective_follow_threshold(
+                        str(role_label_history[t, agent_id]) if role_label_history.size else "",
+                        int(follower_counts_t[agent_id]),
+                        B_R=B_R,
+                        B_F=B_F,
+                    )
+                    for agent_id in range(n_agents)
+                ],
+                dtype=float,
+            )
+            step1_positive = np.asarray(weighted_selected_rep_history[t], dtype=float) > np.asarray(pu_history[t], dtype=float)
+            gate_positive = np.asarray(weighted_selected_rep_history[t], dtype=float) > np.maximum(
+                effective_thresholds,
+                np.asarray(pu_history[t], dtype=float),
+            )
+            rows.append(
+                {
+                    "t": int(t + 1),
+                    "seed": int(seed),
+                    "gamma": float(gamma),
+                    "role_update_step": int((t + 1) in role_update_times),
+                    "modal_highest_target": int(modal_highest),
+                    "modal_highest_share": float(modal_count / max(1, n_agents)),
+                    "distinct_highest_targets": int(distinct_highest),
+                    "all_agents_agree_on_highest": bool(distinct_highest == 1 and len(valid_highest) == n_agents),
+                    "distinct_root_leaders": int(distinct_root_leaders),
+                    "largest_root_size": int(largest_root_size),
+                    "share_step1_positive": float(np.mean(step1_positive)),
+                    "share_gate_positive": float(np.mean(gate_positive)),
+                }
+            )
+    write_csv(output_file, rows)
+
+
+def write_small_n_toy_follow_relationships_long_csv(
+    traces: Dict[Tuple[float, int], DetailedTrace],
+    output_file: Path,
+) -> None:
+    rows: List[dict] = []
+    for (gamma, seed), trace in sorted(traces.items()):
+        following_history = np.asarray(trace.get("following_history", []), dtype=int)
+        role_label_history = np.asarray(trace.get("role_label_history", []), dtype=object)
+        follower_count_history = np.asarray(trace.get("follower_count_history", []), dtype=int)
+        if following_history.size == 0:
+            continue
+
+        role_update_times = set(int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist())
+        n_steps, n_agents = following_history.shape
+        for t in range(n_steps):
+            follower_counts_t = (
+                np.asarray(follower_count_history[t], dtype=int)
+                if follower_count_history.size
+                else np.zeros(n_agents, dtype=int)
+            )
+            following_t = np.asarray(following_history[t], dtype=int)
+            roots_t = _resolve_root_leaders_from_step(following_t, follower_counts_t)
+            for agent_id in range(n_agents):
+                rows.append(
+                    {
+                        "t": int(t + 1),
+                        "seed": int(seed),
+                        "gamma": float(gamma),
+                        "role_update_step": int((t + 1) in role_update_times),
+                        "agent_id": int(agent_id),
+                        "role": str(role_label_history[t, agent_id]) if role_label_history.size else "",
+                        "following": int(following_t[agent_id]),
+                        "root_leader": int(roots_t[agent_id]),
+                        "has_followers": bool(int(follower_counts_t[agent_id]) > 0),
+                    }
+                )
+    write_csv(output_file, rows)
+
+
+def plot_toy_mean_gate_signals(
+    trace: DetailedTrace,
+    output_file: Path,
+    *,
+    gamma: float,
+    title: str,
+) -> None:
+    pu_history = np.asarray(trace.get("estimated_reward_pu_history", []), dtype=float)
+    weighted_selected_rep_history = np.asarray(trace.get("weighted_selected_reputation_history", []), dtype=float)
+    rep_reward_history = np.asarray(trace.get("estimated_reward_rep_history", []), dtype=float)
+    role_update_times = [int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist()]
+    if pu_history.size == 0 or weighted_selected_rep_history.size == 0:
+        return
+
+    x = np.arange(1, pu_history.shape[0] + 1)
+    mean_pu = np.mean(pu_history, axis=1)
+    mean_selected_rep = np.mean(weighted_selected_rep_history, axis=1)
+    mean_estimated_rep = float(gamma) * np.mean(rep_reward_history, axis=1) if rep_reward_history.size else None
+
+    plt.figure(figsize=(8.2, 4.6))
+    plt.plot(x, mean_pu, label="Mean PU estimate", linewidth=1.8, color="tab:blue")
+    plt.plot(x, mean_selected_rep, label="Mean gamma * selected reputation", linewidth=1.8, color="tab:red")
+    if mean_estimated_rep is not None:
+        plt.plot(
+            x,
+            mean_estimated_rep,
+            label="Mean gamma * estimated_reward_rep",
+            linewidth=1.2,
+            linestyle=":",
+            color="tab:orange",
+        )
+    for idx_line, step in enumerate(role_update_times):
+        plt.axvline(
+            int(step),
+            color="gray",
+            linestyle="--",
+            linewidth=0.7,
+            alpha=0.22,
+            label="Role update" if idx_line == 0 else None,
+        )
+    plt.title(title, fontsize=12, fontweight="bold")
+    plt.xlabel("Timestep")
+    plt.ylabel("Mean signal")
+    plt.grid(True, alpha=0.3)
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def _plot_toy_agent_timeline_matrix(
+    matrix: np.ndarray,
+    output_file: Path,
+    *,
+    title: str,
+    colorbar_label: str,
+) -> None:
+    values = np.asarray(matrix, dtype=int)
+    if values.size == 0:
+        return
+    n_agents, n_steps = values.shape
+    plotted = values + 1  # -1 -> 0 ("none")
+    base_colors = ["#f5f5f5"] + [matplotlib.cm.tab20(i % 20) for i in range(max(1, n_agents))]
+    cmap = matplotlib.colors.ListedColormap(base_colors)
+    norm = matplotlib.colors.BoundaryNorm(np.arange(-0.5, n_agents + 1.5, 1.0), cmap.N)
+
+    fig, ax = plt.subplots(figsize=(max(8.0, 0.0035 * n_steps), 3.8))
+    im = ax.imshow(plotted, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel("Agent id")
+    ax.set_yticks(np.arange(n_agents))
+    ax.set_yticklabels([str(i) for i in range(n_agents)])
+    x_ticks = np.arange(n_steps)
+    if n_steps > 12:
+        keep = np.linspace(0, n_steps - 1, num=12, dtype=int)
+        x_ticks = np.unique(keep)
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels([str(int(idx + 1)) for idx in x_ticks], rotation=45, ha="right")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+    cbar.set_ticks(np.arange(n_agents + 1))
+    cbar.set_ticklabels(["none"] + [str(i) for i in range(n_agents)])
+    cbar.set_label(colorbar_label)
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_toy_highest_target_timeline(
+    trace: DetailedTrace,
+    output_file: Path,
+    *,
+    title: str,
+) -> None:
+    highest_rep_history = np.asarray(trace.get("highest_rep_agent_history", []), dtype=int)
+    if highest_rep_history.size == 0:
+        return
+    _plot_toy_agent_timeline_matrix(
+        highest_rep_history.T,
+        output_file,
+        title=title,
+        colorbar_label="Highest-reputation target",
+    )
+
+
+def plot_toy_root_leader_timeline(
+    trace: DetailedTrace,
+    output_file: Path,
+    *,
+    title: str,
+) -> None:
+    following_history = np.asarray(trace.get("following_history", []), dtype=int)
+    follower_count_history = np.asarray(trace.get("follower_count_history", []), dtype=int)
+    if following_history.size == 0:
+        return
+
+    root_history = np.zeros_like(following_history, dtype=int)
+    for t in range(following_history.shape[0]):
+        follower_counts_t = (
+            np.asarray(follower_count_history[t], dtype=int)
+            if follower_count_history.size
+            else np.zeros(following_history.shape[1], dtype=int)
+        )
+        root_history[t] = _resolve_root_leaders_from_step(
+            np.asarray(following_history[t], dtype=int),
+            follower_counts_t,
+        )
+    _plot_toy_agent_timeline_matrix(
+        root_history.T,
+        output_file,
+        title=title,
+        colorbar_label="Current root leader",
+    )
+
+
+def plot_toy_follow_graph_snapshots(
+    trace: DetailedTrace,
+    output_dir: Path,
+    *,
+    title_prefix: str,
+) -> None:
+    following_history = np.asarray(trace.get("following_history", []), dtype=int)
+    role_label_history = np.asarray(trace.get("role_label_history", []), dtype=object)
+    follower_count_history = np.asarray(trace.get("follower_count_history", []), dtype=int)
+    role_update_times = [int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist()]
+    if following_history.size == 0 or role_label_history.size == 0 or not role_update_times:
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    n_agents = int(following_history.shape[1])
+    theta = np.linspace(0.0, 2.0 * np.pi, n_agents, endpoint=False)
+    radius = 1.0
+    coords = np.column_stack((radius * np.cos(theta), radius * np.sin(theta)))
+    role_colors = {
+        "personal_utility": "#5b8ff9",
+        "reputation": "#e8684a",
+        "status": "#f6bd16",
+    }
+
+    for step in role_update_times:
+        idx = int(step) - 1
+        if idx < 0 or idx >= following_history.shape[0]:
+            continue
+        fig, ax = plt.subplots(figsize=(6.0, 6.0))
+        current_following = following_history[idx]
+        current_roles = role_label_history[idx]
+        current_followers = follower_count_history[idx] if follower_count_history.size else np.zeros(n_agents, dtype=int)
+        top_followers = int(np.max(current_followers)) if current_followers.size else 0
+        top_leader = int(np.argmax(current_followers)) if top_followers > 0 else -1
+
+        for agent_id in range(n_agents):
+            target = int(current_following[agent_id])
+            if target < 0 or target == agent_id:
+                continue
+            start = coords[agent_id]
+            end = coords[target]
+            delta = end - start
+            dist = float(np.linalg.norm(delta))
+            if dist <= 1e-9:
+                continue
+            pad = 0.12 * delta / dist
+            ax.annotate(
+                "",
+                xy=(end[0] - pad[0], end[1] - pad[1]),
+                xytext=(start[0] + pad[0], start[1] + pad[1]),
+                arrowprops=dict(arrowstyle="->", color="#7a7a7a", linewidth=1.2, alpha=0.9),
+            )
+
+        for agent_id in range(n_agents):
+            role_label = str(current_roles[agent_id])
+            color = role_colors.get(role_label, "#999999")
+            ax.scatter(
+                coords[agent_id, 0],
+                coords[agent_id, 1],
+                s=520,
+                color=color,
+                edgecolor="black",
+                linewidth=0.8,
+                zorder=3,
+            )
+            ax.text(
+                coords[agent_id, 0],
+                coords[agent_id, 1],
+                str(agent_id),
+                ha="center",
+                va="center",
+                fontsize=10,
+                color="white",
+                fontweight="bold",
+                zorder=4,
+            )
+
+        ax.scatter([], [], s=180, color=role_colors["personal_utility"], label="PU")
+        ax.scatter([], [], s=180, color=role_colors["reputation"], label="Reputation")
+        ax.scatter([], [], s=180, color=role_colors["status"], label="Status")
+        ax.legend(loc="upper right", frameon=False)
+        ax.set_title(
+            f"{title_prefix} t={step} | top leader={top_leader} | top followers={top_followers}",
+            fontsize=11,
+        )
+        ax.set_aspect("equal")
+        ax.set_xlim(-1.35, 1.35)
+        ax.set_ylim(-1.35, 1.35)
+        ax.axis("off")
+        plt.tight_layout()
+        plt.savefig(output_dir / f"toy_follow_graph_t{int(step):04d}.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_toy_follow_timeline(
+    trace: DetailedTrace,
+    output_file: Path,
+    *,
+    title: str,
+) -> None:
+    following_history = np.asarray(trace.get("following_history", []), dtype=int)
+    role_update_times = [int(t) for t in np.asarray(trace.get("role_update_times", []), dtype=int).tolist()]
+    if following_history.size == 0 or not role_update_times:
+        return
+
+    valid_steps = [step for step in role_update_times if 1 <= int(step) <= int(following_history.shape[0])]
+    if not valid_steps:
+        return
+    update_indices = [int(step) - 1 for step in valid_steps]
+    matrix = following_history[update_indices].T + 1  # -1 -> 0 for "none"
+    n_agents = following_history.shape[1]
+
+    base_colors = ["#f5f5f5"] + [matplotlib.cm.tab20(i % 20) for i in range(n_agents)]
+    cmap = matplotlib.colors.ListedColormap(base_colors)
+    norm = matplotlib.colors.BoundaryNorm(np.arange(-0.5, n_agents + 1.5, 1.0), cmap.N)
+
+    fig, ax = plt.subplots(figsize=(max(7.0, 0.24 * len(valid_steps)), 3.8))
+    im = ax.imshow(matrix, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    ax.set_xlabel("Role update timestep")
+    ax.set_ylabel("Agent id")
+    ax.set_yticks(np.arange(n_agents))
+    ax.set_yticklabels([str(i) for i in range(n_agents)])
+    x_ticks = np.arange(len(valid_steps))
+    if len(valid_steps) > 12:
+        keep = np.linspace(0, len(valid_steps) - 1, num=12, dtype=int)
+        x_ticks = np.unique(keep)
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels([str(valid_steps[idx]) for idx in x_ticks], rotation=45, ha="right")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+    cbar.set_ticks(np.arange(n_agents + 1))
+    cbar.set_ticklabels(["none"] + [str(i) for i in range(n_agents)])
+    cbar.set_label("Current following target")
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_agent_estimate_trajectories(
     trace: DetailedTrace,
     output_file: Path,
@@ -1319,6 +2793,13 @@ def main() -> None:
     else:
         print(f"num_steps={args.num_steps}, seeds=0", flush=True)
     print(f"kappa={args.kappa}", flush=True)
+    print(f"delta={args.delta}", flush=True)
+    print(
+        "actor_rate_driver_mode="
+        f"{args.actor_rate_driver_mode} "
+        f"(status_override_min_followers={args.actor_rate_status_override_min_followers})",
+        flush=True,
+    )
     print(
         f"role_update_base_interval={args.role_update_base_interval}, "
         f"fixed_role_update_interval={args.fixed_role_update_interval}",
@@ -1342,6 +2823,11 @@ def main() -> None:
         print("reward_model=simple_preferred_action", flush=True)
     print(f"plot_sample_interval={args.plot_sample_interval}", flush=True)
     print(f"tracking_mode={args.tracking_mode}, numpy_fast_path={args.numpy_fast_path}", flush=True)
+    print(f"eq9_averaging_mode={getattr(args, 'eq9_averaging_mode', 'participants_only')}", flush=True)
+    print(
+        f"leader_update_mode={getattr(args, 'leader_update_mode', 'participants_only_post_eq9')}",
+        flush=True,
+    )
     if args.mode == "async":
         if args.async_role_update_prob is None:
             async_t_seq, async_s0, async_src = _build_async_interval_sequence(args)
@@ -1361,6 +2847,9 @@ def main() -> None:
     async_diagnosis_rows: List[dict] = []
     role_update_diagnostic_rows: List[dict] = []
     role_update_diagnostic_summaries: List[dict] = []
+    true_reputation_checkpoint_rows: List[dict] = []
+    estimate_consensus_checkpoint_rows: List[dict] = []
+    rate_audit_checkpoint_rows: List[dict] = []
     role_update_times = build_static_role_update_times(args, horizon=int(args.num_steps))
     total_jobs = len(gammas) * len(seeds)
     job = 0
@@ -1369,15 +2858,40 @@ def main() -> None:
     table_csv = output_dir / f"reputation_scaling_table_values_{args.mode}.csv"
     role_diag_csv = output_dir / f"reputation_scaling_role_update_diagnostics_{args.mode}.csv"
     role_summary_csv = output_dir / f"reputation_scaling_seed_diagnostic_summary_{args.mode}.csv"
+    true_reputation_csv = output_dir / "expB_true_reputation_checkpoints.csv"
+    estimate_consensus_csv = output_dir / "expB_estimate_consensus_checkpoints.csv"
+    rate_audit_csv = output_dir / "expB_rate_audit_checkpoints.csv"
+    rank_alignment_csv = output_dir / "expB_rank_alignment_checkpoints.csv"
     prog_png = output_dir / f"reputation_scaling_progression_{args.mode}.png"
     curve_png = output_dir / f"reputation_scaling_top_followers_{args.mode}.png"
     paper_png = output_dir / f"reputation_scaling_paper_style_{args.mode}.png"
+    small_n_rep_long_csv = output_dir / "expB_reputation_trace_long.csv"
+    small_n_agent_long_csv = output_dir / "expB_agent_state_trace_long.csv"
+    small_n_true_rep_vs_estimate_csv = output_dir / "expB_true_rep_vs_estimate_trace_long.csv"
+    small_n_true_rep_decomp_csv = output_dir / "expB_true_reputation_decomposition_long.csv"
+    small_n_alignment_by_update_csv = output_dir / "expB_toy_alignment_by_update.csv"
+    small_n_v_to_s_by_update_csv = output_dir / "expB_toy_v_to_s_by_update.csv"
+    small_n_v_to_s_recurrence_audit_csv = output_dir / "expB_toy_v_to_s_recurrence_audit_long.csv"
+    small_n_s_to_highest_by_update_csv = output_dir / "expB_toy_s_to_highest_by_update.csv"
+    small_n_step1_by_update_csv = output_dir / "expB_toy_step1_by_update.csv"
+    small_n_choice_trace_csv = output_dir / "expB_toy_choice_trace_long.csv"
+    small_n_consensus_by_step_csv = output_dir / "expB_toy_consensus_by_step.csv"
+    small_n_follow_relationships_csv = output_dir / "expB_toy_follow_relationships_long.csv"
+    small_n_trace_requested = bool(getattr(args, "small_n_trace_export", False) and int(args.num_agents) <= 12)
 
     for gamma in gammas:
         for seed in seeds:
             job += 1
             print(f"[{job:03d}/{total_jobs:03d}] mode={args.mode} gamma={gamma:g} seed={seed}", flush=True)
-            rec, top_series, leader_series, detailed_trace, async_debug, run_role_update_rows = run_single(
+            (
+                rec,
+                top_series,
+                leader_series,
+                detailed_trace,
+                async_debug,
+                run_role_update_rows,
+                run_checkpoint_audit_rows,
+            ) = run_single(
                 args=args,
                 mode=args.mode,
                 gamma=gamma,
@@ -1388,6 +2902,8 @@ def main() -> None:
             leader_series_by_gamma[gamma].append(leader_series)
             if detailed_trace is not None:
                 save_trace = (
+                    small_n_trace_requested
+                    or
                     args.trace_detailed_seeds == "all"
                     or (args.trace_detailed_seeds == "first" and seed == seeds[0])
                 )
@@ -1434,12 +2950,49 @@ def main() -> None:
                         rows=enriched_rows,
                     )
                 )
+            if run_checkpoint_audit_rows is not None:
+                true_reputation_checkpoint_rows.extend(
+                    enrich_checkpoint_rows(
+                        mode=args.mode,
+                        gamma=gamma,
+                        seed=seed,
+                        rows=run_checkpoint_audit_rows.get("true_reputation_checkpoints", []),
+                    )
+                )
+                estimate_consensus_checkpoint_rows.extend(
+                    enrich_checkpoint_rows(
+                        mode=args.mode,
+                        gamma=gamma,
+                        seed=seed,
+                        rows=run_checkpoint_audit_rows.get("estimate_consensus_checkpoints", []),
+                    )
+                )
+                rate_audit_checkpoint_rows.extend(
+                    enrich_checkpoint_rows(
+                        mode=args.mode,
+                        gamma=gamma,
+                        seed=seed,
+                        rows=run_checkpoint_audit_rows.get("rate_audit_checkpoints", []),
+                    )
+                )
             # Incremental checkpoint for long sweeps.
             write_csv(runs_csv, [asdict(r) for r in all_records])
             if role_update_diagnostic_rows:
                 write_csv(role_diag_csv, role_update_diagnostic_rows)
             if role_update_diagnostic_summaries:
                 write_csv(role_summary_csv, role_update_diagnostic_summaries)
+            if true_reputation_checkpoint_rows:
+                write_csv(true_reputation_csv, true_reputation_checkpoint_rows)
+            if estimate_consensus_checkpoint_rows:
+                write_csv(estimate_consensus_csv, estimate_consensus_checkpoint_rows)
+            if rate_audit_checkpoint_rows:
+                write_csv(rate_audit_csv, rate_audit_checkpoint_rows)
+            rank_alignment_rows = summarize_rank_alignment_checkpoints(
+                true_rows=true_reputation_checkpoint_rows,
+                estimate_rows=estimate_consensus_checkpoint_rows,
+            )
+            if rank_alignment_rows:
+                write_csv(rank_alignment_csv, rank_alignment_rows)
 
     agg_records = aggregate(all_records)
 
@@ -1455,6 +3008,18 @@ def main() -> None:
         write_csv(role_diag_csv, role_update_diagnostic_rows)
     if role_update_diagnostic_summaries:
         write_csv(role_summary_csv, role_update_diagnostic_summaries)
+    if true_reputation_checkpoint_rows:
+        write_csv(true_reputation_csv, true_reputation_checkpoint_rows)
+    if estimate_consensus_checkpoint_rows:
+        write_csv(estimate_consensus_csv, estimate_consensus_checkpoint_rows)
+    if rate_audit_checkpoint_rows:
+        write_csv(rate_audit_csv, rate_audit_checkpoint_rows)
+    rank_alignment_rows = summarize_rank_alignment_checkpoints(
+        true_rows=true_reputation_checkpoint_rows,
+        estimate_rows=estimate_consensus_checkpoint_rows,
+    )
+    if rank_alignment_rows:
+        write_csv(rank_alignment_csv, rank_alignment_rows)
     plot_progression(
         args.mode,
         gammas,
@@ -1495,6 +3060,60 @@ def main() -> None:
             zoom_to_follow_window=True,
         )
 
+    has_dense_small_n_trace = any(
+        np.asarray(trace.get("dense_reputation_history", []), dtype=float).size > 0
+        for trace in detailed_traces.values()
+    )
+    if has_dense_small_n_trace:
+        write_small_n_reputation_trace_long_csv(detailed_traces, small_n_rep_long_csv)
+        write_small_n_agent_state_trace_long_csv(detailed_traces, small_n_agent_long_csv)
+        write_small_n_true_rep_vs_estimate_trace_long_csv(detailed_traces, small_n_true_rep_vs_estimate_csv)
+        write_small_n_true_reputation_decomposition_long_csv(detailed_traces, small_n_true_rep_decomp_csv)
+        write_small_n_toy_alignment_by_update_csv(detailed_traces, small_n_alignment_by_update_csv)
+        write_small_n_toy_v_to_s_by_update_csv(detailed_traces, small_n_v_to_s_by_update_csv)
+        write_small_n_toy_v_to_s_recurrence_audit_csv(detailed_traces, small_n_v_to_s_recurrence_audit_csv)
+        write_small_n_toy_s_to_highest_by_update_csv(detailed_traces, small_n_s_to_highest_by_update_csv)
+        write_small_n_toy_step1_by_update_csv(detailed_traces, small_n_step1_by_update_csv)
+        write_small_n_toy_choice_trace_long_csv(detailed_traces, small_n_choice_trace_csv)
+        write_small_n_toy_consensus_by_step_csv(detailed_traces, small_n_consensus_by_step_csv)
+        write_small_n_toy_follow_relationships_long_csv(detailed_traces, small_n_follow_relationships_csv)
+        for (gamma, seed), trace in sorted(detailed_traces.items()):
+            dense_history = np.asarray(trace.get("dense_reputation_history", []), dtype=float)
+            if dense_history.size == 0:
+                continue
+            gamma_tag = _format_gamma(gamma)
+            mean_signal_png = output_dir / f"toy_mean_gate_signals_g{gamma_tag}_seed{seed}_{args.mode}.png"
+            timeline_png = output_dir / f"toy_follow_timeline_g{gamma_tag}_seed{seed}_{args.mode}.png"
+            highest_timeline_png = output_dir / f"toy_highest_target_timeline_g{gamma_tag}_seed{seed}_{args.mode}.png"
+            root_timeline_png = output_dir / f"toy_root_leader_timeline_g{gamma_tag}_seed{seed}_{args.mode}.png"
+            graph_dir = output_dir / f"toy_follow_graphs_g{gamma_tag}_seed{seed}_{args.mode}"
+            plot_toy_mean_gate_signals(
+                trace,
+                mean_signal_png,
+                gamma=gamma,
+                title=f"Toy mean gate signals: gamma={gamma:g}, seed={seed}",
+            )
+            plot_toy_follow_timeline(
+                trace,
+                timeline_png,
+                title=f"Toy following timeline: gamma={gamma:g}, seed={seed}",
+            )
+            plot_toy_highest_target_timeline(
+                trace,
+                highest_timeline_png,
+                title=f"Toy highest target timeline: gamma={gamma:g}, seed={seed}",
+            )
+            plot_toy_root_leader_timeline(
+                trace,
+                root_timeline_png,
+                title=f"Toy root leader timeline: gamma={gamma:g}, seed={seed}",
+            )
+            plot_toy_follow_graph_snapshots(
+                trace,
+                graph_dir,
+                title_prefix=f"Toy follow graph (gamma={gamma:g}, seed={seed})",
+            )
+
     print("\nCompleted.", flush=True)
     print(f"Per-run CSV:     {runs_csv}", flush=True)
     print(f"Aggregate CSV:   {agg_csv}", flush=True)
@@ -1503,9 +3122,27 @@ def main() -> None:
         print(f"Role diag CSV:   {role_diag_csv}", flush=True)
     if role_update_diagnostic_summaries:
         print(f"Role sum CSV:    {role_summary_csv}", flush=True)
+    if true_reputation_checkpoint_rows:
+        print(f"True rep CSV:    {true_reputation_csv}", flush=True)
+    if estimate_consensus_checkpoint_rows:
+        print(f"Estimate CSV:    {estimate_consensus_csv}", flush=True)
+    if rate_audit_checkpoint_rows:
+        print(f"Rate audit CSV:  {rate_audit_csv}", flush=True)
+    if rank_alignment_rows:
+        print(f"Rank align CSV:  {rank_alignment_csv}", flush=True)
     print(f"Progression PNG: {prog_png}", flush=True)
     print(f"Curve PNG:       {curve_png}", flush=True)
     print(f"Paper PNG:       {paper_png}", flush=True)
+    if has_dense_small_n_trace:
+        print(f"Small-N rep CSV: {small_n_rep_long_csv}", flush=True)
+        print(f"Small-N agent CSV: {small_n_agent_long_csv}", flush=True)
+        print(f"Small-N true/estimate CSV: {small_n_true_rep_vs_estimate_csv}", flush=True)
+        print(f"Small-N true rep decomp CSV: {small_n_true_rep_decomp_csv}", flush=True)
+        print(f"Toy alignment CSV: {small_n_alignment_by_update_csv}", flush=True)
+        print(f"Toy v->s CSV: {small_n_v_to_s_by_update_csv}", flush=True)
+        print(f"Toy v->s audit CSV: {small_n_v_to_s_recurrence_audit_csv}", flush=True)
+        print(f"Toy s->highest CSV: {small_n_s_to_highest_by_update_csv}", flush=True)
+        print(f"Toy Step-1 CSV: {small_n_step1_by_update_csv}", flush=True)
     if detailed_traces:
         print("Detailed trace artifacts written for:", flush=True)
         for gamma, seed in sorted(detailed_traces.keys()):
@@ -1515,6 +3152,12 @@ def main() -> None:
                 f"reputation_scaling_agent_traces_g{gamma_tag}_seed{seed}_{args.mode}.csv",
                 flush=True,
             )
+            if has_dense_small_n_trace:
+                print(
+                    f"  gamma={gamma:g} seed={seed}: "
+                    f"toy_follow_graphs_g{gamma_tag}_seed{seed}_{args.mode}/",
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":

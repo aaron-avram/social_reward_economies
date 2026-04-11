@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import importlib
 import sys
 from pathlib import Path
@@ -757,7 +758,7 @@ def test_async_scheduler_audit_records_exact_timer_expirations():
         output_dir = "."
 
     np.random.seed(0)
-    _, _, _, _, async_debug, role_update_diagnostics = rep_scaling.run_single(
+    _, _, _, _, async_debug, role_update_diagnostics, checkpoint_audit = rep_scaling.run_single(
         args=Args(),
         mode="async",
         gamma=2.0,
@@ -766,6 +767,7 @@ def test_async_scheduler_audit_records_exact_timer_expirations():
 
     assert async_debug is not None
     assert role_update_diagnostics is None
+    assert checkpoint_audit is None
     scheduler_rows = async_debug["scheduler_rows"]
     assert len(scheduler_rows) == Args.num_steps
 
@@ -821,7 +823,7 @@ def test_static_role_update_diagnostics_capture_only_role_update_epochs():
         output_dir = "."
 
     np.random.seed(0)
-    _, _, _, _, async_debug, role_update_diagnostics = rep_scaling.run_single(
+    _, _, _, _, async_debug, role_update_diagnostics, checkpoint_audit = rep_scaling.run_single(
         args=Args(),
         mode="static",
         gamma=5.0,
@@ -830,6 +832,7 @@ def test_static_role_update_diagnostics_capture_only_role_update_epochs():
 
     assert async_debug is None
     assert role_update_diagnostics is not None
+    assert checkpoint_audit is not None
 
     expected_role_update_times = rep_scaling.build_static_role_update_times(Args(), horizon=Args.num_steps)
     assert [int(row["t"]) for row in role_update_diagnostics] == expected_role_update_times
@@ -852,6 +855,16 @@ def test_static_role_update_diagnostics_capture_only_role_update_epochs():
     ):
         assert key in first_row
 
+    final_true_rows = [row for row in checkpoint_audit["true_reputation_checkpoints"] if row["checkpoint_kind"] == "final"]
+    final_estimate_rows = [row for row in checkpoint_audit["estimate_consensus_checkpoints"] if row["checkpoint_kind"] == "final"]
+    final_rate_rows = [row for row in checkpoint_audit["rate_audit_checkpoints"] if row["checkpoint_kind"] == "final"]
+
+    assert len(final_true_rows) == Args.num_agents
+    assert len(final_estimate_rows) == Args.num_agents
+    assert len(final_rate_rows) == Args.num_agents
+    assert all(int(row["t"]) == Args.num_steps for row in final_true_rows)
+    assert all(int(row["role_update_index"]) == len(expected_role_update_times) for row in final_true_rows)
+
 
 def test_reputation_scaling_selected_seeds_override_contiguous_range():
     root = Path(__file__).resolve().parents[1]
@@ -867,6 +880,513 @@ def test_reputation_scaling_selected_seeds_override_contiguous_range():
 
     assert rep_scaling.parse_selected_seeds(Args.selected_seeds) == [2, 7, 9]
     assert rep_scaling.resolve_seeds(Args()) == [2, 7, 9]
+
+
+def test_gossip_scope_helper_builds_b_set_and_flags_off_scope_changes():
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    rep_scaling = importlib.import_module("experiments.reputation_scaling")
+
+    paper_scope = rep_scaling.build_paper_gossip_scope([5, 5, 7, -1, 7])
+    assert paper_scope == [5, 7]
+
+    rep_before = np.array(
+        [
+            [0.0, 1.0, 4.0],
+            [0.0, 2.0, 8.0],
+        ],
+        dtype=float,
+    )
+    rep_after = np.array(
+        [
+            [0.0, 3.0, 5.0],
+            [0.0, 3.0, 6.0],
+        ],
+        dtype=float,
+    )
+    scope_audit = rep_scaling.characterize_changed_gossip_columns(rep_before, rep_after, paper_scope=[1])
+
+    assert scope_audit["paper_scope_columns"] == [1]
+    assert scope_audit["changed_columns"] == [1, 2]
+    assert scope_audit["off_scope_changed_columns"] == [2]
+    assert scope_audit["implementation_updates_only_paper_scope"] == 0
+
+
+def test_rank_alignment_summary_helper_rolls_up_checkpoint_rows():
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    rep_scaling = importlib.import_module("experiments.reputation_scaling")
+
+    true_rows = [
+        {
+            "mode": "static",
+            "gamma": 5.0,
+            "seed": 2,
+            "t": 50000,
+            "checkpoint_kind": "final",
+            "role_update_index": 16,
+            "agent_id": 0,
+            "true_top_unique": 1,
+            "unique_true_top_agent": 7,
+            "eq9_averaging_mode": "all_agents",
+            "leader_update_mode": "participants_only_post_eq9",
+        },
+        {
+            "mode": "static",
+            "gamma": 5.0,
+            "seed": 2,
+            "t": 50000,
+            "checkpoint_kind": "final",
+            "role_update_index": 16,
+            "agent_id": 1,
+            "true_top_unique": 1,
+            "unique_true_top_agent": 7,
+            "eq9_averaging_mode": "all_agents",
+            "leader_update_mode": "participants_only_post_eq9",
+        },
+    ]
+    estimate_rows = [
+        {
+            "mode": "static",
+            "gamma": 5.0,
+            "seed": 2,
+            "t": 50000,
+            "checkpoint_kind": "final",
+            "role_update_index": 16,
+            "observer_id": 0,
+            "top_estimate_agent": 7,
+            "highest_rep_agent_estimate": 7,
+            "candidate_count_within_delta": 3,
+            "gap_top2": 0.2,
+            "current_root_leader": 7,
+            "eq9_averaging_mode": "all_agents",
+            "leader_update_mode": "participants_only_post_eq9",
+        },
+        {
+            "mode": "static",
+            "gamma": 5.0,
+            "seed": 2,
+            "t": 50000,
+            "checkpoint_kind": "final",
+            "role_update_index": 16,
+            "observer_id": 1,
+            "top_estimate_agent": 5,
+            "highest_rep_agent_estimate": 7,
+            "candidate_count_within_delta": 5,
+            "gap_top2": 0.1,
+            "current_root_leader": 3,
+            "eq9_averaging_mode": "all_agents",
+            "leader_update_mode": "participants_only_post_eq9",
+        },
+    ]
+
+    summary_rows = rep_scaling.summarize_rank_alignment_checkpoints(
+        true_rows=true_rows,
+        estimate_rows=estimate_rows,
+    )
+
+    assert len(summary_rows) == 1
+    row = summary_rows[0]
+    assert row["eq9_averaging_mode"] == "all_agents"
+    assert row["leader_update_mode"] == "participants_only_post_eq9"
+    assert row["unique_true_top_agent"] == 7
+    assert row["top_estimate_mode_agent"] == 5
+    assert row["selected_target_mode_agent"] == 7
+    assert row["top_estimate_matches_true_top_share"] == pytest.approx(0.5, abs=1e-12)
+    assert row["selected_matches_true_top_share"] == pytest.approx(1.0, abs=1e-12)
+    assert row["candidate_count_mean"] == pytest.approx(4.0, abs=1e-12)
+    assert row["candidate_count_max"] == 5
+    assert row["distinct_root_count"] == 2
+
+
+def test_run_single_small_n_trace_export_populates_dense_history_only_when_enabled(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    rep_scaling = importlib.import_module("experiments.reputation_scaling")
+
+    class Args:
+        mode = "static"
+        num_agents = 4
+        num_states = 2
+        num_actions = 2
+        num_steps = 5
+        kappa = 0.0
+        tail_window = 5
+        role_update_s0 = 0
+        role_update_T_seq = ""
+        role_update_base_interval = 10
+        fixed_role_update_interval = True
+        role_update_epochs = ""
+        tracking_mode = "full"
+        numpy_fast_path = True
+        initial_actor_rate = 0.2
+        initial_participant_rate = 0.2
+        reward_model = "simple_preferred_action"
+        reward_base_mu = 0.5
+        reward_base_sigma = 0.08
+        reward_agent_sigma = 0.1
+        reward_clip_min = 0.01
+        reward_clip_max = 2.5
+        delta = 0.15
+        eq9_averaging_mode = "all_agents"
+        leader_update_mode = "participants_only_post_eq9"
+        async_role_update_prob = None
+        async_decision_audit = False
+        role_update_diagnostics = False
+        trace_detailed_seeds = "none"
+        plot_sample_interval = 1
+        small_n_trace_export = True
+        output_dir = str(tmp_path)
+
+    np.random.seed(0)
+    _, _, _, detailed_trace, _, _, _ = rep_scaling.run_single(
+        args=Args(),
+        mode="static",
+        gamma=2.0,
+        seed=0,
+    )
+    assert detailed_trace is not None
+    dense = np.asarray(detailed_trace["dense_reputation_history"], dtype=float)
+    assert dense.shape == (Args.num_steps, Args.num_agents, Args.num_agents)
+    dense_v = np.asarray(detailed_trace["dense_personal_benefit_history"], dtype=float)
+    assert dense_v.shape == (Args.num_steps, Args.num_agents, Args.num_agents)
+    true_rep = np.asarray(detailed_trace["true_reputation_history"], dtype=float)
+    assert true_rep.shape == (Args.num_steps, Args.num_agents)
+
+    class ArgsDisabled(Args):
+        small_n_trace_export = False
+
+    np.random.seed(0)
+    _, _, _, detailed_trace_disabled, _, _, _ = rep_scaling.run_single(
+        args=ArgsDisabled(),
+        mode="static",
+        gamma=2.0,
+        seed=0,
+    )
+    assert detailed_trace_disabled is not None
+    dense_disabled = np.asarray(detailed_trace_disabled["dense_reputation_history"], dtype=float)
+    assert dense_disabled.size == 0
+    dense_v_disabled = np.asarray(detailed_trace_disabled["dense_personal_benefit_history"], dtype=float)
+    assert dense_v_disabled.size == 0
+    true_rep_disabled = np.asarray(detailed_trace_disabled["true_reputation_history"], dtype=float)
+    assert true_rep_disabled.size == 0
+
+
+def test_force_all_active_debug_overrides_sampling(model_module):
+    np.random.seed(0)
+    system = make_system(
+        model_module,
+        num_agents=4,
+        extra_config=dict(
+            num_time_steps=2,
+            initial_actor_interaction_rate=0.0,
+            initial_participant_interaction_rate=0.0,
+            force_all_active_debug=True,
+        ),
+    )
+
+    system.step()
+
+    assert system.results["actor_counts"][0] == 4
+    assert system.results["participant_counts"][0] == 4
+    assert system.last_active_actor_ids == {0, 1, 2, 3}
+    assert system.last_active_participant_ids == {0, 1, 2, 3}
+
+
+def test_small_n_long_trace_writers_emit_expected_row_counts(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    rep_scaling = importlib.import_module("experiments.reputation_scaling")
+
+    trace = {
+        "estimated_reward_pu_history": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=float),
+        "estimated_reward_rep_history": np.array([[0.5, 0.6], [0.7, 0.8]], dtype=float),
+        "estimated_reward_status_history": np.array([[0.0, 0.0], [0.0, 0.0]], dtype=float),
+        "actor_interaction_rate_history": np.array([[0.2, 0.2], [0.25, 0.25]], dtype=float),
+        "selected_reputation_history": np.array([[0.9, 0.8], [1.1, 1.0]], dtype=float),
+        "weighted_selected_reputation_history": np.array([[1.8, 1.6], [2.2, 2.0]], dtype=float),
+        "highest_rep_agent_history": np.array([[1, 0], [1, 0]], dtype=int),
+        "following_history": np.array([[-1, 0], [-1, 0]], dtype=int),
+        "follower_count_history": np.array([[1, 0], [1, 0]], dtype=int),
+        "role_label_history": np.array(
+            [["personal_utility", "reputation"], ["personal_utility", "reputation"]],
+            dtype=object,
+        ),
+        "dense_reputation_history": np.array(
+            [
+                [[0.0, 1.0], [2.0, 0.0]],
+                [[0.0, 1.5], [2.5, 0.0]],
+            ],
+            dtype=float,
+        ),
+        "dense_personal_benefit_history": np.array(
+            [
+                [[0.0, 0.4], [0.6, 0.0]],
+                [[0.0, 0.5], [0.7, 0.0]],
+            ],
+            dtype=float,
+        ),
+        "true_reputation_history": np.array(
+            [
+                [0.2, 0.8],
+                [0.3, 0.9],
+            ],
+            dtype=float,
+        ),
+        "true_reputation_rank_history": np.array(
+            [
+                [2, 1],
+                [2, 1],
+            ],
+            dtype=int,
+        ),
+        "true_reputation_theta_history": np.array(
+            [
+                [0.1, 0.2],
+                [0.15, 0.25],
+            ],
+            dtype=float,
+        ),
+        "true_reputation_sum_expected_history": np.array(
+            [
+                [2.0, 4.0],
+                [2.0, 3.6],
+            ],
+            dtype=float,
+        ),
+        "active_actor_ids_history": [[0, 1], [0]],
+        "active_participant_ids_history": [[0, 1], [0, 1]],
+        "observed_utility_matrix_history": [
+            np.array([[0.0, 0.4], [0.6, 0.0]], dtype=float),
+            np.array([[0.2, 0.0], [0.5, 0.0]], dtype=float),
+        ],
+        "eta_v_history": [0.5, 0.5],
+        "gossip_target_ids_history": [[0, 1], [0, 1]],
+        "averaging_agent_ids_history": [[0, 1], [0, 1]],
+        "avg_s_by_target_history": [
+            {0: 0.1, 1: 0.2},
+            {0: 0.3, 1: 0.4},
+        ],
+        "delta_v_matrix_history": [
+            np.array([[0.0, 0.4], [0.6, 0.0]], dtype=float),
+            np.array([[0.2, -0.2], [-0.1, 0.0]], dtype=float),
+        ],
+        "B_R": 0.8,
+        "B_F": 0.6,
+        "delta": 0.15,
+        "role_update_times": np.array([1, 2], dtype=int),
+    }
+    traces = {(2.0, 0): trace}
+    rep_csv = tmp_path / "expB_reputation_trace_long.csv"
+    agent_csv = tmp_path / "expB_agent_state_trace_long.csv"
+    true_vs_est_csv = tmp_path / "expB_true_rep_vs_estimate_trace_long.csv"
+    true_decomp_csv = tmp_path / "expB_true_reputation_decomposition_long.csv"
+    align_csv = tmp_path / "expB_toy_alignment_by_update.csv"
+    v_to_s_csv = tmp_path / "expB_toy_v_to_s_by_update.csv"
+    v_to_s_audit_csv = tmp_path / "expB_toy_v_to_s_recurrence_audit_long.csv"
+    s_to_highest_csv = tmp_path / "expB_toy_s_to_highest_by_update.csv"
+    step1_csv = tmp_path / "expB_toy_step1_by_update.csv"
+    choice_csv = tmp_path / "expB_toy_choice_trace_long.csv"
+    consensus_csv = tmp_path / "expB_toy_consensus_by_step.csv"
+    follow_relationships_csv = tmp_path / "expB_toy_follow_relationships_long.csv"
+
+    rep_scaling.write_small_n_reputation_trace_long_csv(traces, rep_csv)
+    rep_scaling.write_small_n_agent_state_trace_long_csv(traces, agent_csv)
+    rep_scaling.write_small_n_true_rep_vs_estimate_trace_long_csv(traces, true_vs_est_csv)
+    rep_scaling.write_small_n_true_reputation_decomposition_long_csv(traces, true_decomp_csv)
+    rep_scaling.write_small_n_toy_alignment_by_update_csv(traces, align_csv)
+    rep_scaling.write_small_n_toy_v_to_s_by_update_csv(traces, v_to_s_csv)
+    rep_scaling.write_small_n_toy_v_to_s_recurrence_audit_csv(traces, v_to_s_audit_csv)
+    rep_scaling.write_small_n_toy_s_to_highest_by_update_csv(traces, s_to_highest_csv)
+    rep_scaling.write_small_n_toy_step1_by_update_csv(traces, step1_csv)
+    rep_scaling.write_small_n_toy_choice_trace_long_csv(traces, choice_csv)
+    rep_scaling.write_small_n_toy_consensus_by_step_csv(traces, consensus_csv)
+    rep_scaling.write_small_n_toy_follow_relationships_long_csv(traces, follow_relationships_csv)
+
+    with rep_csv.open() as f:
+        rep_rows = list(csv.DictReader(f))
+    with agent_csv.open() as f:
+        agent_rows = list(csv.DictReader(f))
+    with true_vs_est_csv.open() as f:
+        true_vs_est_rows = list(csv.DictReader(f))
+    with true_decomp_csv.open() as f:
+        true_decomp_rows = list(csv.DictReader(f))
+    with align_csv.open() as f:
+        align_rows = list(csv.DictReader(f))
+    with v_to_s_csv.open() as f:
+        v_to_s_rows = list(csv.DictReader(f))
+    with v_to_s_audit_csv.open() as f:
+        v_to_s_audit_rows = list(csv.DictReader(f))
+    with s_to_highest_csv.open() as f:
+        s_to_highest_rows = list(csv.DictReader(f))
+    with step1_csv.open() as f:
+        step1_rows = list(csv.DictReader(f))
+    with choice_csv.open() as f:
+        choice_rows = list(csv.DictReader(f))
+    with consensus_csv.open() as f:
+        consensus_rows = list(csv.DictReader(f))
+    with follow_relationships_csv.open() as f:
+        follow_relationship_rows = list(csv.DictReader(f))
+
+    assert len(rep_rows) == 8
+    assert len(agent_rows) == 4
+    assert len(true_vs_est_rows) == 4
+    assert len(true_decomp_rows) == 4
+    assert len(align_rows) == 2
+    assert len(v_to_s_rows) == 2
+    assert len(v_to_s_audit_rows) == 8
+    assert len(s_to_highest_rows) == 2
+    assert len(step1_rows) == 2
+    assert len(choice_rows) == 4
+    assert len(consensus_rows) == 2
+    assert len(follow_relationship_rows) == 4
+    assert rep_rows[0]["seed"] == "0"
+    assert rep_rows[0]["gamma"] == "2.0"
+    assert set(row["role"] for row in agent_rows) == {"personal_utility", "reputation"}
+    assert "mean_observed_reputation" in true_vs_est_rows[0]
+    assert "gamma_times_selected_reputation" in true_vs_est_rows[0]
+    assert float(true_vs_est_rows[0]["step1_margin"]) == pytest.approx(1.7, abs=1e-12)
+    assert "mean_incoming_v" in true_decomp_rows[0]
+    assert "dominant_alignment_target" in align_rows[0]
+    assert "failure_stage_label" in align_rows[0]
+    assert align_rows[0]["dominant_alignment_target"] == "mean_incoming_v"
+    assert align_rows[0]["failure_stage_label"] == "learning_target_mismatch"
+    assert "dominant_v_alignment_target" in v_to_s_rows[0]
+    assert "corr_observed_vs_mean_incoming_v" in v_to_s_rows[0]
+    assert "expected_s_new_paper" in v_to_s_audit_rows[0]
+    assert "actual_s_new_code" in v_to_s_audit_rows[0]
+    assert "v_matches_paper" in v_to_s_audit_rows[0]
+    assert "s_matches_paper" in v_to_s_audit_rows[0]
+    assert "share_highest_within_delta_set" in s_to_highest_rows[0]
+    assert "mean_candidate_count_within_delta" in s_to_highest_rows[0]
+    assert "first_positive_follow_signal_reached" in step1_rows[0]
+    assert "share_selected_reputation_matches_highest_row_value" in step1_rows[0]
+    assert "share_weighted_signal_matches_gamma_times_selected" in step1_rows[0]
+    assert float(step1_rows[0]["mean_step1_margin"]) == pytest.approx(1.55, abs=1e-12)
+    assert step1_rows[0]["first_positive_follow_signal_reached"] == "True"
+    assert "root_leader" in choice_rows[0]
+    assert "rep_beats_gate" in choice_rows[0]
+    assert choice_rows[0]["root_leader"] == "0"
+    assert "all_agents_agree_on_highest" in consensus_rows[0]
+    assert "largest_root_size" in consensus_rows[0]
+    assert consensus_rows[0]["all_agents_agree_on_highest"] == "False"
+    assert consensus_rows[0]["largest_root_size"] == "2"
+    assert "root_leader" in follow_relationship_rows[0]
+    assert "has_followers" in follow_relationship_rows[0]
+    assert follow_relationship_rows[0]["root_leader"] == "0"
+
+
+def test_toy_alignment_and_failure_stage_helpers_snapshot():
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    rep_scaling = importlib.import_module("experiments.reputation_scaling")
+
+    dominant = rep_scaling._dominant_alignment_target(
+        corr_true_reputation=0.2,
+        corr_sum_expected_utility=0.7,
+        corr_theta_mu=-0.1,
+        corr_mean_incoming_v=0.4,
+    )
+    assert dominant == "sum_expected_utility"
+
+    label = rep_scaling._classify_toy_failure_stage(
+        true_top_agent=4,
+        observed_top_agent=4,
+        modal_highest_rep_agent_estimate=2,
+        modal_selected_target=2,
+        dominant_alignment_target="true_reputation",
+        share_step1_margin_positive=1.0,
+        top_followers=3,
+    )
+    assert label == "ranking_selection_mismatch"
+
+    label = rep_scaling._classify_toy_failure_stage(
+        true_top_agent=4,
+        observed_top_agent=1,
+        modal_highest_rep_agent_estimate=1,
+        modal_selected_target=1,
+        dominant_alignment_target="mean_incoming_v",
+        share_step1_margin_positive=1.0,
+        top_followers=3,
+    )
+    assert label == "learning_target_mismatch"
+
+
+def test_small_n_follow_graph_and_timeline_smoke(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    rep_scaling = importlib.import_module("experiments.reputation_scaling")
+
+    trace = {
+        "following_history": np.array(
+            [
+                [-1, 0, -1],
+                [-1, 0, 1],
+            ],
+            dtype=int,
+        ),
+        "role_label_history": np.array(
+            [
+                ["personal_utility", "reputation", "personal_utility"],
+                ["personal_utility", "reputation", "reputation"],
+            ],
+            dtype=object,
+        ),
+        "follower_count_history": np.array(
+            [
+                [1, 0, 0],
+                [1, 1, 0],
+            ],
+            dtype=int,
+        ),
+        "role_update_times": np.array([1, 2], dtype=int),
+    }
+
+    graph_dir = tmp_path / "graphs"
+    timeline_png = tmp_path / "timeline.png"
+    highest_timeline_png = tmp_path / "highest_timeline.png"
+    root_timeline_png = tmp_path / "root_timeline.png"
+    rep_scaling.plot_toy_follow_graph_snapshots(
+        trace,
+        graph_dir,
+        title_prefix="Toy smoke",
+    )
+    rep_scaling.plot_toy_follow_timeline(
+        trace,
+        timeline_png,
+        title="Toy following timeline",
+    )
+    rep_scaling.plot_toy_highest_target_timeline(
+        {
+            **trace,
+            "highest_rep_agent_history": np.array([[1, 0, 0], [1, 0, 1]], dtype=int),
+        },
+        highest_timeline_png,
+        title="Toy highest target timeline",
+    )
+    rep_scaling.plot_toy_root_leader_timeline(
+        trace,
+        root_timeline_png,
+        title="Toy root leader timeline",
+    )
+
+    assert (graph_dir / "toy_follow_graph_t0001.png").exists()
+    assert (graph_dir / "toy_follow_graph_t0002.png").exists()
+    assert timeline_png.exists()
+    assert highest_timeline_png.exists()
+    assert root_timeline_png.exists()
 
 
 def test_role_update_diagnostic_helpers_classify_fragmented_vs_partial():

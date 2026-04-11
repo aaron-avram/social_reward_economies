@@ -30,7 +30,7 @@ from collections import Counter
 import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Set, List, Tuple, Optional
+from typing import Dict, Set, List, Tuple, Optional, Sequence
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
@@ -54,6 +54,8 @@ class SystemConfig:
     # --- Section 6.7: Actor Interaction Rates (Eq. 13) ---
     M: float = 1.0  # Total interaction rate budget
     u_0: float = 0.1  # Utility from outside interactions
+    actor_rate_driver_mode: str = "standard"  # "standard" or experimental "status_if_followers_kappa0"
+    actor_rate_status_override_min_followers: int = 10
     
     # --- Section 7.1: Role Incentives ---
     gamma: float = 2.0  # Reputation weight
@@ -68,6 +70,12 @@ class SystemConfig:
     
     # --- Section 6.4.4: Tie Threshold for Reputation Selection ---
     delta: float = 0.1  # Tolerance for near-ties in reputation
+
+    # --- Section 6.4.3: Eq. (9) averaging set for observed reputation ---
+    eq9_averaging_mode: str = "participants_only"  # "participants_only" or "all_agents"
+
+    # --- Section 6.4.4: timing/scope for L_i(t+1) updates ---
+    leader_update_mode: str = "participants_only_post_eq9"  # also supports "all_agents_post_eq9" and audit-only "participants_only_pre_eq9"
     
     # --- Section 8: Time-Scale Aware Stepsizes (Assumptions 5–8) ---
     # Base stepsizes (will be decayed as 1/t)
@@ -92,6 +100,7 @@ class SystemConfig:
     # --- Runtime/Simulation controls ---
     tracking_mode: str = "full"  # "full" keeps all diagnostics, "light" keeps core metrics only
     use_numpy_fast_path: bool = False  # Enable vectorized reputation updates for large-N sweeps
+    force_all_active_debug: bool = False  # Debug override: force A_a(t)=A_p(t)=C every step
     initial_actor_interaction_rate: float = 0.7
     initial_participant_interaction_rate: float = 0.7
     reward_model: str = "simple_preferred_action"  # "simple_preferred_action", "shared_base_gaussian", or "shared_good_bad_heterogeneous"
@@ -172,14 +181,15 @@ class Agent:
         # Initialize reputation and personal benefit estimates for all agents
         for other_id in range(config.num_agents):
             self.state.personal_benefit_estimates[other_id] = 0.0
-            self.state.reputation_estimates[other_id] = np.random.randn() * 0.1
+            self.state.reputation_estimates[other_id] = 0.0
 
         # Runtime tuning: initial rates are configurable for faster large-scale experiments.
         self.state.actor_interaction_rate = float(config.initial_actor_interaction_rate)
         self.state.participant_interaction_rate = float(config.initial_participant_interaction_rate)
         
-        # Initial highest rep agent estimate
-        self.state.highest_rep_agent_estimate = np.random.randint(config.num_agents)
+        # Initial highest-reputation target is resolved lazily from s_i(k,t) when
+        # first needed so tied rows use the normal Section 6.4.4 tie rule over C\{i}.
+        self.state.highest_rep_agent_estimate = None
         
         # Track last action for gradient updates
         self.last_action = None
@@ -198,22 +208,23 @@ class Agent:
         if self.state.role == AgentRole.STATUS:
             return self.state.weights_status
         return self.state.weights_pu
+
+    def get_current_policy(self, state: int) -> np.ndarray:
+        """
+        Return the actual action distribution used by this agent at the current
+        timestep under its present role and follow relationship.
+        """
+        if self.state.role == AgentRole.REPUTATION and self.state.following is not None:
+            leader_weights = self.system.agents[self.state.following].get_behavior_weights()
+            return self.get_softmax_policy(state, leader_weights)
+        if self.state.role == AgentRole.STATUS:
+            return self.get_softmax_policy(state, self.state.weights_status)
+        return self.get_softmax_policy(state, self.state.weights_pu)
     
     def select_action(self, state: int) -> int:
         """Select action based on current role"""
         self.last_state = state
-        
-        if self.state.role == AgentRole.REPUTATION and self.state.following is not None:
-            # [REP-5] Followers emulate the leader's active-role policy w_k(t):
-            # status weights for STATUS leaders, PU weights otherwise.
-            leader_weights = self.system.agents[self.state.following].get_behavior_weights()
-            policy = self.get_softmax_policy(state, leader_weights)
-        elif self.state.role == AgentRole.STATUS:
-            # Use status-optimized policy
-            policy = self.get_softmax_policy(state, self.state.weights_status)
-        else:
-            # Personal utility role
-            policy = self.get_softmax_policy(state, self.state.weights_pu)
+        policy = self.get_current_policy(state)
         
         action = np.random.choice(len(policy), p=policy)
         self.last_action = action
@@ -252,8 +263,12 @@ class Agent:
     
     # ==================== Section 6.4: Reputation Learning ====================
     
-    def update_personal_benefit_estimates(self, observed_payoffs: Dict[int, float], 
-                                          eta_v_t: float) -> Dict[int, float]:
+    def update_personal_benefit_estimates(
+        self,
+        observed_payoffs: Dict[int, float],
+        eta_v_t: float,
+        active_actor_ids: Optional[Sequence[int]] = None,
+    ) -> Dict[int, float]:
         """
         Section 6.4.2: Learn personal benefit from each agent's actions
         v_i(k, t+1) = v_i(k, t) + η_v(t) [u_i(s(t), x_k(t)) - v_i(k, t)]
@@ -267,11 +282,17 @@ class Agent:
             Dictionary of deltas Δv_i(k,t) = v_i(k,t+1) - v_i(k,t), used by Eq. (9).
         """
         personal_benefit_deltas = {}
+        active_actor_set = None
+        if active_actor_ids is not None:
+            active_actor_set = {int(agent_k) for agent_k in active_actor_ids}
         for agent_k, payoff in observed_payoffs.items():
             prev_val = self.state.personal_benefit_estimates.get(agent_k, 0.0)
 
             # Update if active; otherwise decay for inactive agents.
-            if payoff != 0.0:
+            # An active actor can legitimately generate zero observed utility,
+            # so activity must come from the sampled actor set, not payoff != 0.
+            is_active = (agent_k in active_actor_set) if active_actor_set is not None else (payoff != 0.0)
+            if is_active:
                 new_val = prev_val + eta_v_t * (payoff - prev_val)
             else:
                 new_val = prev_val * (1.0 - eta_v_t)
@@ -281,17 +302,29 @@ class Agent:
 
         return personal_benefit_deltas
     
-    def update_reputation_estimates_gossip(self, personal_benefit_deltas: Dict[int, float],
-                                          other_agents_list: List['Agent'],
-                                          eta_s_t: float):
+    def update_reputation_estimates_gossip(
+        self,
+        personal_benefit_deltas: Dict[int, float],
+        other_agents_list: List['Agent'],
+        eta_s_t: float,
+        target_agent_ids: Optional[Sequence[int]] = None,
+    ):
         """
         Section 6.4.3: Update reputation estimates via gossip
         s_i(k, t+1) = (Σ_j s_j(k, t)) / |A_p(t)| + v_i(k, t+1) - v_i(k, t)
         """
-        # [REP-2] Implement Eq. (9) directly:
-        # s_i(k,t+1) = average active estimate for k + delta_v_i(k,t).
-        # This replaces the old two-step EMA logic (toward avg, then toward payoff).
-        for agent_k in range(self.config.num_agents):
+        # [REP-2] Implement Eq. (9) directly, but only for the paper's gossip scope
+        # B(t) = union_i {L_i(t)}. Reputation entries outside B(t) stay unchanged.
+        if target_agent_ids is None:
+            update_targets = list(range(self.config.num_agents))
+        else:
+            update_targets = [
+                int(agent_k)
+                for agent_k in target_agent_ids
+                if 0 <= int(agent_k) < self.config.num_agents
+            ]
+
+        for agent_k in update_targets:
             estimates = [
                 other_agent.state.reputation_estimates.get(agent_k, 0.0)
                 for other_agent in other_agents_list
@@ -313,7 +346,11 @@ class Agent:
         Select uniformly at random from K_i(t)
         """
         if not self.state.reputation_estimates:
-            self.state.highest_rep_agent_estimate = np.random.randint(self.config.num_agents)
+            all_other_ids = [i for i in range(self.config.num_agents) if i != self.agent_id]
+            if all_other_ids:
+                self.state.highest_rep_agent_estimate = np.random.choice(all_other_ids)
+            else:
+                self.state.highest_rep_agent_estimate = self.agent_id
             return
         
         # [REP-1] Section 6.4.4 defines candidates over C\{i}.
@@ -349,7 +386,7 @@ class Agent:
                 self.state.highest_rep_agent_estimate = np.random.choice(all_other_ids)
             else:
                 self.state.highest_rep_agent_estimate = self.agent_id
-    
+
     # ==================== Section 6.5: Status Optimization ====================
     
     def update_status_optimization(self, state: int, action: int, 
@@ -389,7 +426,49 @@ class Agent:
         estimate of followed agent k, i.e., s_i(k,t), not an EMA of leader payoff.
         """
         self.state.estimated_reward_rep = followed_rep_estimate
-    
+
+    def get_actor_rate_terms(self) -> Dict[str, object]:
+        pu_term = float(self.state.estimated_reward_pu)
+        rep_term = float(self.config.gamma) * float(self.state.estimated_reward_rep)
+        status_term = float(self.config.kappa) * float(self.state.estimated_reward_status)
+        follower_count = int(len(self.state.followers))
+        standard_driver = max(pu_term, rep_term, status_term)
+
+        labels = []
+        if np.isclose(standard_driver, pu_term, atol=1e-12, rtol=0.0):
+            labels.append("pu")
+        if np.isclose(standard_driver, rep_term, atol=1e-12, rtol=0.0):
+            labels.append("rep")
+        if np.isclose(standard_driver, status_term, atol=1e-12, rtol=0.0):
+            labels.append("status")
+        standard_driver_label = "|".join(labels) if labels else "none"
+
+        status_override_active = bool(
+            self.config.actor_rate_driver_mode == "status_if_followers_kappa0"
+            and np.isclose(float(self.config.kappa), 0.0, atol=1e-12, rtol=0.0)
+            and follower_count >= int(self.config.actor_rate_status_override_min_followers)
+        )
+        if status_override_active:
+            driver = float(self.state.estimated_reward_status)
+            driver_label = "status_override"
+        else:
+            driver = float(standard_driver)
+            driver_label = standard_driver_label
+
+        return {
+            "pu_term": pu_term,
+            "rep_term": rep_term,
+            "status_term": status_term,
+            "driver": float(driver),
+            "driver_label": str(driver_label),
+            "standard_driver": float(standard_driver),
+            "standard_driver_label": str(standard_driver_label),
+            "status_override_active": int(status_override_active),
+            "follower_count": int(follower_count),
+            "actor_rate_driver_mode": str(self.config.actor_rate_driver_mode),
+            "actor_rate_status_override_min_followers": int(self.config.actor_rate_status_override_min_followers),
+        }
+
     # ==================== Section 6.7: Actor Interaction Rates ====================
     
     def update_actor_interaction_rate(self, alpha_rate: float):
@@ -405,12 +484,7 @@ class Agent:
         - M is total interaction budget
         - [x]^M_0 = clip(x, 0, M)
         """
-        # Compute H_i with PROPER gamma and kappa weighting
-        max_reward = max(
-            self.state.estimated_reward_pu,
-            self.config.gamma * self.state.estimated_reward_rep,
-            self.config.kappa * self.state.estimated_reward_status
-        )
+        max_reward = float(self.get_actor_rate_terms()["driver"])
         
         # Compute derivatives of θ
         mu_prev = self.state.actor_interaction_rate
@@ -441,6 +515,29 @@ class MultiAgentSystem:
                 "Use 'simple_preferred_action', 'shared_base_gaussian', or "
                 "'shared_good_bad_heterogeneous'."
             )
+        if self.config.eq9_averaging_mode not in {"participants_only", "all_agents"}:
+            raise ValueError(
+                f"Unsupported eq9_averaging_mode='{self.config.eq9_averaging_mode}'. "
+                "Use 'participants_only' or 'all_agents'."
+            )
+        if self.config.actor_rate_driver_mode not in {
+            "standard",
+            "status_if_followers_kappa0",
+        }:
+            raise ValueError(
+                f"Unsupported actor_rate_driver_mode='{self.config.actor_rate_driver_mode}'. "
+                "Use 'standard' or 'status_if_followers_kappa0'."
+            )
+        if self.config.leader_update_mode not in {
+            "participants_only_post_eq9",
+            "all_agents_post_eq9",
+            "participants_only_pre_eq9",
+        }:
+            raise ValueError(
+                f"Unsupported leader_update_mode='{self.config.leader_update_mode}'. "
+                "Use 'participants_only_post_eq9', 'all_agents_post_eq9', or "
+                "'participants_only_pre_eq9'."
+            )
         self.agents = [Agent(i, config, self) for i in range(config.num_agents)]
         self.time_step = 0
         self.role_update_epoch = 0  # Track which role update epoch we're in
@@ -463,19 +560,41 @@ class MultiAgentSystem:
             'social_welfare': [],
             'role_update_times': [],
             'estimated_reward_pu_history': [],
+            'estimated_reward_rep_history': [],
+            'estimated_reward_status_history': [],
+            'actor_interaction_rate_history': [],
             'selected_reputation_history': [],
             'weighted_selected_reputation_history': [],
             'highest_rep_agent_history': [],
             'following_history': [],
             'role_label_history': [],
+            'dense_reputation_history': [],
+            'dense_personal_benefit_history': [],
+            'true_reputation_history': [],
+            'true_reputation_rank_history': [],
+            'true_reputation_theta_history': [],
+            'true_reputation_sum_expected_history': [],
+            'active_actor_ids_history': [],
+            'active_participant_ids_history': [],
+            'observed_utility_matrix_history': [],
+            'eta_v_history': [],
+            'gossip_target_ids_history': [],
+            'averaging_agent_ids_history': [],
+            'avg_s_by_target_history': [],
+            'delta_v_matrix_history': [],
         }
 
         # Async-debug instrumentation is opt-in so normal experiment runs do not
         # pay the memory/serialization cost.
         self._async_decision_audit_enabled = False
         self._async_decision_audit_rows: List[Dict[str, object]] = []
+        self._decision_audit_preleader_id: Optional[int] = None
         self._compact_debug_histories_enabled = False
         self._role_update_diagnostics_enabled = False
+        self._dense_reputation_history_enabled = False
+        self._last_observed_utility_matrix = None
+        self._last_phase4_debug = None
+        self._last_eta_v_t = 0.0
 
         # Optional reward table r_i(s,a) for richer state/action-dependent experiments.
         self._reward_tables = None
@@ -657,6 +776,13 @@ class MultiAgentSystem:
         self._async_decision_audit_enabled = True
         self._compact_debug_histories_enabled = True
 
+    def set_decision_audit_preleader(self, agent_id: Optional[int]):
+        """Set the pre-perturb leader id referenced by audit exports."""
+        if agent_id is None or int(agent_id) < 0:
+            self._decision_audit_preleader_id = None
+        else:
+            self._decision_audit_preleader_id = int(agent_id)
+
     def enable_role_update_diagnostics(self):
         """
         Enable lightweight snapshots recorded only at role-update epochs.
@@ -667,11 +793,413 @@ class MultiAgentSystem:
         """
         self._role_update_diagnostics_enabled = True
 
+    def enable_small_n_trace_export(self):
+        """
+        Enable dense per-timestep reputation-matrix snapshots for small-N runs.
+
+        This is intended only for toy/debug configurations where exporting the
+        full s_i(k,t) history is feasible and helpful for diagnosis.
+        """
+        self._compact_debug_histories_enabled = True
+        self._dense_reputation_history_enabled = True
+
+    def _record_small_n_trace_snapshot(self):
+        if not self._dense_reputation_history_enabled:
+            return
+
+        self.results['dense_reputation_history'].append(self._snapshot_reputation_matrix())
+        self.results['dense_personal_benefit_history'].append(self._snapshot_personal_benefit_matrix())
+        self.results['active_actor_ids_history'].append(
+            [int(x) for x in sorted(self.last_active_actor_ids)]
+        )
+        self.results['active_participant_ids_history'].append(
+            [int(x) for x in sorted(self.last_active_participant_ids)]
+        )
+        self.results['observed_utility_matrix_history'].append(
+            None
+            if self._last_observed_utility_matrix is None
+            else np.array(self._last_observed_utility_matrix, dtype=float, copy=True)
+        )
+        self.results['eta_v_history'].append(float(self._last_eta_v_t))
+        phase4_debug = self._last_phase4_debug or {}
+        self.results['gossip_target_ids_history'].append(
+            [int(x) for x in phase4_debug.get("gossip_target_ids", [])]
+        )
+        self.results['averaging_agent_ids_history'].append(
+            [int(x) for x in phase4_debug.get("averaging_agent_ids", [])]
+        )
+        self.results['avg_s_by_target_history'].append(
+            {int(k): float(v) for k, v in phase4_debug.get("avg_s_by_target", {}).items()}
+        )
+        self.results['delta_v_matrix_history'].append(
+            np.array(phase4_debug.get("delta_v_matrix", np.zeros((self.config.num_agents, self.config.num_agents), dtype=float)), dtype=float, copy=True)
+        )
+
+        true_snapshot = self._compute_true_reputation_vector()
+        self.results['true_reputation_history'].append(
+            np.array(true_snapshot["true_reputation"], dtype=float, copy=True)
+        )
+        self.results['true_reputation_rank_history'].append(
+            np.array(true_snapshot["true_rank"], dtype=int, copy=True)
+        )
+        self.results['true_reputation_theta_history'].append(
+            np.array(true_snapshot["theta_mu"], dtype=float, copy=True)
+        )
+        self.results['true_reputation_sum_expected_history'].append(
+            np.array(true_snapshot["sum_expected_utility_others"], dtype=float, copy=True)
+        )
+
     def get_async_decision_audit_rows(self) -> List[Dict[str, object]]:
         return list(self._async_decision_audit_rows)
 
     def get_role_update_diagnostic_rows(self) -> List[Dict[str, object]]:
         return list(self.results.get("role_update_diagnostics", []))
+
+    def get_true_reputation_checkpoint_rows(self) -> List[Dict[str, object]]:
+        return list(self.results.get("true_reputation_checkpoints", []))
+
+    def get_estimate_consensus_checkpoint_rows(self) -> List[Dict[str, object]]:
+        return list(self.results.get("estimate_consensus_checkpoints", []))
+
+    def get_rate_audit_checkpoint_rows(self) -> List[Dict[str, object]]:
+        return list(self.results.get("rate_audit_checkpoints", []))
+
+    def _sync_reputation_views_for_diagnostics(self):
+        if self.config.use_numpy_fast_path and self._s_matrix is not None:
+            self._sync_s_matrix_to_state_dicts()
+
+    def _compute_expected_observer_utilities_by_agent(self) -> np.ndarray:
+        """
+        Compute E[u_i(s, x_k)] for every observer i under each agent k's current
+        role-consistent behavior, averaged uniformly across states.
+        """
+        num_agents = int(self.config.num_agents)
+        num_states = max(1, int(self.config.num_states))
+        expected = np.zeros((num_agents, num_agents), dtype=float)
+
+        if self._reward_tables is not None:
+            for source_id, source_agent in enumerate(self.agents):
+                source_expectation = np.zeros(num_agents, dtype=float)
+                for state in range(num_states):
+                    policy = source_agent.get_current_policy(state)
+                    source_expectation += np.dot(self._reward_tables[:, state, :], policy)
+                expected[:, source_id] = source_expectation / float(num_states)
+            return expected
+
+        for source_id, source_agent in enumerate(self.agents):
+            source_expectation = np.zeros(num_agents, dtype=float)
+            for state in range(num_states):
+                policy = source_agent.get_current_policy(state)
+                state_expectation = np.zeros(num_agents, dtype=float)
+                for action in range(int(self.config.num_actions)):
+                    state_expectation += float(policy[action]) * self.compute_observer_utility_vector(state, action)
+                source_expectation += state_expectation
+            expected[:, source_id] = source_expectation / float(num_states)
+        return expected
+
+    def _compute_true_reputation_vector(self) -> Dict[str, object]:
+        expected_utilities = self._compute_expected_observer_utilities_by_agent()
+        theta_mu = 1.0 - np.exp(
+            -np.array([float(agent.state.actor_interaction_rate) for agent in self.agents], dtype=float)
+        )
+        sum_expected_utility_others = np.sum(expected_utilities, axis=0) - np.diag(expected_utilities)
+        true_reputation = theta_mu * sum_expected_utility_others
+
+        ranked = sorted(
+            range(self.config.num_agents),
+            key=lambda i: (-float(true_reputation[i]), i),
+        )
+        true_rank = np.zeros(self.config.num_agents, dtype=int)
+        for pos, agent_id in enumerate(ranked, start=1):
+            true_rank[agent_id] = pos
+
+        top_value = float(np.max(true_reputation)) if true_reputation.size > 0 else 0.0
+        exact_tol = 1e-12
+        near_tol = 1e-6
+        exact_top_mask = np.isclose(true_reputation, top_value, atol=exact_tol, rtol=0.0)
+        near_top_mask = np.isclose(true_reputation, top_value, atol=near_tol, rtol=0.0)
+        exact_top_ids = np.where(exact_top_mask)[0].tolist()
+        unique_true_top_agent = int(exact_top_ids[0]) if len(exact_top_ids) == 1 else -1
+
+        return {
+            "expected_utilities": expected_utilities,
+            "theta_mu": theta_mu,
+            "sum_expected_utility_others": sum_expected_utility_others,
+            "true_reputation": true_reputation,
+            "true_rank": true_rank,
+            "top_value": top_value,
+            "exact_top_mask": exact_top_mask,
+            "near_top_mask": near_top_mask,
+            "unique_true_top_agent": unique_true_top_agent,
+        }
+
+    def _resolve_current_root_leader(self, agent_id: int) -> int:
+        agent = self.agents[int(agent_id)]
+        if agent.state.following is None:
+            return int(agent_id) if len(agent.state.followers) > 0 else -1
+
+        current = int(agent.state.following)
+        seen = {int(agent_id)}
+        while current >= 0 and current not in seen:
+            seen.add(current)
+            next_leader = self.agents[current].state.following
+            if next_leader is None:
+                return int(current)
+            current = int(next_leader)
+        return -1
+
+    def _compute_gossip_target_ids_from_active_participants(
+        self,
+        active_participant_ids: Sequence[int],
+        *,
+        source_matrix: Optional[np.ndarray] = None,
+    ) -> List[int]:
+        """
+        Paper Section 7.3.3:
+        B(t) = union_{i in A(t)} {L_i(t)}
+
+        Here we approximate A(t) by the active participants in Phase 4 and use each
+        participant's current highest-reputation target L_i(t). Only those target
+        columns are gossip-updated; all others remain unchanged this step.
+        """
+        target_ids: Set[int] = set()
+        for agent_id in active_participant_ids:
+            idx = int(agent_id)
+            if idx < 0 or idx >= self.config.num_agents:
+                continue
+            if self.agents[idx].state.highest_rep_agent_estimate is None:
+                if source_matrix is not None:
+                    self._identify_highest_reputation_agent_from_matrix(idx, source_matrix=source_matrix)
+                elif self.config.use_numpy_fast_path and self._s_matrix is not None:
+                    self._identify_highest_reputation_agent_from_matrix(idx)
+                else:
+                    self.agents[idx].identify_highest_reputation_agent()
+            target = self.agents[idx].state.highest_rep_agent_estimate
+            if target is None:
+                continue
+            target = int(target)
+            if 0 <= target < self.config.num_agents and target != idx:
+                target_ids.add(target)
+        return sorted(target_ids)
+
+    def _resolve_eq9_averaging_mode(self, override: Optional[str] = None) -> str:
+        mode = self.config.eq9_averaging_mode if override is None else str(override)
+        if mode not in {"participants_only", "all_agents"}:
+            raise ValueError(
+                f"Unsupported eq9_averaging_mode='{mode}'. Use 'participants_only' or 'all_agents'."
+            )
+        return mode
+
+    def _resolve_eq9_averaging_agent_ids(
+        self,
+        active_participant_ids: Sequence[int],
+        *,
+        override: Optional[str] = None,
+    ) -> List[int]:
+        mode = self._resolve_eq9_averaging_mode(override)
+        if mode == "participants_only":
+            return [int(agent_id) for agent_id in active_participant_ids]
+        return list(range(self.config.num_agents))
+
+    def _resolve_leader_update_mode(self, override: Optional[str] = None) -> str:
+        mode = self.config.leader_update_mode if override is None else str(override)
+        if mode not in {
+            "participants_only_post_eq9",
+            "all_agents_post_eq9",
+            "participants_only_pre_eq9",
+        }:
+            raise ValueError(
+                f"Unsupported leader_update_mode='{mode}'. Use "
+                "'participants_only_post_eq9', 'all_agents_post_eq9', or "
+                "'participants_only_pre_eq9'."
+            )
+        return mode
+
+    def _resolve_leader_update_agent_ids(
+        self,
+        active_participant_ids: Sequence[int],
+        *,
+        override: Optional[str] = None,
+    ) -> List[int]:
+        mode = self._resolve_leader_update_mode(override)
+        if mode == "all_agents_post_eq9":
+            return list(range(int(self.config.num_agents)))
+        return [int(agent_id) for agent_id in active_participant_ids]
+
+    def _build_true_reputation_checkpoint_rows(
+        self,
+        *,
+        checkpoint_kind: str,
+        role_update_index: int,
+    ) -> List[Dict[str, object]]:
+        self._sync_reputation_views_for_diagnostics()
+        snapshot = self._compute_true_reputation_vector()
+        true_reputation = np.asarray(snapshot["true_reputation"], dtype=float)
+        true_rank = np.asarray(snapshot["true_rank"], dtype=int)
+        theta_mu = np.asarray(snapshot["theta_mu"], dtype=float)
+        sum_expected = np.asarray(snapshot["sum_expected_utility_others"], dtype=float)
+        exact_top_mask = np.asarray(snapshot["exact_top_mask"], dtype=bool)
+        near_top_mask = np.asarray(snapshot["near_top_mask"], dtype=bool)
+        top_value = float(snapshot["top_value"])
+        unique_true_top_agent = int(snapshot["unique_true_top_agent"])
+        rows: List[Dict[str, object]] = []
+        for agent_id in range(self.config.num_agents):
+            rows.append(
+                {
+                    "t": int(self.time_step),
+                    "checkpoint_kind": str(checkpoint_kind),
+                    "role_update_index": int(role_update_index),
+                    "agent_id": int(agent_id),
+                    "true_reputation": float(true_reputation[agent_id]),
+                    "true_rank": int(true_rank[agent_id]),
+                    "theta_mu": float(theta_mu[agent_id]),
+                    "sum_expected_utility_others": float(sum_expected[agent_id]),
+                    "top_true_reputation": float(top_value),
+                    "gap_to_true_top": float(top_value - true_reputation[agent_id]),
+                    "true_top_unique": int(unique_true_top_agent >= 0),
+                    "unique_true_top_agent": int(unique_true_top_agent),
+                    "is_exact_top_tie": int(bool(exact_top_mask[agent_id]) and int(np.sum(exact_top_mask)) > 1),
+                    "is_near_top_tie": int(bool(near_top_mask[agent_id]) and int(np.sum(near_top_mask)) > 1),
+                    "eq9_averaging_mode": str(self.config.eq9_averaging_mode),
+                    "leader_update_mode": str(self.config.leader_update_mode),
+                }
+            )
+        return rows
+
+    def _build_estimate_consensus_checkpoint_rows(
+        self,
+        *,
+        checkpoint_kind: str,
+        role_update_index: int,
+    ) -> List[Dict[str, object]]:
+        self._sync_reputation_views_for_diagnostics()
+        snapshot = self._compute_true_reputation_vector()
+        unique_true_top_agent = int(snapshot["unique_true_top_agent"])
+        rows: List[Dict[str, object]] = []
+        for agent_id, agent in enumerate(self.agents):
+            rep_items = [
+                (other_id, float(rep))
+                for other_id, rep in agent.state.reputation_estimates.items()
+                if int(other_id) != int(agent_id)
+            ]
+            rep_items.sort(key=lambda item: (-item[1], item[0]))
+
+            if rep_items:
+                top_estimate_agent = int(rep_items[0][0])
+                top_estimate_value = float(rep_items[0][1])
+                second_estimate_agent = int(rep_items[1][0]) if len(rep_items) > 1 else -1
+                second_estimate_value = float(rep_items[1][1]) if len(rep_items) > 1 else float(rep_items[0][1])
+                candidate_count = int(
+                    sum(1 for _, rep in rep_items if rep >= top_estimate_value - float(self.config.delta))
+                )
+            else:
+                top_estimate_agent = -1
+                top_estimate_value = 0.0
+                second_estimate_agent = -1
+                second_estimate_value = 0.0
+                candidate_count = 0
+
+            selected_target = -1 if agent.state.highest_rep_agent_estimate is None else int(agent.state.highest_rep_agent_estimate)
+            selected_rep_value = float(agent.state.reputation_estimates.get(selected_target, 0.0)) if selected_target >= 0 else 0.0
+            following = -1 if agent.state.following is None else int(agent.state.following)
+            root_leader = self._resolve_current_root_leader(agent_id)
+            has_followers = int(len(agent.state.followers) > 0)
+
+            rows.append(
+                {
+                    "t": int(self.time_step),
+                    "checkpoint_kind": str(checkpoint_kind),
+                    "role_update_index": int(role_update_index),
+                    "observer_id": int(agent_id),
+                    "role": str(agent.state.role.value),
+                    "has_followers": int(has_followers),
+                    "eligible_in_C": int(not has_followers),
+                    "highest_rep_agent_estimate": int(selected_target),
+                    "selected_rep_value": float(selected_rep_value),
+                    "top_estimate_agent": int(top_estimate_agent),
+                    "top_estimate_value": float(top_estimate_value),
+                    "second_estimate_agent": int(second_estimate_agent),
+                    "second_estimate_value": float(second_estimate_value),
+                    "gap_top2": float(top_estimate_value - second_estimate_value),
+                    "candidate_count_within_delta": int(candidate_count),
+                    "true_top_unique": int(unique_true_top_agent >= 0),
+                    "unique_true_top_agent": int(unique_true_top_agent),
+                    "selected_matches_true_top": int(unique_true_top_agent >= 0 and selected_target == unique_true_top_agent),
+                    "following": int(following),
+                    "current_root_leader": int(root_leader),
+                    "current_root_matches_true_top": int(unique_true_top_agent >= 0 and root_leader == unique_true_top_agent),
+                    "eq9_averaging_mode": str(self.config.eq9_averaging_mode),
+                    "leader_update_mode": str(self.config.leader_update_mode),
+                }
+            )
+        return rows
+
+    def _build_rate_audit_checkpoint_rows(
+        self,
+        *,
+        checkpoint_kind: str,
+        role_update_index: int,
+    ) -> List[Dict[str, object]]:
+        rows: List[Dict[str, object]] = []
+        for agent_id, agent in enumerate(self.agents):
+            rate_terms = agent.get_actor_rate_terms()
+            paper_driver = float(rate_terms["standard_driver"])
+            rows.append(
+                {
+                    "t": int(self.time_step),
+                    "checkpoint_kind": str(checkpoint_kind),
+                    "role_update_index": int(role_update_index),
+                    "agent_id": int(agent_id),
+                    "role": str(agent.state.role.value),
+                    "follower_count": int(len(agent.state.followers)),
+                    "estimated_reward_pu": float(agent.state.estimated_reward_pu),
+                    "estimated_reward_rep": float(agent.state.estimated_reward_rep),
+                    "estimated_reward_status": float(agent.state.estimated_reward_status),
+                    "actor_interaction_rate": float(agent.state.actor_interaction_rate),
+                    "participant_interaction_rate": float(agent.state.participant_interaction_rate),
+                    "actor_rate_driver_mode": str(rate_terms["actor_rate_driver_mode"]),
+                    "actor_rate_status_override_min_followers": int(
+                        rate_terms["actor_rate_status_override_min_followers"]
+                    ),
+                    "status_override_active": int(rate_terms["status_override_active"]),
+                    "paper_driver_pu_term": float(rate_terms["pu_term"]),
+                    "paper_driver_rep_term": float(rate_terms["rep_term"]),
+                    "paper_driver_status_term": float(rate_terms["status_term"]),
+                    "paper_driver_value": float(paper_driver),
+                    "paper_driver_label": str(rate_terms["standard_driver_label"]),
+                    "code_driver_value": float(rate_terms["driver"]),
+                    "code_driver_label": str(rate_terms["driver_label"]),
+                    "paper_driver_matches_code": int(np.isclose(paper_driver, float(rate_terms["driver"]), atol=1e-12, rtol=0.0)),
+                    "paper_section66_requires_status_update": int(
+                        agent.state.role == AgentRole.PERSONAL_UTILITY and len(agent.state.followers) > 0
+                    ),
+                    "status_estimate_positive": int(float(agent.state.estimated_reward_status) > 0.0),
+                    "eq9_averaging_mode": str(self.config.eq9_averaging_mode),
+                    "leader_update_mode": str(self.config.leader_update_mode),
+                }
+            )
+        return rows
+
+    def build_expb_checkpoint_audit_bundle(
+        self,
+        *,
+        checkpoint_kind: str,
+        role_update_index: int,
+    ) -> Dict[str, List[Dict[str, object]]]:
+        return {
+            "true_reputation_checkpoints": self._build_true_reputation_checkpoint_rows(
+                checkpoint_kind=checkpoint_kind,
+                role_update_index=role_update_index,
+            ),
+            "estimate_consensus_checkpoints": self._build_estimate_consensus_checkpoint_rows(
+                checkpoint_kind=checkpoint_kind,
+                role_update_index=role_update_index,
+            ),
+            "rate_audit_checkpoints": self._build_rate_audit_checkpoint_rows(
+                checkpoint_kind=checkpoint_kind,
+                role_update_index=role_update_index,
+            ),
+        }
 
     def _build_role_update_diagnostic_row(self, role_update_index: int) -> Dict[str, object]:
         follower_counts = [len(a.state.followers) for a in self.agents]
@@ -806,6 +1334,18 @@ class MultiAgentSystem:
             self.results["estimated_reward_pu_history"][-1] = [
                 float(a.state.estimated_reward_pu) for a in self.agents
             ]
+        if self.results.get("estimated_reward_rep_history"):
+            self.results["estimated_reward_rep_history"][-1] = [
+                float(a.state.estimated_reward_rep) for a in self.agents
+            ]
+        if self.results.get("estimated_reward_status_history"):
+            self.results["estimated_reward_status_history"][-1] = [
+                float(a.state.estimated_reward_status) for a in self.agents
+            ]
+        if self.results.get("actor_interaction_rate_history"):
+            self.results["actor_interaction_rate_history"][-1] = [
+                float(a.state.actor_interaction_rate) for a in self.agents
+            ]
         if self.results.get("role_label_history"):
             self.results["role_label_history"][-1] = [str(a.state.role.value) for a in self.agents]
         if self.results.get("selected_reputation_history"):
@@ -828,6 +1368,24 @@ class MultiAgentSystem:
             self.results["weighted_selected_reputation_history"][-1] = weighted_selected_rep
             self.results["highest_rep_agent_history"][-1] = highest_rep_agents
             self.results["following_history"][-1] = following_ids
+        if self.results.get("dense_reputation_history"):
+            self.results["dense_reputation_history"][-1] = self._snapshot_reputation_matrix()
+        if self.results.get("dense_personal_benefit_history"):
+            self.results["dense_personal_benefit_history"][-1] = self._snapshot_personal_benefit_matrix()
+        if self.results.get("true_reputation_history"):
+            true_snapshot = self._compute_true_reputation_vector()
+            self.results["true_reputation_history"][-1] = np.array(
+                true_snapshot["true_reputation"], dtype=float, copy=True
+            )
+            self.results["true_reputation_rank_history"][-1] = np.array(
+                true_snapshot["true_rank"], dtype=int, copy=True
+            )
+            self.results["true_reputation_theta_history"][-1] = np.array(
+                true_snapshot["theta_mu"], dtype=float, copy=True
+            )
+            self.results["true_reputation_sum_expected_history"][-1] = np.array(
+                true_snapshot["sum_expected_utility_others"], dtype=float, copy=True
+            )
 
     def _sync_s_matrix_to_state_dicts(self, agent_ids=None):
         """Materialize dense s_i(k,t) rows into per-agent dicts when needed."""
@@ -842,32 +1400,119 @@ class MultiAgentSystem:
                 k: float(row[k]) for k in range(num_agents)
             }
 
-    def _identify_highest_reputation_agent_from_matrix(self, agent_id: int):
-        """
-        Fast REP-1 selection on dense s_i(k,t): choose from C\\{i} with tie tolerance delta.
-        """
-        num_agents = self.config.num_agents
-        agent = self.agents[agent_id]
-        if num_agents <= 1:
-            agent.state.highest_rep_agent_estimate = agent_id
-            return
+    def _snapshot_personal_benefit_matrix(self) -> np.ndarray:
+        num_agents = int(self.config.num_agents)
+        if self.config.use_numpy_fast_path and self._v_matrix is not None:
+            return np.array(self._v_matrix, dtype=float, copy=True)
+        out = np.zeros((num_agents, num_agents), dtype=float)
+        for i, agent in enumerate(self.agents):
+            for k in range(num_agents):
+                out[i, k] = float(agent.state.personal_benefit_estimates.get(k, 0.0))
+        return out
 
-        row = self._s_matrix[agent_id].copy()
-        row[agent_id] = -np.inf  # REP-1: exclude self
-        max_rep = np.max(row)
+    def _snapshot_reputation_matrix(self) -> np.ndarray:
+        num_agents = int(self.config.num_agents)
+        if self.config.use_numpy_fast_path and self._s_matrix is not None:
+            return np.array(self._s_matrix, dtype=float, copy=True)
+        out = np.zeros((num_agents, num_agents), dtype=float)
+        for i, agent in enumerate(self.agents):
+            for k in range(num_agents):
+                out[i, k] = float(agent.state.reputation_estimates.get(k, 0.0))
+        return out
+
+    def get_reputation_learning_snapshot(self) -> Dict[str, np.ndarray]:
+        """Return dense v/s/L state for isolated reputation-learning audits."""
+        return {
+            "v_matrix": self._snapshot_personal_benefit_matrix(),
+            "s_matrix": self._snapshot_reputation_matrix(),
+            "highest_rep_agent_estimates": np.array(
+                [
+                    -1 if agent.state.highest_rep_agent_estimate is None else int(agent.state.highest_rep_agent_estimate)
+                    for agent in self.agents
+                ],
+                dtype=int,
+            ),
+            "actor_rates": np.array(
+                [float(agent.state.actor_interaction_rate) for agent in self.agents],
+                dtype=float,
+            ),
+        }
+
+    def _set_reputation_learning_state_for_audit(
+        self,
+        *,
+        personal_benefit_matrix: np.ndarray,
+        reputation_matrix: np.ndarray,
+        highest_rep_agent_estimates: Sequence[int],
+    ):
+        """
+        Deterministic test helper for isolated gossip audits.
+
+        This keeps dense caches and per-agent dicts synchronized so the same
+        reputation-learning state can be exercised through either code path.
+        """
+        v_matrix = np.asarray(personal_benefit_matrix, dtype=float)
+        s_matrix = np.asarray(reputation_matrix, dtype=float)
+        num_agents = int(self.config.num_agents)
+        expected_shape = (num_agents, num_agents)
+        if v_matrix.shape != expected_shape or s_matrix.shape != expected_shape:
+            raise ValueError(
+                f"Expected personal_benefit_matrix and reputation_matrix to have shape {expected_shape}, "
+                f"got {v_matrix.shape} and {s_matrix.shape}."
+            )
+        highest = [int(x) for x in highest_rep_agent_estimates]
+        if len(highest) != num_agents:
+            raise ValueError(
+                f"Expected {num_agents} highest_rep_agent_estimates, got {len(highest)}."
+            )
+
+        self._v_matrix = np.array(v_matrix, dtype=float, copy=True)
+        self._s_matrix = np.array(s_matrix, dtype=float, copy=True)
+        for i, agent in enumerate(self.agents):
+            agent.state.personal_benefit_estimates = {
+                k: float(v_matrix[i, k]) for k in range(num_agents)
+            }
+            agent.state.reputation_estimates = {
+                k: float(s_matrix[i, k]) for k in range(num_agents)
+            }
+            estimate = highest[i]
+            agent.state.highest_rep_agent_estimate = estimate if 0 <= estimate < num_agents else None
+
+    def _choose_highest_reputation_target_from_row(self, agent_id: int, row: np.ndarray) -> int:
+        """
+        Fast REP-1 selection on a dense s_i(k,t) row: choose from C\\{i} with tie tolerance delta.
+        """
+        num_agents = int(self.config.num_agents)
+        if num_agents <= 1:
+            return int(agent_id)
+
+        row_copy = np.asarray(row, dtype=float).copy()
+        row_copy[agent_id] = -np.inf  # REP-1: exclude self
+        max_rep = np.max(row_copy)
         if not np.isfinite(max_rep):
             others = [k for k in range(num_agents) if k != agent_id]
-            agent.state.highest_rep_agent_estimate = int(np.random.choice(others))
-            return
+            return int(np.random.choice(others))
 
-        candidates = np.where(row >= max_rep - self.config.delta)[0]
+        candidates = np.where(row_copy >= max_rep - self.config.delta)[0]
         candidates = candidates[candidates != agent_id]
         if candidates.size == 0:
             others = [k for k in range(num_agents) if k != agent_id]
-            agent.state.highest_rep_agent_estimate = int(np.random.choice(others))
-            return
+            return int(np.random.choice(others))
 
-        agent.state.highest_rep_agent_estimate = int(np.random.choice(candidates))
+        return int(np.random.choice(candidates))
+
+    def _identify_highest_reputation_agent_from_matrix(
+        self,
+        agent_id: int,
+        *,
+        source_matrix: Optional[np.ndarray] = None,
+    ):
+        """
+        Fast REP-1 selection using either the live dense matrix or an override snapshot.
+        """
+        matrix = self._s_matrix if source_matrix is None else np.asarray(source_matrix, dtype=float)
+        chosen = self._choose_highest_reputation_target_from_row(int(agent_id), matrix[int(agent_id)])
+        self.agents[int(agent_id)].state.highest_rep_agent_estimate = int(chosen)
 
     def _phase4_updates_numpy_fast(
         self,
@@ -875,7 +1520,13 @@ class MultiAgentSystem:
         active_actor_ids: np.ndarray,
         active_participant_ids: np.ndarray,
         eta_v_t: float,
-    ):
+        alpha_rate_t: float = 0.0,
+        *,
+        update_actor_rates: bool = True,
+        identify_highest_rep: bool = True,
+        eq9_averaging_mode: Optional[str] = None,
+        leader_update_mode: Optional[str] = None,
+    ) -> Dict[str, object]:
         """
         Vectorized Phase-4 updates:
         - REP-4: update v_i(k,t) for all agents i and all k each step.
@@ -883,6 +1534,10 @@ class MultiAgentSystem:
         - REP-2: update s_i(k,t+1)=avg_j s_j(k,t)+delta_v_i(k,t) for active participants.
         """
         prev_v = self._v_matrix
+        leader_mode = self._resolve_leader_update_mode(leader_update_mode)
+        pre_s_matrix = None
+        if identify_highest_rep and leader_mode == "participants_only_pre_eq9":
+            pre_s_matrix = np.array(self._s_matrix, dtype=float, copy=True)
 
         new_v = prev_v * (1.0 - eta_v_t)
         if active_actor_ids.size > 0:
@@ -893,12 +1548,213 @@ class MultiAgentSystem:
         delta_v = new_v - prev_v
         self._v_matrix = new_v
 
+        gossip_target_ids = np.array([], dtype=int)
+        avg_s_by_target: Dict[int, float] = {}
+        averaging_agent_ids: List[int] = []
+        leader_update_agent_ids: List[int] = []
         if active_participant_ids.size > 0:
-            avg_s = np.mean(self._s_matrix[active_participant_ids, :], axis=0)
-            self._s_matrix[active_participant_ids, :] = avg_s[np.newaxis, :] + delta_v[active_participant_ids, :]
+            gossip_target_ids = np.array(
+                self._compute_gossip_target_ids_from_active_participants(
+                    active_participant_ids.tolist(),
+                    source_matrix=self._s_matrix,
+                ),
+                dtype=int,
+            )
+            averaging_agent_ids = self._resolve_eq9_averaging_agent_ids(
+                active_participant_ids.tolist(),
+                override=eq9_averaging_mode,
+            )
+            if gossip_target_ids.size > 0:
+                avg_s = np.mean(
+                    self._s_matrix[np.ix_(np.array(averaging_agent_ids, dtype=int), gossip_target_ids)],
+                    axis=0,
+                )
+                avg_s_by_target = {
+                    int(target_id): float(avg_s[idx])
+                    for idx, target_id in enumerate(gossip_target_ids.tolist())
+                }
+                self._s_matrix[np.ix_(active_participant_ids, gossip_target_ids)] = (
+                    avg_s[np.newaxis, :] + delta_v[np.ix_(active_participant_ids, gossip_target_ids)]
+                )
 
-            for agent_id in active_participant_ids:
-                self._identify_highest_reputation_agent_from_matrix(int(agent_id))
+            if identify_highest_rep:
+                leader_update_agent_ids = self._resolve_leader_update_agent_ids(
+                    active_participant_ids.tolist(),
+                    override=leader_update_mode,
+                )
+                source_matrix = pre_s_matrix if leader_mode == "participants_only_pre_eq9" else self._s_matrix
+                for agent_id in leader_update_agent_ids:
+                    self._identify_highest_reputation_agent_from_matrix(
+                        int(agent_id),
+                        source_matrix=source_matrix,
+                    )
+
+            if update_actor_rates:
+                for agent_id in active_participant_ids:
+                    self.agents[int(agent_id)].update_actor_interaction_rate(alpha_rate_t)
+
+        return {
+            "gossip_target_ids": [int(x) for x in gossip_target_ids.tolist()],
+            "averaging_agent_ids": [int(x) for x in averaging_agent_ids],
+            "leader_update_agent_ids": [int(x) for x in leader_update_agent_ids],
+            "avg_s_by_target": avg_s_by_target,
+            "delta_v_matrix": np.array(delta_v, dtype=float, copy=True),
+            "eq9_averaging_mode": self._resolve_eq9_averaging_mode(eq9_averaging_mode),
+            "leader_update_mode": leader_mode,
+        }
+
+    def _phase4_updates_python(
+        self,
+        observed_utility_matrix: np.ndarray,
+        active_actor_ids: Sequence[int],
+        active_participant_ids: Sequence[int],
+        eta_v_t: float,
+        alpha_rate_t: float = 0.0,
+        *,
+        update_actor_rates: bool = True,
+        identify_highest_rep: bool = True,
+        eq9_averaging_mode: Optional[str] = None,
+        leader_update_mode: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """
+        Python reference implementation of the Phase-4 reputation-learning step.
+
+        This is used by the normal non-fast path and by isolated gossip audits
+        that want to exercise only the Section 6.4 recurrence.
+        """
+        leader_mode = self._resolve_leader_update_mode(leader_update_mode)
+        pre_s_matrix = None
+        if identify_highest_rep and leader_mode == "participants_only_pre_eq9":
+            pre_s_matrix = self._snapshot_reputation_matrix()
+
+        delta_v_by_agent = {}
+        for agent in self.agents:
+            observed_utilities = {
+                k: float(observed_utility_matrix[agent.agent_id, k])
+                for k in range(self.config.num_agents)
+            }
+            delta_v_by_agent[agent.agent_id] = agent.update_personal_benefit_estimates(
+                observed_utilities,
+                eta_v_t,
+                active_actor_ids=active_actor_ids,
+            )
+
+        delta_v_matrix = np.zeros((self.config.num_agents, self.config.num_agents), dtype=float)
+        for agent_id, deltas in delta_v_by_agent.items():
+            for target_id, delta_val in deltas.items():
+                delta_v_matrix[int(agent_id), int(target_id)] = float(delta_val)
+
+        participant_ids = [int(agent_id) for agent_id in active_participant_ids]
+        gossip_target_ids = self._compute_gossip_target_ids_from_active_participants(
+            participant_ids,
+            source_matrix=self._snapshot_reputation_matrix(),
+        )
+        averaging_agent_ids = self._resolve_eq9_averaging_agent_ids(
+            participant_ids,
+            override=eq9_averaging_mode,
+        )
+        leader_update_agent_ids: List[int] = []
+
+        snapshot_s = {}
+        for target_id in gossip_target_ids:
+            snapshot_s[target_id] = [
+                self.agents[agent_id].state.reputation_estimates.get(target_id, 0.0)
+                for agent_id in averaging_agent_ids
+            ]
+        avg_s_by_target = {
+            int(target_id): float(np.mean(vals)) if len(vals) > 0 else 0.0
+            for target_id, vals in snapshot_s.items()
+        }
+
+        for participant_id in participant_ids:
+            agent = self.agents[participant_id]
+            deltas = delta_v_by_agent[participant_id]
+            for target_id in gossip_target_ids:
+                agent.state.reputation_estimates[target_id] = (
+                    avg_s_by_target[target_id] + deltas.get(target_id, 0.0)
+                )
+
+        if identify_highest_rep:
+            leader_update_agent_ids = self._resolve_leader_update_agent_ids(
+                participant_ids,
+                override=leader_update_mode,
+            )
+            source_matrix = pre_s_matrix if leader_mode == "participants_only_pre_eq9" else self._snapshot_reputation_matrix()
+            for participant_id in leader_update_agent_ids:
+                self._identify_highest_reputation_agent_from_matrix(
+                    int(participant_id),
+                    source_matrix=source_matrix,
+                )
+
+        if update_actor_rates:
+            for participant_id in participant_ids:
+                self.agents[participant_id].update_actor_interaction_rate(alpha_rate_t)
+
+        return {
+            "gossip_target_ids": [int(x) for x in gossip_target_ids],
+            "averaging_agent_ids": [int(x) for x in averaging_agent_ids],
+            "leader_update_agent_ids": [int(x) for x in leader_update_agent_ids],
+            "avg_s_by_target": avg_s_by_target,
+            "delta_v_matrix": delta_v_matrix,
+            "eq9_averaging_mode": self._resolve_eq9_averaging_mode(eq9_averaging_mode),
+            "leader_update_mode": leader_mode,
+        }
+
+    def run_isolated_reputation_learning_phase(
+        self,
+        *,
+        observed_utility_matrix: np.ndarray,
+        active_actor_ids: Sequence[int],
+        active_participant_ids: Sequence[int],
+        eta_v_t: float,
+        alpha_rate_t: float = 0.0,
+        update_actor_rates: bool = False,
+        identify_highest_rep: bool = True,
+        eq9_averaging_mode: Optional[str] = None,
+        leader_update_mode: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """
+        Deterministic Phase-4-only audit hook for gossip / reputation learning.
+
+        This applies the Section 6.4 recurrence to supplied active sets and
+        observed utilities without sampling actions, updating policies, or
+        running role switching.
+        """
+        observed = np.asarray(observed_utility_matrix, dtype=float)
+        expected_shape = (self.config.num_agents, self.config.num_agents)
+        if observed.shape != expected_shape:
+            raise ValueError(
+                f"Expected observed_utility_matrix to have shape {expected_shape}, got {observed.shape}."
+            )
+
+        if self.config.use_numpy_fast_path and self._v_matrix is not None and self._s_matrix is not None:
+            debug = self._phase4_updates_numpy_fast(
+                observed,
+                np.array(sorted(int(i) for i in active_actor_ids), dtype=int),
+                np.array([int(i) for i in active_participant_ids], dtype=int),
+                eta_v_t,
+                alpha_rate_t,
+                update_actor_rates=update_actor_rates,
+                identify_highest_rep=identify_highest_rep,
+                eq9_averaging_mode=eq9_averaging_mode,
+                leader_update_mode=leader_update_mode,
+            )
+        else:
+            debug = self._phase4_updates_python(
+                observed,
+                active_actor_ids,
+                active_participant_ids,
+                eta_v_t,
+                alpha_rate_t,
+                update_actor_rates=update_actor_rates,
+                identify_highest_rep=identify_highest_rep,
+                eq9_averaging_mode=eq9_averaging_mode,
+                leader_update_mode=leader_update_mode,
+            )
+
+        snapshot = self.get_reputation_learning_snapshot()
+        snapshot.update(debug)
+        return snapshot
     
     def compute_observer_utility(self, observer_id: int, state: int, action: int) -> float:
         """
@@ -950,20 +1806,26 @@ class MultiAgentSystem:
         # [IR-1] Activation probability must be θ(μ)=1-exp(-μ).
         # The old implementation used raw μ directly, which over-activated agents.
         # A_a(t): Active actors (Section 6.2) sampled using θ(μ)=1-exp(-μ)
-        active_actors = set()
-        for agent in self.agents:
-            actor_prob = 1.0 - np.exp(-agent.state.actor_interaction_rate)
-            if np.random.random() < actor_prob:
-                active_actors.add(agent.agent_id)
+        if self.config.force_all_active_debug:
+            active_actors = {agent.agent_id for agent in self.agents}
+        else:
+            active_actors = set()
+            for agent in self.agents:
+                actor_prob = 1.0 - np.exp(-agent.state.actor_interaction_rate)
+                if np.random.random() < actor_prob:
+                    active_actors.add(agent.agent_id)
         
         # [IR-1] Activation probability must be θ(μ)=1-exp(-μ).
         # Keep participant sampling consistent with Section 6.2.
         # A_p(t): Active participants (Section 6.2) sampled using θ(μ)=1-exp(-μ)
-        active_participants = []
-        for agent in self.agents:
-            participant_prob = 1.0 - np.exp(-agent.state.participant_interaction_rate)
-            if np.random.random() < participant_prob:
-                active_participants.append(agent)
+        if self.config.force_all_active_debug:
+            active_participants = list(self.agents)
+        else:
+            active_participants = []
+            for agent in self.agents:
+                participant_prob = 1.0 - np.exp(-agent.state.participant_interaction_rate)
+                if np.random.random() < participant_prob:
+                    active_participants.append(agent)
         
         active_participant_ids = {a.agent_id for a in active_participants}
         self.last_active_actor_ids = set(active_actors)
@@ -986,6 +1848,8 @@ class MultiAgentSystem:
             payoff = float(observer_utilities[agent_id])
             this_step_payoffs[agent_id] = payoff
             agent.state.payoff_history.append(payoff)
+        self._last_observed_utility_matrix = np.array(observed_utility_matrix, dtype=float, copy=True)
+        self._last_eta_v_t = float(eta_v_t)
 
         # === PHASE 3: Role-Based Updates for Active Actors (Section 6) ===
         
@@ -1041,47 +1905,26 @@ class MultiAgentSystem:
                 [a.agent_id for a in active_participants],
                 dtype=int,
             )
-            self._phase4_updates_numpy_fast(
+            phase4_debug = self._phase4_updates_numpy_fast(
                 observed_utility_matrix,
                 active_actor_array,
                 active_participant_array,
                 eta_v_t,
+                alpha_rate_t,
+                update_actor_rates=True,
+                identify_highest_rep=True,
             )
-
-            for agent in active_participants:
-                agent.update_actor_interaction_rate(alpha_rate_t)
         else:
-            # (4.1)
-            # [REP-4]/[REP-7] Section 6.4.2 updates v_i(k,t) for every agent i each step
-            # using observer-specific utilities u_i(s(t), x_k(t)) for active actors k.
-            delta_v_by_agent = {}
-            for agent in self.agents:
-                observed_utilities = {
-                    k: float(observed_utility_matrix[agent.agent_id, k])
-                    for k in range(self.config.num_agents)
-                }
-                delta_v_by_agent[agent.agent_id] = agent.update_personal_benefit_estimates(
-                    observed_utilities, eta_v_t
-                )
-
-            # (4.2) snapshot
-            snapshot_s = {}
-            for k in range(self.config.num_agents):
-                snapshot_s[k] = [
-                    p.state.reputation_estimates.get(k, 0.0)
-                    for p in active_participants
-                ]
-            avg_s = {k: float(np.mean(vals)) if len(vals) > 0 else 0.0 for k, vals in snapshot_s.items()}
-
-            # (4.3) s_i(k,t+1) = avg_s[k] + delta_v_i(k)
-            for agent in active_participants:
-                deltas = delta_v_by_agent[agent.agent_id]
-                for k in range(self.config.num_agents):
-                    agent.state.reputation_estimates[k] = avg_s[k] + deltas.get(k, 0.0)
-
-            for agent in active_participants:
-                agent.identify_highest_reputation_agent()
-                agent.update_actor_interaction_rate(alpha_rate_t)
+            phase4_debug = self._phase4_updates_python(
+                observed_utility_matrix,
+                [int(a) for a in active_actors],
+                [a.agent_id for a in active_participants],
+                eta_v_t,
+                alpha_rate_t,
+                update_actor_rates=True,
+                identify_highest_rep=True,
+            )
+        self._last_phase4_debug = phase4_debug
 
 
         # [REP-3] No second gossip pass here.
@@ -1200,6 +2043,11 @@ class MultiAgentSystem:
                     current_followed_rep_raw = float(
                         agent.state.reputation_estimates.get(following_before, 0.0)
                     )
+                rep_to_preleader_raw = float("nan")
+                if self._decision_audit_preleader_id is not None:
+                    rep_to_preleader_raw = float(
+                        agent.state.reputation_estimates.get(self._decision_audit_preleader_id, 0.0)
+                    )
                 audit_rows[i] = {
                     "t": int(self.time_step),
                     "agent_id": int(i),
@@ -1211,6 +2059,7 @@ class MultiAgentSystem:
                     "highest_rep_agent_estimate": -1 if highest_rep_agent is None else int(highest_rep_agent),
                     "selected_reputation_raw": selected_rep_raw,
                     "selected_reputation_weighted": float(self.config.gamma) * selected_rep_raw,
+                    "rep_to_preleader_raw": rep_to_preleader_raw,
                     "current_followed_reputation_raw": current_followed_rep_raw,
                     "current_followed_reputation_weighted": float(self.config.gamma) * current_followed_rep_raw,
                     "estimated_reward_pu": float(agent.state.estimated_reward_pu),
@@ -1452,11 +2301,33 @@ class MultiAgentSystem:
                     role_update_index=len(self.results["role_update_times"])
                 )
             )
+            checkpoint_bundle = self.build_expb_checkpoint_audit_bundle(
+                checkpoint_kind="role_update",
+                role_update_index=len(self.results["role_update_times"]),
+            )
+            self.results.setdefault("true_reputation_checkpoints", []).extend(
+                checkpoint_bundle["true_reputation_checkpoints"]
+            )
+            self.results.setdefault("estimate_consensus_checkpoints", []).extend(
+                checkpoint_bundle["estimate_consensus_checkpoints"]
+            )
+            self.results.setdefault("rate_audit_checkpoints", []).extend(
+                checkpoint_bundle["rate_audit_checkpoints"]
+            )
 
         collect_compact_histories = (mode == "full") or self._compact_debug_histories_enabled
         if collect_compact_histories:
             self.results['estimated_reward_pu_history'].append(
                 [float(a.state.estimated_reward_pu) for a in self.agents]
+            )
+            self.results['estimated_reward_rep_history'].append(
+                [float(a.state.estimated_reward_rep) for a in self.agents]
+            )
+            self.results['estimated_reward_status_history'].append(
+                [float(a.state.estimated_reward_status) for a in self.agents]
+            )
+            self.results['actor_interaction_rate_history'].append(
+                [float(a.state.actor_interaction_rate) for a in self.agents]
             )
             self.results['role_label_history'].append(
                 [str(a.state.role.value) for a in self.agents]
@@ -1481,6 +2352,7 @@ class MultiAgentSystem:
             self.results['weighted_selected_reputation_history'].append(weighted_selected_rep)
             self.results['highest_rep_agent_history'].append(highest_rep_agents)
             self.results['following_history'].append(following_ids)
+            self._record_small_n_trace_snapshot()
 
         if mode == "light":
             return

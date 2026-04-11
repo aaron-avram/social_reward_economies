@@ -8,10 +8,13 @@ import numpy as np
 import pytest
 
 from _shared import (
+    get_reputation_learning_snapshot,
     gossip_inplace_update,
+    gossip_phase_oracle,
     gossip_sync_update,
     load_model_module,
     make_system,
+    set_reputation_learning_state,
     variance,
 )
 
@@ -22,6 +25,22 @@ def model_module():
 
 
 # ==================== GOSSIP NETWORK ====================
+
+def test_rep_observed_reputation_estimates_initialize_to_zero(model_module):
+    system = make_system(
+        model_module,
+        num_agents=4,
+        extra_config=dict(use_numpy_fast_path=True),
+    )
+
+    for agent in system.agents:
+        assert all(
+            agent.state.reputation_estimates[k] == pytest.approx(0.0, abs=1e-12)
+            for k in range(system.config.num_agents)
+        )
+
+    assert system._s_matrix is not None
+    assert np.allclose(system._s_matrix, 0.0)
 
 def test_rep3_no_extra_phase5_pairwise_gossip_strict_noop_phase4(model_module):
     system = make_system(
@@ -37,6 +56,8 @@ def test_rep3_no_extra_phase5_pairwise_gossip_strict_noop_phase4(model_module):
 
     a0.state.reputation_estimates = {0: 0.0, 1: 0.0}
     a1.state.reputation_estimates = {0: 10.0, 1: 10.0}
+    a0.state.highest_rep_agent_estimate = 0
+    a1.state.highest_rep_agent_estimate = 0
 
     def _deltas_a0(self, observed_payoffs, eta_v_t):
         return {0: 1.0, 1: 0.0}
@@ -68,6 +89,8 @@ def test_rep3_no_extra_phase5_pairwise_gossip_legacy_scenario(model_module):
 
     a0.state.reputation_estimates = {0: 0.0, 1: 0.0}
     a1.state.reputation_estimates = {0: 10.0, 1: 10.0}
+    a0.state.highest_rep_agent_estimate = 0
+    a1.state.highest_rep_agent_estimate = 0
 
     def _deltas_a0(self, observed_payoffs, eta_v_t):
         return {0: 1.0, 1: 0.0}
@@ -189,7 +212,11 @@ def test_rep4_personal_benefit_estimates_active_and_inactive_decay(model_module)
         2: 0.0,
     }
 
-    deltas = agent.update_personal_benefit_estimates(observed_payoffs, eta_v_t=0.2)
+    deltas = agent.update_personal_benefit_estimates(
+        observed_payoffs,
+        eta_v_t=0.2,
+        active_actor_ids=[0],
+    )
 
     # active update: 4 + 0.2*(10-4) = 5.2
     assert agent.state.personal_benefit_estimates[0] == pytest.approx(5.2, abs=1e-12)
@@ -198,6 +225,37 @@ def test_rep4_personal_benefit_estimates_active_and_inactive_decay(model_module)
     # inactive decay: 5*(1-0.2) = 4.0
     assert agent.state.personal_benefit_estimates[1] == pytest.approx(4.0, abs=1e-12)
     assert deltas[1] == pytest.approx(-1.0, abs=1e-12)
+
+
+def test_rep4_active_zero_payoff_updates_instead_of_decaying(model_module):
+    system = make_system(model_module, num_agents=3)
+    agent = system.agents[0]
+
+    agent.state.personal_benefit_estimates = {
+        0: 1.0,
+        1: 5.0,
+        2: 0.0,
+    }
+
+    observed_payoffs = {
+        0: 0.0,
+        1: 0.0,
+        2: 0.0,
+    }
+
+    deltas = agent.update_personal_benefit_estimates(
+        observed_payoffs,
+        eta_v_t=0.2,
+        active_actor_ids=[1],
+    )
+
+    # Active zero-utility observation should move toward 0, not decay as inactive.
+    assert agent.state.personal_benefit_estimates[1] == pytest.approx(4.0, abs=1e-12)
+    assert deltas[1] == pytest.approx(-1.0, abs=1e-12)
+
+    # Truly inactive targets still decay.
+    assert agent.state.personal_benefit_estimates[0] == pytest.approx(0.8, abs=1e-12)
+    assert deltas[0] == pytest.approx(-0.2, abs=1e-12)
 
 
 def test_rep1_identify_highest_reputation_agent_single_agent_edge_case(model_module):
@@ -316,6 +374,28 @@ def test_rep2_update_reputation_estimates_gossip_function_empty_other_agents_lis
     assert a.state.reputation_estimates[1] == pytest.approx(1.5, abs=1e-12)
 
 
+def test_rep2_update_reputation_estimates_gossip_function_respects_target_scope(model_module):
+    system = make_system(model_module, num_agents=3)
+    a0, a1, a2 = system.agents
+
+    a0.state.reputation_estimates = {0: 10.0, 1: 1.0, 2: 20.0}
+    a1.state.reputation_estimates = {0: 30.0, 1: 5.0, 2: 40.0}
+    a2.state.reputation_estimates = {0: 50.0, 1: 9.0, 2: 60.0}
+
+    deltas = {0: 7.0, 1: 2.0, 2: 11.0}
+    a0.update_reputation_estimates_gossip(
+        deltas,
+        [a0, a1, a2],
+        eta_s_t=0.1,
+        target_agent_ids=[1],
+    )
+
+    # Only target 1 should be gossip-updated under paper scope B(t).
+    assert a0.state.reputation_estimates[1] == pytest.approx(7.0, abs=1e-12)
+    assert a0.state.reputation_estimates[0] == pytest.approx(10.0, abs=1e-12)
+    assert a0.state.reputation_estimates[2] == pytest.approx(20.0, abs=1e-12)
+
+
 def test_rep1_identify_highest_reputation_agent_delta_tie_random_candidate_is_valid(model_module):
     np.random.seed(0)
     system = make_system(model_module, num_agents=4, extra_config=dict(delta=0.1))
@@ -353,6 +433,754 @@ def test_rep4_step_decays_all_v_estimates_when_no_active_actors(model_module):
         assert a.state.personal_benefit_estimates[0] == pytest.approx(5.0 * (1.0 - eta_v_t), rel=1e-9)
         assert a.state.personal_benefit_estimates[1] == pytest.approx(2.0 * (1.0 - eta_v_t), rel=1e-9)
         assert a.state.personal_benefit_estimates[2] == pytest.approx(1.0 * (1.0 - eta_v_t), rel=1e-9)
+
+
+def _make_isolated_gossip_fixture(
+    model_module,
+    *,
+    use_numpy_fast_path: bool,
+    eq9_averaging_mode: str,
+    leader_update_mode: str = "participants_only_post_eq9",
+):
+    system = make_system(
+        model_module,
+        num_agents=4,
+        extra_config=dict(
+            use_numpy_fast_path=use_numpy_fast_path,
+            delta=0.0,
+            eq9_averaging_mode=eq9_averaging_mode,
+            leader_update_mode=leader_update_mode,
+            initial_actor_interaction_rate=0.4,
+            initial_participant_interaction_rate=0.4,
+        ),
+    )
+
+    v0 = np.array(
+        [
+            [0.00, 0.20, 0.10, 0.00],
+            [0.05, 0.00, 0.20, 0.10],
+            [0.10, 0.30, 0.00, 0.10],
+            [0.00, 0.10, 0.20, 0.00],
+        ],
+        dtype=float,
+    )
+    s0 = np.array(
+        [
+            [0.00, 0.90, 0.40, 0.10],
+            [0.30, 0.00, 1.10, 0.20],
+            [0.20, 0.80, 0.00, 0.10],
+            [0.10, 0.70, 0.30, 0.00],
+        ],
+        dtype=float,
+    )
+    l0 = np.array([1, 2, 1, 1], dtype=int)
+    observed = np.array(
+        [
+            [0.0, 0.9, 1.3, 0.0],
+            [0.0, 0.4, 1.1, 0.0],
+            [0.0, 0.8, 1.2, 0.0],
+            [0.0, 0.5, 1.0, 0.0],
+        ],
+        dtype=float,
+    )
+
+    set_reputation_learning_state(
+        system,
+        personal_benefit_matrix=v0,
+        reputation_matrix=s0,
+        highest_rep_agent_estimates=l0,
+    )
+    return system, v0, s0, l0, observed
+
+
+def test_gossip_isolated_phase_python_path_matches_oracle(model_module):
+    system, v0, s0, l0, observed = _make_isolated_gossip_fixture(
+        model_module,
+        use_numpy_fast_path=False,
+        eq9_averaging_mode="all_agents",
+    )
+    eta_v_t = 0.2
+    active_actor_ids = [1, 2]
+    active_participant_ids = [0, 1, 3]
+
+    expected = gossip_phase_oracle(
+        v_before=v0,
+        s_before=s0,
+        highest_rep_before=l0,
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        delta=0.0,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode="participants_only_post_eq9",
+    )
+
+    actual = system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode="participants_only_post_eq9",
+    )
+
+    assert actual["gossip_target_ids"] == expected["gossip_target_ids"]
+    assert actual["eq9_averaging_mode"] == "all_agents"
+    assert actual["leader_update_mode"] == "participants_only_post_eq9"
+    assert actual["averaging_agent_ids"] == [0, 1, 2, 3]
+    assert actual["leader_update_agent_ids"] == active_participant_ids
+    assert actual["avg_s_by_target"] == pytest.approx(expected["avg_s_by_target"], abs=1e-12)
+    assert np.allclose(actual["delta_v_matrix"], expected["delta_v_matrix"], atol=1e-12)
+    assert np.allclose(actual["v_matrix"], expected["v_matrix"], atol=1e-12)
+    assert np.allclose(actual["s_matrix"], expected["s_matrix"], atol=1e-12)
+    assert np.array_equal(actual["highest_rep_agent_estimates"], expected["highest_rep_agent_estimates"])
+
+
+def test_gossip_isolated_phase_python_path_treats_active_zero_utilities_as_active(model_module):
+    system, v0, s0, l0, observed = _make_isolated_gossip_fixture(
+        model_module,
+        use_numpy_fast_path=False,
+        eq9_averaging_mode="all_agents",
+    )
+    eta_v_t = 0.2
+    active_actor_ids = [1, 2]
+    active_participant_ids = [0, 1, 3]
+    observed[:, 1] = 0.0
+
+    expected = gossip_phase_oracle(
+        v_before=v0,
+        s_before=s0,
+        highest_rep_before=l0,
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        delta=0.0,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode="participants_only_post_eq9",
+    )
+
+    actual = system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode="participants_only_post_eq9",
+    )
+
+    assert np.allclose(actual["delta_v_matrix"], expected["delta_v_matrix"], atol=1e-12)
+    assert np.allclose(actual["v_matrix"], expected["v_matrix"], atol=1e-12)
+
+
+def test_gossip_isolated_phase_numpy_fast_path_matches_oracle(model_module):
+    system, v0, s0, l0, observed = _make_isolated_gossip_fixture(
+        model_module,
+        use_numpy_fast_path=True,
+        eq9_averaging_mode="all_agents",
+    )
+    eta_v_t = 0.2
+    active_actor_ids = [1, 2]
+    active_participant_ids = [0, 1, 3]
+
+    expected = gossip_phase_oracle(
+        v_before=v0,
+        s_before=s0,
+        highest_rep_before=l0,
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        delta=0.0,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode="participants_only_post_eq9",
+    )
+
+    actual = system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode="participants_only_post_eq9",
+    )
+
+    assert actual["gossip_target_ids"] == expected["gossip_target_ids"]
+    assert actual["eq9_averaging_mode"] == "all_agents"
+    assert actual["leader_update_mode"] == "participants_only_post_eq9"
+    assert actual["averaging_agent_ids"] == [0, 1, 2, 3]
+    assert actual["leader_update_agent_ids"] == active_participant_ids
+    assert actual["avg_s_by_target"] == pytest.approx(expected["avg_s_by_target"], abs=1e-12)
+    assert np.allclose(actual["delta_v_matrix"], expected["delta_v_matrix"], atol=1e-12)
+    assert np.allclose(actual["v_matrix"], expected["v_matrix"], atol=1e-12)
+    assert np.allclose(actual["s_matrix"], expected["s_matrix"], atol=1e-12)
+    assert np.array_equal(actual["highest_rep_agent_estimates"], expected["highest_rep_agent_estimates"])
+
+
+def test_gossip_isolated_phase_python_path_matches_oracle_participants_only(model_module):
+    system, v0, s0, l0, observed = _make_isolated_gossip_fixture(
+        model_module,
+        use_numpy_fast_path=False,
+        eq9_averaging_mode="participants_only",
+    )
+    eta_v_t = 0.2
+    active_actor_ids = [1, 2]
+    active_participant_ids = [0, 1, 3]
+
+    expected = gossip_phase_oracle(
+        v_before=v0,
+        s_before=s0,
+        highest_rep_before=l0,
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        delta=0.0,
+        eq9_averaging_mode="participants_only",
+        leader_update_mode="participants_only_post_eq9",
+    )
+
+    actual = system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="participants_only",
+        leader_update_mode="participants_only_post_eq9",
+    )
+
+    assert actual["eq9_averaging_mode"] == "participants_only"
+    assert actual["leader_update_mode"] == "participants_only_post_eq9"
+    assert actual["averaging_agent_ids"] == active_participant_ids
+    assert actual["leader_update_agent_ids"] == active_participant_ids
+    assert actual["avg_s_by_target"] == pytest.approx(expected["avg_s_by_target"], abs=1e-12)
+    assert np.allclose(actual["v_matrix"], expected["v_matrix"], atol=1e-12)
+    assert np.allclose(actual["s_matrix"], expected["s_matrix"], atol=1e-12)
+    assert np.array_equal(actual["highest_rep_agent_estimates"], expected["highest_rep_agent_estimates"])
+
+
+def test_gossip_isolated_phase_fast_and_python_paths_match(model_module):
+    active_actor_ids = [1, 2]
+    active_participant_ids = [0, 1, 3]
+    eta_v_t = 0.2
+
+    slow_system, _, _, _, observed = _make_isolated_gossip_fixture(
+        model_module,
+        use_numpy_fast_path=False,
+        eq9_averaging_mode="all_agents",
+    )
+    fast_system, _, _, _, _ = _make_isolated_gossip_fixture(
+        model_module,
+        use_numpy_fast_path=True,
+        eq9_averaging_mode="all_agents",
+    )
+
+    slow_after = slow_system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+    )
+    fast_after = fast_system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+    )
+
+    assert slow_after["gossip_target_ids"] == fast_after["gossip_target_ids"]
+    assert slow_after["avg_s_by_target"] == pytest.approx(fast_after["avg_s_by_target"], abs=1e-12)
+    assert np.allclose(slow_after["delta_v_matrix"], fast_after["delta_v_matrix"], atol=1e-12)
+    assert np.allclose(slow_after["v_matrix"], fast_after["v_matrix"], atol=1e-12)
+    assert np.allclose(slow_after["s_matrix"], fast_after["s_matrix"], atol=1e-12)
+    assert np.array_equal(
+        slow_after["highest_rep_agent_estimates"],
+        fast_after["highest_rep_agent_estimates"],
+    )
+
+
+def test_gossip_isolated_phase_fast_and_python_paths_match_participants_only(model_module):
+    active_actor_ids = [1, 2]
+    active_participant_ids = [0, 1, 3]
+    eta_v_t = 0.2
+
+    slow_system, _, _, _, observed = _make_isolated_gossip_fixture(
+        model_module,
+        use_numpy_fast_path=False,
+        eq9_averaging_mode="participants_only",
+    )
+    fast_system, _, _, _, _ = _make_isolated_gossip_fixture(
+        model_module,
+        use_numpy_fast_path=True,
+        eq9_averaging_mode="participants_only",
+    )
+
+    slow_after = slow_system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="participants_only",
+    )
+    fast_after = fast_system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="participants_only",
+    )
+
+    assert slow_after["eq9_averaging_mode"] == "participants_only"
+    assert fast_after["eq9_averaging_mode"] == "participants_only"
+    assert slow_after["avg_s_by_target"] == pytest.approx(fast_after["avg_s_by_target"], abs=1e-12)
+    assert np.allclose(slow_after["delta_v_matrix"], fast_after["delta_v_matrix"], atol=1e-12)
+    assert np.allclose(slow_after["v_matrix"], fast_after["v_matrix"], atol=1e-12)
+    assert np.allclose(slow_after["s_matrix"], fast_after["s_matrix"], atol=1e-12)
+    assert np.array_equal(slow_after["highest_rep_agent_estimates"], fast_after["highest_rep_agent_estimates"])
+
+
+@pytest.mark.parametrize(
+    "leader_update_mode",
+    ["participants_only_post_eq9", "all_agents_post_eq9", "participants_only_pre_eq9"],
+)
+def test_gossip_isolated_phase_leader_update_modes_match_oracle_in_both_paths(model_module, leader_update_mode):
+    active_actor_ids = [1, 2]
+    active_participant_ids = [0, 1, 3]
+    eta_v_t = 0.2
+
+    expected_system, v0, s0, l0, observed = _make_isolated_gossip_fixture(
+        model_module,
+        use_numpy_fast_path=False,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode=leader_update_mode,
+    )
+    expected = gossip_phase_oracle(
+        v_before=v0,
+        s_before=s0,
+        highest_rep_before=l0,
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        delta=0.0,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode=leader_update_mode,
+    )
+
+    slow_after = expected_system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode=leader_update_mode,
+    )
+    fast_system, _, _, _, _ = _make_isolated_gossip_fixture(
+        model_module,
+        use_numpy_fast_path=True,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode=leader_update_mode,
+    )
+    fast_after = fast_system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=active_actor_ids,
+        active_participant_ids=active_participant_ids,
+        eta_v_t=eta_v_t,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode=leader_update_mode,
+    )
+
+    assert slow_after["leader_update_mode"] == leader_update_mode
+    assert fast_after["leader_update_mode"] == leader_update_mode
+    assert slow_after["leader_update_agent_ids"] == expected["leader_update_agent_ids"]
+    assert fast_after["leader_update_agent_ids"] == expected["leader_update_agent_ids"]
+    assert np.allclose(slow_after["v_matrix"], expected["v_matrix"], atol=1e-12)
+    assert np.allclose(fast_after["v_matrix"], expected["v_matrix"], atol=1e-12)
+    assert np.allclose(slow_after["s_matrix"], expected["s_matrix"], atol=1e-12)
+    assert np.allclose(fast_after["s_matrix"], expected["s_matrix"], atol=1e-12)
+    assert np.array_equal(slow_after["highest_rep_agent_estimates"], expected["highest_rep_agent_estimates"])
+    assert np.array_equal(fast_after["highest_rep_agent_estimates"], expected["highest_rep_agent_estimates"])
+
+
+def test_gossip_isolated_phase_updates_l_only_for_active_participants(model_module):
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(use_numpy_fast_path=True, delta=0.0, eq9_averaging_mode="all_agents"),
+    )
+    v0 = np.zeros((3, 3), dtype=float)
+    s0 = np.array(
+        [
+            [0.0, 0.9, 0.2],
+            [0.1, 0.0, 0.95],
+            [0.8, 0.3, 0.0],
+        ],
+        dtype=float,
+    )
+    l0 = np.array([1, 2, 1], dtype=int)
+    observed = np.array(
+        [
+            [0.0, 0.1, 2.0],
+            [0.0, 0.1, 2.2],
+            [0.0, 0.1, 2.4],
+        ],
+        dtype=float,
+    )
+    set_reputation_learning_state(
+        system,
+        personal_benefit_matrix=v0,
+        reputation_matrix=s0,
+        highest_rep_agent_estimates=l0,
+    )
+
+    before = get_reputation_learning_snapshot(system)
+    after = system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=[2],
+        active_participant_ids=[0, 1],
+        eta_v_t=1.0,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+    )
+
+    # Active participant 0 updates L_i(t+1) from the post-update reputation row.
+    # B(t) is built from the *pre-update* highest-reputation targets of active participants,
+    # so participant 1 brings target 2 into scope for participant 0.
+    assert int(after["highest_rep_agent_estimates"][0]) == 2
+    # Active participant 1 is allowed to refresh its estimate too.
+    assert int(after["highest_rep_agent_estimates"][1]) in {0, 2}
+    # Inactive participants keep their previous estimate.
+    assert int(after["highest_rep_agent_estimates"][2]) == int(before["highest_rep_agent_estimates"][2])
+
+
+def test_gossip_isolated_phase_all_agents_post_eq9_updates_l_for_all_agents(model_module):
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(
+            use_numpy_fast_path=True,
+            delta=0.0,
+            eq9_averaging_mode="all_agents",
+            leader_update_mode="all_agents_post_eq9",
+        ),
+    )
+    v0 = np.zeros((3, 3), dtype=float)
+    s0 = np.array(
+        [
+            [0.0, 0.9, 0.2],
+            [0.1, 0.0, 0.95],
+            [0.8, 0.3, 0.0],
+        ],
+        dtype=float,
+    )
+    l0 = np.array([1, 2, 1], dtype=int)
+    observed = np.array(
+        [
+            [0.0, 0.1, 2.0],
+            [0.0, 0.1, 2.2],
+            [0.0, 0.1, 2.4],
+        ],
+        dtype=float,
+    )
+    set_reputation_learning_state(
+        system,
+        personal_benefit_matrix=v0,
+        reputation_matrix=s0,
+        highest_rep_agent_estimates=l0,
+    )
+
+    after = system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=[2],
+        active_participant_ids=[0, 1],
+        eta_v_t=1.0,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode="all_agents_post_eq9",
+    )
+
+    assert after["leader_update_mode"] == "all_agents_post_eq9"
+    assert after["leader_update_agent_ids"] == [0, 1, 2]
+    assert int(after["highest_rep_agent_estimates"][0]) == 2
+    assert int(after["highest_rep_agent_estimates"][1]) in {0, 2}
+    # Inactive agent 2 is refreshed under the all-agents mode and no longer keeps the stale value 1.
+    assert int(after["highest_rep_agent_estimates"][2]) in {0, 1}
+    assert int(after["highest_rep_agent_estimates"][2]) != int(l0[2])
+
+
+def test_gossip_isolated_phase_pre_eq9_uses_preupdate_reputation_row(model_module):
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(
+            use_numpy_fast_path=True,
+            delta=0.0,
+            eq9_averaging_mode="all_agents",
+            leader_update_mode="participants_only_pre_eq9",
+        ),
+    )
+    v0 = np.zeros((3, 3), dtype=float)
+    s0 = np.array(
+        [
+            [0.0, 0.9, 0.2],
+            [0.1, 0.0, 0.95],
+            [0.8, 0.3, 0.0],
+        ],
+        dtype=float,
+    )
+    l0 = np.array([1, 2, 1], dtype=int)
+    observed = np.array(
+        [
+            [0.0, 0.1, 2.0],
+            [0.0, 0.1, 2.2],
+            [0.0, 0.1, 2.4],
+        ],
+        dtype=float,
+    )
+    set_reputation_learning_state(
+        system,
+        personal_benefit_matrix=v0,
+        reputation_matrix=s0,
+        highest_rep_agent_estimates=l0,
+    )
+
+    after = system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=[2],
+        active_participant_ids=[0, 1],
+        eta_v_t=1.0,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode="participants_only_pre_eq9",
+    )
+
+    assert after["leader_update_mode"] == "participants_only_pre_eq9"
+    assert after["leader_update_agent_ids"] == [0, 1]
+    # Participant 0 would switch to target 2 under post-update selection, but pre-update timing keeps target 1.
+    assert int(after["highest_rep_agent_estimates"][0]) == 1
+    assert int(after["highest_rep_agent_estimates"][2]) == int(l0[2])
+
+
+def test_gossip_isolated_phase_builds_b_from_previous_l_without_same_step_leak(model_module):
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(
+            use_numpy_fast_path=True,
+            delta=0.0,
+            eq9_averaging_mode="all_agents",
+            leader_update_mode="participants_only_post_eq9",
+        ),
+    )
+    v0 = np.zeros((3, 3), dtype=float)
+    s0 = np.array(
+        [
+            [0.0, 0.8, 0.1],
+            [0.3, 0.0, 0.2],
+            [0.4, 0.3, 0.0],
+        ],
+        dtype=float,
+    )
+    l0 = np.array([1, 0, 0], dtype=int)
+    observed = np.array(
+        [
+            [0.0, 0.0, 3.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 3.0],
+        ],
+        dtype=float,
+    )
+    set_reputation_learning_state(
+        system,
+        personal_benefit_matrix=v0,
+        reputation_matrix=s0,
+        highest_rep_agent_estimates=l0,
+    )
+
+    after = system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=[2],
+        active_participant_ids=[0],
+        eta_v_t=1.0,
+        update_actor_rates=False,
+        identify_highest_rep=True,
+        eq9_averaging_mode="all_agents",
+        leader_update_mode="participants_only_post_eq9",
+    )
+
+    # B(t) comes from the previous L_i(t) of active participants, so only target 1 is updated this step.
+    assert after["gossip_target_ids"] == [1]
+    # The newly selected target is allowed to change after Eq. (9), but it must not retroactively enter the same-step gossip scope.
+    assert int(after["highest_rep_agent_estimates"][0]) in {1, 2}
+
+
+def test_gossip_isolated_phase_current_averaging_uses_active_participants_only(model_module):
+    system = make_system(
+        model_module,
+        num_agents=4,
+        extra_config=dict(use_numpy_fast_path=True, delta=0.0, eq9_averaging_mode="participants_only"),
+    )
+    v0 = np.zeros((4, 4), dtype=float)
+    s0 = np.array(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [0.0, 100.0, 0.0, 0.0],
+            [0.0, 200.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    l0 = np.array([1, 1, 1, 1], dtype=int)
+    observed = np.zeros((4, 4), dtype=float)
+    set_reputation_learning_state(
+        system,
+        personal_benefit_matrix=v0,
+        reputation_matrix=s0,
+        highest_rep_agent_estimates=l0,
+    )
+
+    after = system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=[],
+        active_participant_ids=[0, 1],
+        eta_v_t=0.0,
+        update_actor_rates=False,
+        identify_highest_rep=False,
+        eq9_averaging_mode="participants_only",
+    )
+
+    # If only active participants are averaged, target-1 mean is (1 + 3) / 2 = 2.
+    assert after["eq9_averaging_mode"] == "participants_only"
+    assert after["avg_s_by_target"] == pytest.approx({1: 2.0}, abs=1e-12)
+    assert after["s_matrix"][0, 1] == pytest.approx(2.0, abs=1e-12)
+    assert after["s_matrix"][1, 1] == pytest.approx(2.0, abs=1e-12)
+    # Inactive agents are not updated and their large values do not enter the mean.
+    assert after["s_matrix"][2, 1] == pytest.approx(100.0, abs=1e-12)
+    assert after["s_matrix"][3, 1] == pytest.approx(200.0, abs=1e-12)
+
+
+def test_gossip_isolated_phase_paper_literal_averaging_uses_all_agents(model_module):
+    system = make_system(
+        model_module,
+        num_agents=4,
+        extra_config=dict(use_numpy_fast_path=True, delta=0.0, eq9_averaging_mode="all_agents"),
+    )
+    v0 = np.zeros((4, 4), dtype=float)
+    s0 = np.array(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [0.0, 100.0, 0.0, 0.0],
+            [0.0, 200.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    l0 = np.array([1, 1, 1, 1], dtype=int)
+    observed = np.zeros((4, 4), dtype=float)
+    set_reputation_learning_state(
+        system,
+        personal_benefit_matrix=v0,
+        reputation_matrix=s0,
+        highest_rep_agent_estimates=l0,
+    )
+
+    after = system.run_isolated_reputation_learning_phase(
+        observed_utility_matrix=observed,
+        active_actor_ids=[],
+        active_participant_ids=[0, 1],
+        eta_v_t=0.0,
+        update_actor_rates=False,
+        identify_highest_rep=False,
+        eq9_averaging_mode="all_agents",
+    )
+
+    # Paper-literal all-agent averaging uses all four rows: (1 + 3 + 100 + 200) / 4 = 76.
+    assert after["eq9_averaging_mode"] == "all_agents"
+    assert after["averaging_agent_ids"] == [0, 1, 2, 3]
+    assert after["avg_s_by_target"] == pytest.approx({1: 76.0}, abs=1e-12)
+    assert after["s_matrix"][0, 1] == pytest.approx(76.0, abs=1e-12)
+    assert after["s_matrix"][1, 1] == pytest.approx(76.0, abs=1e-12)
+    assert after["s_matrix"][2, 1] == pytest.approx(100.0, abs=1e-12)
+    assert after["s_matrix"][3, 1] == pytest.approx(200.0, abs=1e-12)
+
+
+def test_gossip_isolated_toy_case_converges_to_unique_target(model_module):
+    system = make_system(
+        model_module,
+        num_agents=3,
+        extra_config=dict(use_numpy_fast_path=True, delta=0.0, eq9_averaging_mode="all_agents"),
+    )
+    v0 = np.zeros((3, 3), dtype=float)
+    s0 = np.zeros((3, 3), dtype=float)
+    l0 = np.array([1, 1, 1], dtype=int)
+    set_reputation_learning_state(
+        system,
+        personal_benefit_matrix=v0,
+        reputation_matrix=s0,
+        highest_rep_agent_estimates=l0,
+    )
+    observed = np.array(
+        [
+            [0.0, 1.8, 0.2],
+            [0.0, 1.6, 0.1],
+            [0.0, 1.7, 0.1],
+        ],
+        dtype=float,
+    )
+
+    for _ in range(5):
+        system.run_isolated_reputation_learning_phase(
+            observed_utility_matrix=observed,
+            active_actor_ids=[1, 2],
+            active_participant_ids=[0, 1, 2],
+            eta_v_t=0.5,
+            update_actor_rates=False,
+            identify_highest_rep=True,
+            eq9_averaging_mode="all_agents",
+        )
+
+    snap = get_reputation_learning_snapshot(system)
+    assert int(snap["highest_rep_agent_estimates"][0]) == 1
+    assert int(snap["highest_rep_agent_estimates"][2]) == 1
+    assert int(snap["highest_rep_agent_estimates"][1]) in {0, 2}
+    assert snap["s_matrix"][0, 1] > snap["s_matrix"][0, 2]
+    assert snap["s_matrix"][2, 1] > snap["s_matrix"][2, 0]
+
+
+def test_l_initialization_is_characterized_when_paper_leaves_it_unspecified(model_module):
+    np.random.seed(123)
+    system = make_system(model_module, num_agents=5)
+    highest = [
+        int(agent.state.highest_rep_agent_estimate)
+        for agent in system.agents
+    ]
+    assert all(0 <= estimate < 5 for estimate in highest)
 
 
 # ==================== ROLE SWITCHING ====================
@@ -539,6 +1367,9 @@ def test_role_4_no_self_following_after_redirect(model_module):
     agent_1.state.role = model_module.AgentRole.REPUTATION
     agent_1.state.following = 0
     agent_1.state.followers = set()
+    agent_1.state.estimated_reward_pu = 0.0
+    agent_1.state.reputation_estimates = {0: 1.0, 2: 0.0}
+    agent_1.state.highest_rep_agent_estimate = 0
 
     system._update_roles_sequential()
 
@@ -1372,7 +2203,7 @@ def test_reputation_follower_select_action_uses_leader_behavior_weights(model_mo
 
 
 
-def test_fast_path_phase4_updates_reputation_and_highest_rep_agent(model_module):
+def test_fast_path_phase4_updates_only_paper_gossip_scope_and_highest_rep_agent(model_module):
     np.random.seed(0)
     config = model_module.SystemConfig(
         num_agents=3,
@@ -1399,6 +2230,12 @@ def test_fast_path_phase4_updates_reputation_and_highest_rep_agent(model_module)
     active_participant_ids = np.array([0, 1, 2], dtype=int)
     eta_v_t = 0.2
 
+    # Paper Section 7.3.3: B(t) is built from the active participants' current
+    # highest-reputation targets. Here all participants target agent 1, so only
+    # column 1 should be gossip-updated.
+    for agent in system.agents:
+        agent.state.highest_rep_agent_estimate = 1
+
     system._phase4_updates_numpy_fast(
         observed_utility_matrix=observed_utility_matrix,
         active_actor_ids=active_actor_ids,
@@ -1409,20 +2246,24 @@ def test_fast_path_phase4_updates_reputation_and_highest_rep_agent(model_module)
     # v update: only target 0 is active, with observer-specific utilities [10, 6, 2]
     assert np.allclose(system._v_matrix[:, 0], np.array([2.0, 1.2, 0.4]))
 
-    # average old s for each target:
-    # k=0: mean(0,0,0)=0
-    # k=1: mean(1,5,9)=5
-    # k=2: mean(2,8,4)=14/3
-    #
-    # then add each observer's own delta_v(:,0), giving distinct rows:
+    # Only column 1 is inside B(t), so only that column is updated.
+    # Its mean is mean(1,5,9)=5 and delta_v(:,1)=0 because actor 1 was inactive.
     expected_rows = np.array([
-        [2.0, 5.0, 14.0 / 3.0],
-        [1.2, 5.0, 14.0 / 3.0],
-        [0.4, 5.0, 14.0 / 3.0],
+        [0.0, 5.0, 2.0],
+        [0.0, 5.0, 8.0],
+        [0.0, 5.0, 4.0],
     ])
     assert np.allclose(system._s_matrix, expected_rows)
 
-    # highest reputation agent should be target 1 for agent 0 (self excluded)
-    # because among non-self entries for row [2,5,14/3]:
-    # agent 0 excludes k=0, so compares 5 vs 14/3 -> highest is 1
+    # Agent 0 should still identify target 1 as highest after the scoped update.
     assert system.agents[0].state.highest_rep_agent_estimate == 1
+
+
+def test_system_builds_paper_gossip_scope_from_active_participants(model_module):
+    system = make_system(model_module, num_agents=4)
+    for agent_id, target in {0: 2, 1: 2, 2: 3, 3: None}.items():
+        system.agents[agent_id].state.highest_rep_agent_estimate = target
+
+    b_t = system._compute_gossip_target_ids_from_active_participants([0, 1, 2, 3])
+
+    assert b_t == [2, 3]
