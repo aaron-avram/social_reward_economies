@@ -1,3 +1,21 @@
+"""
+Phase-3 status scaling harness (Experiment C family).
+
+This runner performs kappa sweeps with gamma fixed, collects
+per-run metrics, aggregates across seeds, and writes plots/CSVs.
+
+Example:
+    python3 experiments/status_scaling.py \
+      --mode static \
+      --gamma 5 \
+      --kappas "0,0.01,0.02,0.05,0.1" \
+      --num-agents 100 \
+      --num-states 5 \
+      --num-actions 3 \
+      --num-steps 50000 \
+      --seeds 20
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -7,19 +25,20 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import sys
-from typing import Dict, List, Sequence, Tuple, Optional
+from typing import Dict, List, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+import itertools
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.code_debugged import MultiAgentSystem, SystemConfig, AgentRole  # noqa: E402
+from src.code_debugged import MultiAgentSystem, SystemConfig  # noqa: E402
 
 
 @dataclass
@@ -30,22 +49,21 @@ class RunRecord:
     seed: int
     leader_id: int
     final_top_followers: int
-    mean_tail_top_followers: float
     time_to_90pct_followers: int
     leader_switches: int
     tail_welfare: float
+    leader_role_final: str
+    leader_is_status_final: int
     final_status_count: int
-    mean_tail_status_count: float
-    max_status_count: int
-    leader_is_status_at_end: int
-    final_pu_count: int
-    final_rep_count: int
-    final_norm_detected: int
-    mean_tail_norm_detected: float
-    final_norm_mean_consensus: float
-    mean_tail_norm_mean_consensus: float
-    min_tail_state_consensus: float
+    tail_status_leader_share: float
+    tail_status_agent_share: float
 
+    final_norm: str
+    best_norm: str
+    final_norm_welfare_check: float
+    best_norm_welfare: float
+    welfare_gap_to_best: float
+    is_final_norm_optimal: int
 
 @dataclass
 class AggregateRecord:
@@ -53,96 +71,95 @@ class AggregateRecord:
     gamma: float
     kappa: float
     n_runs: int
-
     mean_final_top_followers: float
     std_final_top_followers: float
     ci95_final_top_followers: float
-
-    mean_mean_tail_top_followers: float
-    std_mean_tail_top_followers: float
-    ci95_mean_tail_top_followers: float
-
     mean_time_to_90pct_followers: float
     std_time_to_90pct_followers: float
     ci95_time_to_90pct_followers: float
-
     mean_leader_switches: float
     std_leader_switches: float
     ci95_leader_switches: float
-
     mean_tail_welfare: float
     std_tail_welfare: float
     ci95_tail_welfare: float
-
+    mean_leader_is_status_final: float
+    std_leader_is_status_final: float
+    ci95_leader_is_status_final: float
     mean_final_status_count: float
     std_final_status_count: float
     ci95_final_status_count: float
+    mean_tail_status_leader_share: float
+    std_tail_status_leader_share: float
+    ci95_tail_status_leader_share: float
+    mean_tail_status_agent_share: float
+    std_tail_status_agent_share: float
+    ci95_tail_status_agent_share: float
+    
+    mean_final_norm_welfare_check: float
+    std_final_norm_welfare_check: float
+    ci95_final_norm_welfare_check: float
+    mean_best_norm_welfare: float
+    std_best_norm_welfare: float
+    ci95_best_norm_welfare: float
+    mean_welfare_gap_to_best: float
+    std_welfare_gap_to_best: float
+    ci95_welfare_gap_to_best: float
+    mean_is_final_norm_optimal: float
+    std_is_final_norm_optimal: float
+    ci95_is_final_norm_optimal: float
 
-    mean_mean_tail_status_count: float
-    std_mean_tail_status_count: float
-    ci95_mean_tail_status_count: float
 
-    mean_max_status_count: float
-    std_max_status_count: float
-    ci95_max_status_count: float
-
-    mean_leader_is_status_at_end: float
-    std_leader_is_status_at_end: float
-    ci95_leader_is_status_at_end: float
-
-    mean_final_pu_count: float
-    std_final_pu_count: float
-    ci95_final_pu_count: float
-
-    mean_final_rep_count: float
-    std_final_rep_count: float
-    ci95_final_rep_count: float
-
-    mean_final_norm_detected: float
-    std_final_norm_detected: float
-    ci95_final_norm_detected: float
-
-    mean_mean_tail_norm_detected: float
-    std_mean_tail_norm_detected: float
-    ci95_mean_tail_norm_detected: float
-
-    mean_final_norm_mean_consensus: float
-    std_final_norm_mean_consensus: float
-    ci95_final_norm_mean_consensus: float
-
-    mean_mean_tail_norm_mean_consensus: float
-    std_mean_tail_norm_mean_consensus: float
-    ci95_mean_tail_norm_mean_consensus: float
-
-    mean_min_tail_state_consensus: float
-    std_min_tail_state_consensus: float
-    ci95_min_tail_state_consensus: float
+@dataclass
+class SeedComparisonRecord:
+    mode: str
+    gamma: float
+    seed: int
+    kappa: float
+    leader_id: int
+    leader_role_final: str
+    final_top_followers: int
+    tail_welfare: float
+    final_norm: str
+    final_norm_welfare_check: float
+    best_norm: str
+    best_norm_welfare: float
+    welfare_gap_to_best: float
+    is_final_norm_optimal: int
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Status scaling kappa sweep harness (Experiment C family)."
-    )
-
+    parser = argparse.ArgumentParser(description="Status scaling kappa sweep harness.")
     parser.add_argument("--mode", choices=["static", "async"], required=True)
     parser.add_argument("--gamma", type=float, default=5.0)
-    parser.add_argument("--kappas", type=str, default="0,0.05,0.1,0.2,0.5,1")
-
+    parser.add_argument("--kappas", type=str, default="0,0.01,0.02,0.05,0.1")
     parser.add_argument("--num-agents", type=int, default=100)
     parser.add_argument("--num-states", type=int, default=3)
     parser.add_argument("--num-actions", type=int, default=2)
     parser.add_argument("--num-steps", type=int, default=10000)
-
     parser.add_argument("--seeds", type=int, default=20, help="Number of seeds to run.")
     parser.add_argument("--seed-start", type=int, default=0, help="First seed (inclusive).")
-
     parser.add_argument(
-        "--output-dir",
+        "--selected-seeds",
         type=str,
-        default=str(Path(__file__).resolve().parent / "outputs"),
+        default="",
+        help="Optional explicit comma-separated seed list (e.g. \"2,7,9\"). Overrides --seeds/--seed-start.",
     )
+    parser.add_argument("--delta", type=float, default=0.15)
+    parser.add_argument(
+        "--actor-rate-driver-mode",
+        choices=["standard", "status_if_followers_kappa0"],
+        default="standard",
+        help="Actor-rate driver mode for Eq. (13): paper-faithful standard or experimental status override at kappa=0.",
+    )
+    parser.add_argument(
+        "--actor-rate-status-override-min-followers",
+        type=int,
+        default=10,
+        help="Follower-count threshold for the experimental status-driven actor-rate override.",
+    )
+    parser.add_argument("--output-dir", type=str, default=str(Path(__file__).resolve().parent / "outputs"))
     parser.add_argument("--tail-window", type=int, default=500)
-
     parser.add_argument(
         "--role-update-s0",
         type=int,
@@ -153,18 +170,16 @@ def parse_args() -> argparse.Namespace:
         "--role-update-T-seq",
         type=str,
         default="",
-        help=(
-            "Paper notation interval sequence T_n as comma-separated positive ints "
-            '(e.g., "2000,3000,6000"); epochs are s_n = s_(n-1)+T_n. '
-            "In async mode this is used as each agent's local interval progression."
-        ),
+        help="Paper notation interval sequence T_n as comma-separated positive ints "
+             "(e.g., \"2000,3000,6000\"); epochs are s_n = s_{n-1}+T_n. "
+             "In async mode this is used as each agent's local interval progression.",
     )
     parser.add_argument("--role-update-base-interval", type=int, default=3000)
     parser.add_argument(
         "--fixed-role-update-interval",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use constant role-update epochs T_n = const when enabled.",
+        help="Use constant role-update epochs T_n = const (Section 7.1.4) when enabled.",
     )
     parser.add_argument(
         "--plot-sample-interval",
@@ -176,13 +191,18 @@ def parse_args() -> argparse.Namespace:
         "--role-update-epochs",
         type=str,
         default="",
-        help='Optional direct role-update epochs s_n as comma-separated positive ints (e.g., "2000,3000,6000").',
+        help="Optional direct role-update epochs s_n as comma-separated positive ints "
+             "(e.g., \"2000,3000,6000\"). Used when role_update_T_seq is empty.",
     )
-
     parser.add_argument("--tracking-mode", choices=["full", "light"], default="light")
+    parser.add_argument(
+        "--force-all-active-debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Debug override: force all agents to be active as both actors and participants every step.",
+    )
     parser.add_argument("--initial-actor-rate", type=float, default=0.2)
     parser.add_argument("--initial-participant-rate", type=float, default=0.2)
-
     parser.add_argument(
         "--reward-model",
         choices=[
@@ -199,64 +219,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-agent-sigma", type=float, default=0.1)
     parser.add_argument("--reward-clip-min", type=float, default=0.01)
     parser.add_argument("--reward-clip-max", type=float, default=2.5)
-    parser.add_argument("--reward-good-value", type=float, default=1.0)
-    parser.add_argument("--reward-bad-value", type=float, default=0.1)
-    parser.add_argument("--reward-order-gap", type=float, default=0.02)
-    parser.add_argument("--reward-consensus-high", type=float, default=0.85)
-    parser.add_argument("--reward-consensus-low", type=float, default=0.65)
-    parser.add_argument("--reward-welfare-high", type=float, default=0.82)
-    parser.add_argument("--reward-welfare-low", type=float, default=0.60)
-    parser.add_argument("--reward-lambda-min", type=float, default=0.55)
-    parser.add_argument("--reward-lambda-max", type=float, default=0.85)
-
+    parser.add_argument(
+        "--eq9-averaging-mode",
+        choices=["participants_only", "all_agents"],
+        default="participants_only",
+        help="Eq. (9) observed-reputation averaging set.",
+    )
+    parser.add_argument(
+        "--leader-update-mode",
+        choices=["participants_only_post_eq9", "all_agents_post_eq9", "participants_only_pre_eq9"],
+        default="participants_only_post_eq9",
+        help="Section 6.4.4 timing/scope for updating L_i(t+1).",
+    )
     parser.add_argument(
         "--numpy-fast-path",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable/disable vectorized reputation updates in code_debugged.",
     )
-
-    parser.add_argument(
-        "--c-threshold",
-        type=float,
-        default=0.1,
-        help="Status-entry follower threshold c in |F_i| >= cN.",
-    )
-    parser.add_argument(
-        "--B-R",
-        dest="B_R",
-        type=float,
-        default=0.3,
-        help="Reputation start-follow threshold.",
-    )
-    parser.add_argument(
-        "--B-F",
-        dest="B_F",
-        type=float,
-        default=1000000.0,
-        help="Reputation continue-follow threshold. Large default effectively disables hysteresis.",
-    )
-
     parser.add_argument(
         "--async-role-update-prob",
         type=float,
         default=None,
-        help="Optional per-step Bernoulli probability for role updates in async mode.",
+        help="Optional per-step Bernoulli probability for role updates in async mode. "
+             "If omitted, async uses independent per-agent clocks driven by "
+             "role_update_T_seq/role_update_epochs (or role_update_base_interval as fallback).",
     )
-
-    parser.add_argument(
-        "--role-update-diagnostics",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Write lightweight role-update-only diagnostics for convergence/fragmentation analysis.",
-    )
-
+    parser.add_argument("--c-threshold", type=float, default=0.1)
+    parser.add_argument("--B-R", dest="B_R", type=float, default=0.8)
+    parser.add_argument("--B-F", dest="B_F", type=float, default=0.6)
     return parser.parse_args()
 
 
 def parse_kappas(kappa_text: str) -> List[float]:
     parts = [p.strip() for p in kappa_text.split(",") if p.strip()]
     return [float(x) for x in parts]
+
+
+def parse_selected_seeds(seed_text: str) -> List[int]:
+    if not seed_text.strip():
+        return []
+    parts = [p.strip() for p in seed_text.split(",") if p.strip()]
+    seeds = [int(x) for x in parts]
+    return sorted(set(seed for seed in seeds if seed >= 0))
 
 
 def parse_role_update_epochs(epoch_text: str) -> List[int]:
@@ -300,12 +305,24 @@ def _build_async_interval_sequence(args: argparse.Namespace) -> Tuple[List[int],
     return [max(1, int(args.role_update_base_interval))], s0, "base_interval"
 
 
-def make_config(args: argparse.Namespace, gamma: float, kappa: float, mode: str) -> SystemConfig:
+def resolve_seeds(args: argparse.Namespace) -> List[int]:
+    selected = parse_selected_seeds(getattr(args, "selected_seeds", ""))
+    if selected:
+        return selected
+    return list(range(int(args.seed_start), int(args.seed_start) + int(args.seeds)))
+
+
+def make_config(args: argparse.Namespace, kappa: float, mode: str) -> SystemConfig:
     role_interval = args.role_update_base_interval
     role_s0 = int(args.role_update_s0)
     role_t_seq = parse_role_update_T_seq(args.role_update_T_seq)
     role_epochs = parse_role_update_epochs(args.role_update_epochs)
-
+    eq9_averaging_mode = getattr(args, "eq9_averaging_mode", "participants_only")
+    leader_update_mode = getattr(args, "leader_update_mode", "participants_only_post_eq9")
+    actor_rate_driver_mode = getattr(args, "actor_rate_driver_mode", "standard")
+    actor_rate_status_override_min_followers = int(
+        getattr(args, "actor_rate_status_override_min_followers", 10)
+    )
     if mode == "async":
         role_interval = args.num_steps + 1_000_000
         role_s0 = 0
@@ -319,12 +336,16 @@ def make_config(args: argparse.Namespace, gamma: float, kappa: float, mode: str)
         num_time_steps=args.num_steps,
         M=1.0,
         u_0=0.1,
-        gamma=gamma,
+        actor_rate_driver_mode=actor_rate_driver_mode,
+        actor_rate_status_override_min_followers=actor_rate_status_override_min_followers,
+        gamma=args.gamma,
         kappa=kappa,
-        c_threshold=args.c_threshold,
-        B_R=args.B_R,
-        B_F=args.B_F,
-        delta=0.15,
+        c_threshold=0.1,
+        B_R=0.3,
+        B_F=0.2,
+        delta=args.delta,
+        eq9_averaging_mode=eq9_averaging_mode,
+        leader_update_mode=leader_update_mode,
         alpha_pu_base=0.05,
         beta_status_base=0.05,
         eta_v_base=0.1,
@@ -339,6 +360,7 @@ def make_config(args: argparse.Namespace, gamma: float, kappa: float, mode: str)
         gossip_alpha=0.5,
         tracking_mode=args.tracking_mode,
         use_numpy_fast_path=args.numpy_fast_path,
+        force_all_active_debug=getattr(args, "force_all_active_debug", False),
         initial_actor_interaction_rate=args.initial_actor_rate,
         initial_participant_interaction_rate=args.initial_participant_rate,
         reward_model=args.reward_model,
@@ -347,15 +369,6 @@ def make_config(args: argparse.Namespace, gamma: float, kappa: float, mode: str)
         reward_agent_sigma=args.reward_agent_sigma,
         reward_clip_min=args.reward_clip_min,
         reward_clip_max=args.reward_clip_max,
-        reward_good_value=args.reward_good_value,
-        reward_bad_value=args.reward_bad_value,
-        reward_order_gap=args.reward_order_gap,
-        reward_consensus_high=args.reward_consensus_high,
-        reward_consensus_low=args.reward_consensus_low,
-        reward_welfare_high=args.reward_welfare_high,
-        reward_welfare_low=args.reward_welfare_low,
-        reward_lambda_min=args.reward_lambda_min,
-        reward_lambda_max=args.reward_lambda_max,
     )
 
 
@@ -394,185 +407,142 @@ def _time_to_threshold(series: np.ndarray, threshold: int) -> int:
     return int(idx[0] + 1) if idx.size > 0 else -1
 
 
-def _mean_std_ci(values: Sequence[float]) -> Tuple[float, float, float]:
-    arr = np.array(values, dtype=float)
-    n = arr.size
-    mean = float(np.mean(arr))
-    std = float(np.std(arr, ddof=1)) if n > 1 else 0.0
-    ci95 = float(1.96 * std / np.sqrt(n)) if n > 1 else 0.0
-    return mean, std, ci95
+def _role_to_label(role) -> str:
+    if hasattr(role, "value"):
+        return str(role.value).lower()
+    if hasattr(role, "name"):
+        return str(role.name).lower()
+    return str(role).lower()
 
 
-def aggregate(records: Sequence[RunRecord]) -> List[AggregateRecord]:
-    grouped: Dict[Tuple[str, float, float], List[RunRecord]] = {}
-    for rec in records:
-        grouped.setdefault((rec.mode, rec.gamma, rec.kappa), []).append(rec)
+def _tail_status_leader_share(role_history: np.ndarray, leader_series: np.ndarray, tail_window: int) -> float:
+    if role_history.size == 0 or leader_series.size == 0 or tail_window <= 0:
+        return 0.0
+    tail_window = min(tail_window, leader_series.shape[0])
+    start = leader_series.shape[0] - tail_window
+    hits = 0
+    valid = 0
+    for t in range(start, leader_series.shape[0]):
+        leader = int(leader_series[t])
+        if leader >= 0:
+            valid += 1
+            if _role_to_label(role_history[t, leader]) == "status":
+                hits += 1
+    return float(hits / valid) if valid > 0 else 0.0
 
-    rows: List[AggregateRecord] = []
-    for (mode, gamma, kappa), recs in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
-        def vals(name: str) -> List[float]:
-            return [getattr(r, name) for r in recs]
 
-        final_top_vals = vals("final_top_followers")
-        mean_tail_top_vals = vals("mean_tail_top_followers")
-        reached_vals = [v for v in vals("time_to_90pct_followers") if v >= 0]
-        if not reached_vals:
-            reached_vals = [-1.0]
-        switch_vals = vals("leader_switches")
-        welfare_vals = vals("tail_welfare")
-        final_status_vals = vals("final_status_count")
-        mean_tail_status_vals = vals("mean_tail_status_count")
-        max_status_vals = vals("max_status_count")
-        leader_status_vals = vals("leader_is_status_at_end")
-        final_pu_vals = vals("final_pu_count")
-        final_rep_vals = vals("final_rep_count")
-        final_norm_detected_vals = vals("final_norm_detected")
-        mean_tail_norm_detected_vals = vals("mean_tail_norm_detected")
-        final_norm_mean_consensus_vals = vals("final_norm_mean_consensus")
-        mean_tail_norm_mean_consensus_vals = vals("mean_tail_norm_mean_consensus")
-        min_tail_state_consensus_vals = vals("min_tail_state_consensus")
+def _tail_status_agent_share(role_history: np.ndarray, tail_window: int) -> float:
+    if role_history.size == 0 or tail_window <= 0:
+        return 0.0
+    tail_window = min(tail_window, role_history.shape[0])
+    tail = role_history[-tail_window:]
+    tail_labels = np.vectorize(_role_to_label)(tail)
+    return float(np.mean(tail_labels == "status"))
 
-        m1, s1, c1 = _mean_std_ci(final_top_vals)
-        m1b, s1b, c1b = _mean_std_ci(mean_tail_top_vals)
-        m2, s2, c2 = _mean_std_ci(reached_vals)
-        m3, s3, c3 = _mean_std_ci(switch_vals)
-        m4, s4, c4 = _mean_std_ci(welfare_vals)
-        m5, s5, c5 = _mean_std_ci(final_status_vals)
-        m6, s6, c6 = _mean_std_ci(mean_tail_status_vals)
-        m7, s7, c7 = _mean_std_ci(max_status_vals)
-        m8, s8, c8 = _mean_std_ci(leader_status_vals)
-        m9, s9, c9 = _mean_std_ci(final_pu_vals)
-        m10, s10, c10 = _mean_std_ci(final_rep_vals)
-        m11, s11, c11 = _mean_std_ci(final_norm_detected_vals)
-        m12, s12, c12 = _mean_std_ci(mean_tail_norm_detected_vals)
-        m13, s13, c13 = _mean_std_ci(final_norm_mean_consensus_vals)
-        m14, s14, c14 = _mean_std_ci(mean_tail_norm_mean_consensus_vals)
-        m15, s15, c15 = _mean_std_ci(min_tail_state_consensus_vals)
 
-        rows.append(
-            AggregateRecord(
-                mode=mode,
-                gamma=gamma,
-                kappa=kappa,
-                n_runs=len(recs),
-                mean_final_top_followers=m1,
-                std_final_top_followers=s1,
-                ci95_final_top_followers=c1,
-                mean_mean_tail_top_followers=m1b,
-                std_mean_tail_top_followers=s1b,
-                ci95_mean_tail_top_followers=c1b,
-                mean_time_to_90pct_followers=m2,
-                std_time_to_90pct_followers=s2,
-                ci95_time_to_90pct_followers=c2,
-                mean_leader_switches=m3,
-                std_leader_switches=s3,
-                ci95_leader_switches=c3,
-                mean_tail_welfare=m4,
-                std_tail_welfare=s4,
-                ci95_tail_welfare=c4,
-                mean_final_status_count=m5,
-                std_final_status_count=s5,
-                ci95_final_status_count=c5,
-                mean_mean_tail_status_count=m6,
-                std_mean_tail_status_count=s6,
-                ci95_mean_tail_status_count=c6,
-                mean_max_status_count=m7,
-                std_max_status_count=s7,
-                ci95_max_status_count=c7,
-                mean_leader_is_status_at_end=m8,
-                std_leader_is_status_at_end=s8,
-                ci95_leader_is_status_at_end=c8,
-                mean_final_pu_count=m9,
-                std_final_pu_count=s9,
-                ci95_final_pu_count=c9,
-                mean_final_rep_count=m10,
-                std_final_rep_count=s10,
-                ci95_final_rep_count=c10,
-                mean_final_norm_detected=m11,
-                std_final_norm_detected=s11,
-                ci95_final_norm_detected=c11,
-                mean_mean_tail_norm_detected=m12,
-                std_mean_tail_norm_detected=s12,
-                ci95_mean_tail_norm_detected=c12,
-                mean_final_norm_mean_consensus=m13,
-                std_final_norm_mean_consensus=s13,
-                ci95_final_norm_mean_consensus=c13,
-                mean_mean_tail_norm_mean_consensus=m14,
-                std_mean_tail_norm_mean_consensus=s14,
-                ci95_mean_tail_norm_mean_consensus=c14,
-                mean_min_tail_state_consensus=m15,
-                std_min_tail_state_consensus=s15,
-                ci95_min_tail_state_consensus=c15,
-            )
+def _deterministic_norm_welfare(system: MultiAgentSystem, norm_actions: Sequence[int], leader_id: int) -> float:
+    """
+    Evaluate followers-only paper welfare for a deterministic norm:
+    norm_actions[s] is the chosen action in state s.
+    """
+    p_s = np.ones(system.config.num_states, dtype=float) / float(system.config.num_states)
+    total = 0.0
+
+    for i, agent in enumerate(system.agents):
+        if i == int(leader_id):
+            continue
+
+        theta_participant = 1.0 - np.exp(-float(agent.state.participant_interaction_rate))
+
+        U_i = 0.0
+        for s in range(system.config.num_states):
+            action = int(norm_actions[s])
+            u_i_sx = system.compute_observer_utility(i, s, action)
+            U_i += float(p_s[s]) * float(u_i_sx)
+
+        total += theta_participant * U_i
+
+    return float(total)
+
+
+def _leader_greedy_norm(system: MultiAgentSystem, leader_id: int) -> Tuple[int, ...]:
+    """
+    Convert the final leader's role-consistent policy into a deterministic norm
+    by taking argmax action in each state.
+    """
+    leader = system.agents[int(leader_id)]
+    actions = []
+    for s in range(system.config.num_states):
+        pi_s = leader.get_current_policy(s)
+        actions.append(int(np.argmax(pi_s)))
+    return tuple(actions)
+
+
+def _bruteforce_best_norm(system: MultiAgentSystem, leader_id: int) -> Tuple[Tuple[int, ...], float]:
+    """
+    Exhaustively search all deterministic norms.
+    Only feasible for small num_actions ** num_states.
+    """
+    num_states = int(system.config.num_states)
+    num_actions = int(system.config.num_actions)
+
+    total_norms = num_actions ** num_states
+    if total_norms > 50000:
+        raise ValueError(
+            f"Bruteforce norm search too large: {num_actions}^{num_states} = {total_norms}. "
+            "Use only for small state/action spaces."
         )
-    return rows
+
+    best_norm = None
+    best_welfare = -np.inf
+
+    for norm_actions in itertools.product(range(num_actions), repeat=num_states):
+        welfare = _deterministic_norm_welfare(system, norm_actions, leader_id)
+        if welfare > best_welfare:
+            best_welfare = welfare
+            best_norm = tuple(int(x) for x in norm_actions)
+
+    return best_norm, float(best_welfare)
 
 
-def write_csv(path: Path, rows: Sequence[dict]) -> None:
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(rows[0].keys())
-    with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+def _final_norm_optimality_check(system: MultiAgentSystem, leader_id: int) -> Dict[str, object]:
+    """
+    Compare final leader greedy norm to brute-force best deterministic norm.
+    """
+    if leader_id < 0:
+        return {
+            "final_norm": (),
+            "best_norm": (),
+            "final_norm_welfare_check": float("nan"),
+            "best_norm_welfare": float("nan"),
+            "welfare_gap_to_best": float("nan"),
+            "is_final_norm_optimal": 0,
+        }
+    
+    final_norm = _leader_greedy_norm(system, leader_id)
+    final_welfare = _deterministic_norm_welfare(system, final_norm, leader_id)
+    best_norm, best_welfare = _bruteforce_best_norm(system, leader_id)
+
+    gap = float(best_welfare - final_welfare)
+    is_optimal = int(tuple(final_norm) == tuple(best_norm) or np.isclose(gap, 0.0, atol=1e-10, rtol=0.0))
+
+    return {
+        "final_norm": final_norm,
+        "best_norm": best_norm,
+        "final_norm_welfare_check": float(final_welfare),
+        "best_norm_welfare": float(best_welfare),
+        "welfare_gap_to_best": float(gap),
+        "is_final_norm_optimal": int(is_optimal),
+    }
 
 
-def build_static_role_update_times(args: argparse.Namespace, horizon: int) -> List[int]:
-    if args.mode == "async":
-        return []
+def _norm_to_str(norm: Sequence[int]) -> str:
+    return "".join(str(int(x)) for x in norm)
 
-    horizon = max(0, int(horizon))
-    if horizon == 0:
-        return []
-
-    t_seq = parse_role_update_T_seq(args.role_update_T_seq)
-    if t_seq:
-        cursor = max(0, int(args.role_update_s0))
-        epochs = []
-        for interval in t_seq:
-            cursor += int(interval)
-            if 0 < cursor <= horizon:
-                epochs.append(int(cursor))
-        return epochs
-
-    epochs = parse_role_update_epochs(args.role_update_epochs)
-    if epochs:
-        return [int(t) for t in epochs if 0 < int(t) <= horizon]
-
-    if args.fixed_role_update_interval:
-        interval = max(1, int(args.role_update_base_interval))
-        return list(range(interval, horizon + 1, interval))
-
-    out: List[int] = []
-    epoch = 0
-    next_time = max(1, int(args.role_update_base_interval))
-    while next_time <= horizon:
-        out.append(int(next_time))
-        epoch += 1
-        next_interval = max(
-            int(args.role_update_base_interval),
-            int(args.role_update_base_interval * (1.0 + epoch * 0.1)),
-        )
-        next_time += next_interval
-    return out
-
-
-def run_single(
-    args: argparse.Namespace,
-    mode: str,
-    gamma: float,
-    kappa: float,
-    seed: int,
-) -> Tuple[RunRecord, np.ndarray, np.ndarray, np.ndarray, Optional[List[Dict[str, object]]]]:
+def run_single(args: argparse.Namespace, mode: str, kappa: float, seed: int) -> RunRecord:
     np.random.seed(seed)
-    config = make_config(args, gamma=gamma, kappa=kappa, mode=mode)
+    config = make_config(args, kappa=kappa, mode=mode)
     system = MultiAgentSystem(config)
-
-    role_update_diagnostics_enabled = bool(mode == "static" and getattr(args, "role_update_diagnostics", False))
-    if role_update_diagnostics_enabled:
-        system.enable_role_update_diagnostics()
 
     if mode == "async":
         with redirect_stdout(io.StringIO()):
@@ -583,9 +553,12 @@ def run_single(
                 if async_s0 > 0:
                     role_timers = role_timers + async_s0
                 interval_indices = np.zeros(args.num_agents, dtype=int)
+            else:
+                async_update_prob = float(args.async_role_update_prob)
 
-                for _ in range(args.num_steps):
-                    system.step()
+            for _ in range(args.num_steps):
+                system.step()
+                if args.async_role_update_prob is None:
                     role_timers -= 1
                     update_ids = np.where(role_timers <= 0)[0]
                     if update_ids.size > 0:
@@ -593,8 +566,6 @@ def run_single(
                         system._update_roles_sequential(update_list)
                         system.refresh_last_tracked_state()
                         system.results.setdefault("role_update_times", []).append(int(system.time_step))
-                        system.role_update_epoch += 1
-
                         if len(interval_seq) == 1:
                             role_timers[update_ids] += int(interval_seq[0])
                         else:
@@ -604,10 +575,8 @@ def run_single(
                                 role_timers[agent_id] += next_interval
                                 if idx < len(interval_seq) - 1:
                                     interval_indices[agent_id] = idx + 1
-            else:
-                async_update_prob = float(args.async_role_update_prob)
-                for _ in range(args.num_steps):
-                    system.step()
+                        system.role_update_epoch += 1
+                else:
                     update_mask = np.random.random(args.num_agents) < async_update_prob
                     update_ids = np.where(update_mask)[0]
                     if update_ids.size > 0:
@@ -615,7 +584,6 @@ def run_single(
                         system.refresh_last_tracked_state()
                         system.results.setdefault("role_update_times", []).append(int(system.time_step))
                         system.role_update_epoch += 1
-
             results = _finalize_results(system)
     else:
         with redirect_stdout(io.StringIO()):
@@ -623,499 +591,277 @@ def run_single(
                 system.step()
             results = _finalize_results(system)
 
-    follower_counts = np.array(results["follower_counts"], dtype=float)
+    follower_counts = np.asarray(results["follower_counts"], dtype=float)
+    role_history = np.asarray(results.get("role_label_history", []), dtype=object)
+    social_welfare = np.asarray(results.get("paper_welfare_followers_only", []), dtype=float)
+
     top_follower_series = follower_counts.max(axis=1)
     leader_series = _leader_series_from_follower_counts(follower_counts)
-
     threshold_90 = int(np.ceil(0.90 * (args.num_agents - 1)))
     time_to_90 = _time_to_threshold(top_follower_series, threshold_90)
     leader_switches = _leader_switches(leader_series)
 
-    tail_window = min(args.tail_window, len(results["social_welfare"]))
-    tail_welfare = float(np.mean(results["social_welfare"][-tail_window:]))
-    mean_tail_top_followers = float(np.mean(top_follower_series[-tail_window:]))
+    tail_window = min(int(args.tail_window), len(social_welfare)) if len(social_welfare) > 0 else 0
+    tail_welfare = float(np.mean(social_welfare[-tail_window:])) if tail_window > 0 else float("nan")
 
-    status_counts_series = np.array(results.get("status_counts", []), dtype=float)
-    pu_counts_series = np.array(results.get("pu_counts", []), dtype=float)
-    rep_counts_series = np.array(results.get("rep_counts", []), dtype=float)
+    leader_id = int(results["opinion_leader"])
+    final_roles = [_role_to_label(r) for r in results["final_roles"]]
+    leader_role_final = final_roles[leader_id] if leader_id >= 0 else "none"
+    leader_is_status_final = int(leader_role_final == "status")
+    final_status_count = sum(1 for r in final_roles if r == "status")
+    tail_status_leader_share = _tail_status_leader_share(role_history, leader_series, tail_window)
+    tail_status_agent_share = _tail_status_agent_share(role_history, tail_window)
 
-    norm_detected_series = np.array(results.get("norm_detected_history", []), dtype=float)
-    norm_mean_consensus_series = np.array(results.get("norm_mean_consensus_history", []), dtype=float)
-    norm_state_consensus_history = np.array(results.get("norm_state_consensus_history", []), dtype=float)
+    try:
+        optimality = _final_norm_optimality_check(system, leader_id)
+    except ValueError:
+        optimality = {
+            "final_norm": (),
+            "best_norm": (),
+            "final_norm_welfare_check": float("nan"),
+            "best_norm_welfare": float("nan"),
+            "welfare_gap_to_best": float("nan"),
+            "is_final_norm_optimal": -1,
+        }
 
-    if norm_detected_series.size > 0:
-        final_norm_detected = int(norm_detected_series[-1])
-        mean_tail_norm_detected = float(np.mean(norm_detected_series[-tail_window:]))
-    else:
-        final_norm_detected = 0
-        mean_tail_norm_detected = 0.0
-
-    if norm_mean_consensus_series.size > 0:
-        final_norm_mean_consensus = float(norm_mean_consensus_series[-1])
-        mean_tail_norm_mean_consensus = float(np.mean(norm_mean_consensus_series[-tail_window:]))
-    else:
-        final_norm_mean_consensus = 0.0
-        mean_tail_norm_mean_consensus = 0.0
-
-    if norm_state_consensus_history.size > 0:
-        tail_state_consensus = norm_state_consensus_history[-tail_window:]
-        min_tail_state_consensus = float(np.min(np.mean(tail_state_consensus, axis=0)))
-    else:
-        min_tail_state_consensus = 0.0
-
-    if status_counts_series.size > 0:
-        final_status_count = int(status_counts_series[-1])
-        mean_tail_status_count = float(np.mean(status_counts_series[-tail_window:]))
-        max_status_count = int(np.max(status_counts_series))
-    else:
-        final_status_count = 0
-        mean_tail_status_count = 0.0
-        max_status_count = 0
-
-    final_pu_count = int(pu_counts_series[-1]) if pu_counts_series.size > 0 else 0
-    final_rep_count = int(rep_counts_series[-1]) if rep_counts_series.size > 0 else 0
-
-    leader_is_status_at_end = 0
-    if results["opinion_leader"] >= 0:
-        leader_role = system.agents[results["opinion_leader"]].state.role
-        leader_is_status_at_end = int(leader_role == AgentRole.STATUS)
-
-    record = RunRecord(
+    return RunRecord(
         mode=mode,
-        gamma=float(gamma),
+        gamma=float(args.gamma),
         kappa=float(kappa),
         seed=int(seed),
-        leader_id=int(results["opinion_leader"]),
+        leader_id=leader_id,
         final_top_followers=int(max(results["final_followers"])),
-        mean_tail_top_followers=mean_tail_top_followers,
-        time_to_90pct_followers=time_to_90,
+        time_to_90pct_followers=int(time_to_90),
         leader_switches=int(leader_switches),
-        tail_welfare=tail_welfare,
-        final_status_count=final_status_count,
-        mean_tail_status_count=mean_tail_status_count,
-        max_status_count=max_status_count,
-        leader_is_status_at_end=leader_is_status_at_end,
-        final_pu_count=final_pu_count,
-        final_rep_count=final_rep_count,
-        final_norm_detected=final_norm_detected,
-        mean_tail_norm_detected=mean_tail_norm_detected,
-        final_norm_mean_consensus=final_norm_mean_consensus,
-        mean_tail_norm_mean_consensus=mean_tail_norm_mean_consensus,
-        min_tail_state_consensus=min_tail_state_consensus,
+        tail_welfare=float(tail_welfare),
+        leader_role_final=str(leader_role_final),
+        leader_is_status_final=int(leader_is_status_final),
+        final_status_count=int(final_status_count),
+        tail_status_leader_share=float(tail_status_leader_share),
+        tail_status_agent_share=float(tail_status_agent_share),
+
+        final_norm=_norm_to_str(optimality["final_norm"]) if optimality["final_norm"] else "",
+        best_norm=_norm_to_str(optimality["best_norm"]) if optimality["best_norm"] else "",
+        final_norm_welfare_check=float(optimality["final_norm_welfare_check"]),
+        best_norm_welfare=float(optimality["best_norm_welfare"]),
+        welfare_gap_to_best=float(optimality["welfare_gap_to_best"]),
+        is_final_norm_optimal=int(optimality["is_final_norm_optimal"]),
     )
 
-    role_update_diagnostics = system.get_role_update_diagnostic_rows() if role_update_diagnostics_enabled else None
-    return record, top_follower_series, status_counts_series, norm_mean_consensus_series, role_update_diagnostics
+
+def _mean_std_ci(values: Sequence[float]) -> Tuple[float, float, float]:
+    arr = np.asarray(list(values), dtype=float)
+    if arr.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    mean = float(np.mean(arr))
+    std = float(np.std(arr, ddof=1)) if arr.size >= 2 else 0.0
+    ci95 = float(1.96 * std / np.sqrt(arr.size)) if arr.size >= 2 else 0.0
+    return mean, std, ci95
 
 
-def summarize_role_update_diagnostics(
-    output_csv: Path,
-    rows: Sequence[Dict[str, object]],
-    mode: str,
-    gamma: float,
-    kappa: float,
-    seed: int,
-) -> None:
+def aggregate(records: Sequence[RunRecord]) -> List[AggregateRecord]:
+    grouped: Dict[Tuple[str, float, float], List[RunRecord]] = {}
+    for r in records:
+        grouped.setdefault((r.mode, r.gamma, r.kappa), []).append(r)
+
+    rows: List[AggregateRecord] = []
+    for (mode, gamma, kappa), recs in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
+        m1, s1, c1 = _mean_std_ci([r.final_top_followers for r in recs])
+        m2, s2, c2 = _mean_std_ci([r.time_to_90pct_followers for r in recs if r.time_to_90pct_followers >= 0])
+        m3, s3, c3 = _mean_std_ci([r.leader_switches for r in recs])
+        m4, s4, c4 = _mean_std_ci([r.tail_welfare for r in recs])
+        m5, s5, c5 = _mean_std_ci([r.leader_is_status_final for r in recs])
+        m6, s6, c6 = _mean_std_ci([r.final_status_count for r in recs])
+        m7, s7, c7 = _mean_std_ci([r.tail_status_leader_share for r in recs])
+        m8, s8, c8 = _mean_std_ci([r.tail_status_agent_share for r in recs])
+
+        
+        m9, s9, c9 = _mean_std_ci([r.final_norm_welfare_check for r in recs if np.isfinite(r.final_norm_welfare_check)])
+        m10, s10, c10 = _mean_std_ci([r.best_norm_welfare for r in recs if np.isfinite(r.best_norm_welfare)])
+        m11, s11, c11 = _mean_std_ci([r.welfare_gap_to_best for r in recs if np.isfinite(r.welfare_gap_to_best)])
+        m12, s12, c12 = _mean_std_ci([r.is_final_norm_optimal for r in recs if r.is_final_norm_optimal >= 0])
+        rows.append(
+            AggregateRecord(
+                mode=mode,
+                gamma=float(gamma),
+                kappa=float(kappa),
+                n_runs=len(recs),
+                mean_final_top_followers=m1,
+                std_final_top_followers=s1,
+                ci95_final_top_followers=c1,
+                mean_time_to_90pct_followers=m2,
+                std_time_to_90pct_followers=s2,
+                ci95_time_to_90pct_followers=c2,
+                mean_leader_switches=m3,
+                std_leader_switches=s3,
+                ci95_leader_switches=c3,
+                mean_tail_welfare=m4,
+                std_tail_welfare=s4,
+                ci95_tail_welfare=c4,
+                mean_leader_is_status_final=m5,
+                std_leader_is_status_final=s5,
+                ci95_leader_is_status_final=c5,
+                mean_final_status_count=m6,
+                std_final_status_count=s6,
+                ci95_final_status_count=c6,
+                mean_tail_status_leader_share=m7,
+                std_tail_status_leader_share=s7,
+                ci95_tail_status_leader_share=c7,
+                mean_tail_status_agent_share=m8,
+                std_tail_status_agent_share=s8,
+                ci95_tail_status_agent_share=c8,
+                
+                mean_final_norm_welfare_check=m9,
+                std_final_norm_welfare_check=s9,
+                ci95_final_norm_welfare_check=c9,
+                mean_best_norm_welfare=m10,
+                std_best_norm_welfare=s10,
+                ci95_best_norm_welfare=c10,
+                mean_welfare_gap_to_best=m11,
+                std_welfare_gap_to_best=s11,
+                ci95_welfare_gap_to_best=c11,
+                mean_is_final_norm_optimal=m12,
+                std_is_final_norm_optimal=s12,
+                ci95_is_final_norm_optimal=c12,
+            )
+        )
+    return rows
+
+
+def build_seed_comparison(records: Sequence[RunRecord]) -> List[SeedComparisonRecord]:
+    rows: List[SeedComparisonRecord] = []
+    for r in sorted(records, key=lambda x: (x.mode, x.gamma, x.seed, x.kappa)):
+        rows.append(
+            SeedComparisonRecord(
+                mode=r.mode,
+                gamma=r.gamma,
+                seed=r.seed,
+                kappa=r.kappa,
+                leader_id=r.leader_id,
+                leader_role_final=r.leader_role_final,
+                final_top_followers=r.final_top_followers,
+                tail_welfare=r.tail_welfare,
+                final_norm=r.final_norm,
+                final_norm_welfare_check=r.final_norm_welfare_check,
+                best_norm=r.best_norm,
+                best_norm_welfare=r.best_norm_welfare,
+                welfare_gap_to_best=r.welfare_gap_to_best,
+                is_final_norm_optimal=r.is_final_norm_optimal,
+            )
+        )
+    return rows
+
+
+def write_csv(path: Path, rows: Sequence[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         return
-
-    tagged_rows = []
-    for row in rows:
-        tagged = dict(row)
-        tagged["mode"] = mode
-        tagged["gamma"] = float(gamma)
-        tagged["kappa"] = float(kappa)
-        tagged["seed"] = int(seed)
-        tagged_rows.append(tagged)
-
-    existing_rows: List[dict] = []
-    if output_csv.exists():
-        with output_csv.open("r", newline="") as f:
-            reader = csv.DictReader(f)
-            existing_rows = list(reader)
-
-    existing_rows.extend(tagged_rows)
-    write_csv(output_csv, existing_rows)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def plot_top_followers_curve(
-    mode: str,
-    gamma: float,
-    aggregate_rows: Sequence[AggregateRecord],
-    output_file: Path,
-) -> None:
-    rows = sorted(aggregate_rows, key=lambda r: r.kappa)
-    kappas = np.array([r.kappa for r in rows], dtype=float)
-    means = np.array([r.mean_final_top_followers for r in rows], dtype=float)
-    cis = np.array([r.ci95_final_top_followers for r in rows], dtype=float)
-
-    plt.figure(figsize=(7.5, 4.5))
-    plt.errorbar(kappas, means, yerr=cis, fmt="-o", capsize=4, linewidth=1.8)
-    plt.title(f"Final Top Followers vs Kappa ({mode}, gamma={gamma:g})", fontsize=12, fontweight="bold")
+def plot_metric(aggregate_rows: Sequence[AggregateRecord], field: str, ylabel: str, output_file: Path) -> None:
+    kappas = np.array([r.kappa for r in aggregate_rows], dtype=float)
+    means = np.array([getattr(r, field) for r in aggregate_rows], dtype=float)
+    plt.figure(figsize=(6.4, 4.2))
+    plt.plot(kappas, means, "-o", linewidth=1.8)
     plt.xlabel("kappa")
-    plt.ylabel("Final top followers")
-    plt.grid(True, alpha=0.3)
+    plt.ylabel(ylabel)
+    plt.grid(alpha=0.25)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig(output_file, dpi=140, bbox_inches="tight")
-    plt.close()
-
-
-def plot_status_curve(
-    mode: str,
-    gamma: float,
-    aggregate_rows: Sequence[AggregateRecord],
-    output_file: Path,
-) -> None:
-    rows = sorted(aggregate_rows, key=lambda r: r.kappa)
-    kappas = np.array([r.kappa for r in rows], dtype=float)
-    means = np.array([r.mean_mean_tail_status_count for r in rows], dtype=float)
-    cis = np.array([r.ci95_mean_tail_status_count for r in rows], dtype=float)
-
-    plt.figure(figsize=(7.5, 4.5))
-    plt.errorbar(kappas, means, yerr=cis, fmt="-o", capsize=4, linewidth=1.8)
-    plt.title(f"Mean Tail Status Count vs Kappa ({mode}, gamma={gamma:g})", fontsize=12, fontweight="bold")
-    plt.xlabel("kappa")
-    plt.ylabel("Mean tail status count")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=140, bbox_inches="tight")
-    plt.close()
-
-
-def plot_welfare_curve(
-    mode: str,
-    gamma: float,
-    aggregate_rows: Sequence[AggregateRecord],
-    output_file: Path,
-) -> None:
-    rows = sorted(aggregate_rows, key=lambda r: r.kappa)
-    kappas = np.array([r.kappa for r in rows], dtype=float)
-    means = np.array([r.mean_tail_welfare for r in rows], dtype=float)
-    cis = np.array([r.ci95_tail_welfare for r in rows], dtype=float)
-
-    plt.figure(figsize=(7.5, 4.5))
-    plt.errorbar(kappas, means, yerr=cis, fmt="-o", capsize=4, linewidth=1.8)
-    plt.title(f"Tail Welfare vs Kappa ({mode}, gamma={gamma:g})", fontsize=12, fontweight="bold")
-    plt.xlabel("kappa")
-    plt.ylabel("Tail welfare")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=140, bbox_inches="tight")
-    plt.close()
-
-
-def plot_norm_curve(
-    mode: str,
-    gamma: float,
-    aggregate_rows: Sequence[AggregateRecord],
-    output_file: Path,
-) -> None:
-    rows = sorted(aggregate_rows, key=lambda r: r.kappa)
-    kappas = np.array([r.kappa for r in rows], dtype=float)
-    means = np.array([r.mean_mean_tail_norm_mean_consensus for r in rows], dtype=float)
-    cis = np.array([r.ci95_mean_tail_norm_mean_consensus for r in rows], dtype=float)
-
-    plt.figure(figsize=(7.5, 4.5))
-    plt.errorbar(kappas, means, yerr=cis, fmt="-o", capsize=4, linewidth=1.8)
-    plt.title(f"Tail Norm Consensus vs Kappa ({mode}, gamma={gamma:g})", fontsize=12, fontweight="bold")
-    plt.xlabel("kappa")
-    plt.ylabel("Mean tail norm consensus")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=140, bbox_inches="tight")
-    plt.close()
-
-
-def plot_progression_examples(
-    mode: str,
-    gamma: float,
-    kappas: Sequence[float],
-    top_series_by_kappa: Dict[float, List[np.ndarray]],
-    status_series_by_kappa: Dict[float, List[np.ndarray]],
-    norm_series_by_kappa: Dict[float, List[np.ndarray]],
-    output_file: Path,
-    sample_interval: int,
-    role_update_times: Sequence[int],
-) -> None:
-    n = len(kappas)
-    cols = 3 if n >= 3 else n
-    rows = int(np.ceil(n / cols))
-
-    fig, axes = plt.subplots(rows, cols, figsize=(5.0 * cols, 3.8 * rows), squeeze=False)
-
-    for idx, kappa in enumerate(kappas):
-        r, c = divmod(idx, cols)
-        ax = axes[r][c]
-
-        top_stack = np.stack(top_series_by_kappa[kappa], axis=0)
-        top_mean = np.mean(top_stack, axis=0)
-
-        if status_series_by_kappa[kappa]:
-            min_len_status = min(len(s) for s in status_series_by_kappa[kappa])
-            status_stack = np.stack([s[:min_len_status] for s in status_series_by_kappa[kappa]], axis=0)
-            status_mean = np.mean(status_stack, axis=0)
-        else:
-            status_mean = np.zeros_like(top_mean)
-
-        if norm_series_by_kappa[kappa]:
-            min_len_norm = min(len(s) for s in norm_series_by_kappa[kappa])
-            norm_stack = np.stack([s[:min_len_norm] for s in norm_series_by_kappa[kappa]], axis=0)
-            norm_mean = np.mean(norm_stack, axis=0)
-        else:
-            norm_mean = np.zeros_like(top_mean)
-
-        T = min(len(top_mean), len(status_mean), len(norm_mean))
-        x = np.arange(1, T + 1)
-        top_mean = top_mean[:T]
-        status_mean = status_mean[:T]
-        norm_mean = norm_mean[:T]
-
-        if sample_interval > 1:
-            sample_mask = (x % sample_interval) == 0
-            if not np.any(sample_mask):
-                sample_mask[-1] = True
-            x = x[sample_mask]
-            top_mean = top_mean[sample_mask]
-            status_mean = status_mean[sample_mask]
-            norm_mean = norm_mean[sample_mask]
-
-        ax.plot(x, top_mean, linewidth=1.8, label="top followers")
-        ax.plot(x, status_mean, linewidth=1.8, label="status count")
-        ax.plot(x, norm_mean, linewidth=1.8, label="norm consensus")
-
-        for idx_line, step in enumerate(role_update_times):
-            ax.axvline(
-                int(step),
-                color="gray",
-                linestyle="--",
-                linewidth=0.8,
-                alpha=0.18,
-                label="Role update" if idx == 0 and idx_line == 0 else None,
-            )
-
-        ax.set_title(f"kappa={kappa:g}")
-        ax.set_xlabel("Timestep")
-        ax.set_ylabel("Count / consensus")
-        ax.grid(True, alpha=0.3)
-
-    for idx in range(n, rows * cols):
-        rr, cc = divmod(idx, cols)
-        axes[rr][cc].axis("off")
-
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False)
-    fig.suptitle(f"Status Scaling Progression ({mode}, gamma={gamma:g})", fontsize=12, fontweight="bold", y=0.995)
-    plt.tight_layout(rect=(0, 0, 1, 0.96))
-    plt.savefig(output_file, dpi=150, bbox_inches="tight")
+    plt.savefig(output_file, dpi=180)
     plt.close()
 
 
 def main() -> None:
     args = parse_args()
-    kappas = parse_kappas(args.kappas)
-    seeds = list(range(args.seed_start, args.seed_start + args.seeds))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("#" * 72, flush=True)
-    print("Status Scaling Run", flush=True)
-    print(f"mode={args.mode}", flush=True)
-    print(f"gamma={args.gamma}", flush=True)
-    print(f"kappas={kappas}", flush=True)
-    print(f"num_agents={args.num_agents}, num_states={args.num_states}, num_actions={args.num_actions}", flush=True)
-    print(f"num_steps={args.num_steps}, seeds={len(seeds)} ({seeds[0]}..{seeds[-1]})", flush=True)
-    print(
-        f"role_update_base_interval={args.role_update_base_interval}, "
-        f"fixed_role_update_interval={args.fixed_role_update_interval}",
-        flush=True,
-    )
-    print(
-        f"initial_rates=(actor={args.initial_actor_rate}, participant={args.initial_participant_rate})",
-        flush=True,
-    )
+    kappas = parse_kappas(args.kappas)
+    seeds = resolve_seeds(args)
 
-    if args.reward_model == "shared_base_gaussian":
-        print(
-            "reward_model=shared_base_gaussian "
-            f"(base_mu={args.reward_base_mu}, base_sigma={args.reward_base_sigma}, "
-            f"agent_sigma={args.reward_agent_sigma}, clip=[{args.reward_clip_min},{args.reward_clip_max}])",
-            flush=True,
-        )
-    elif args.reward_model == "shared_good_bad_heterogeneous":
-        print(
-            "reward_model=shared_good_bad_heterogeneous "
-            f"(good={args.reward_good_value}, bad={args.reward_bad_value}, "
-            f"order_gap={args.reward_order_gap}, agent_sigma={args.reward_agent_sigma}, "
-            f"clip=[{args.reward_clip_min},{args.reward_clip_max}])",
-            flush=True,
-        )
-    elif args.reward_model == "consensus_welfare_gaussian":
-        print(
-            "reward_model=consensus_welfare_gaussian "
-            f"(consensus_high={args.reward_consensus_high}, "
-            f"consensus_low={args.reward_consensus_low}, "
-            f"welfare_high={args.reward_welfare_high}, "
-            f"welfare_low={args.reward_welfare_low}, "
-            f"lambda_range=[{args.reward_lambda_min},{args.reward_lambda_max}], "
-            f"agent_sigma={args.reward_agent_sigma}, "
-            f"clip=[{args.reward_clip_min},{args.reward_clip_max}])",
-            flush=True,
-        )
-    else:
-        print("reward_model=simple_preferred_action", flush=True)
-
-    print(f"plot_sample_interval={args.plot_sample_interval}", flush=True)
-    print(f"tracking_mode={args.tracking_mode}, numpy_fast_path={args.numpy_fast_path}", flush=True)
-    print(f"c_threshold={args.c_threshold}", flush=True)
-    print(f"B_R={args.B_R}, B_F={args.B_F}", flush=True)
-
-    if args.mode == "async":
-        if args.async_role_update_prob is None:
-            async_t_seq, async_s0, async_src = _build_async_interval_sequence(args)
-            print(
-                f"async_mode=independent_agent_clocks(source={async_src}, s0={async_s0}, "
-                f"T_n={async_t_seq}, random_phase_in=[1,{int(async_t_seq[0])}], activity_coupled=False)",
-                flush=True,
-            )
-        else:
-            print(
-                f"async_mode=bernoulli_per_agent(p={float(args.async_role_update_prob):.6f})",
-                flush=True,
-            )
-
-    print("#" * 72, flush=True)
-
-    all_records: List[RunRecord] = []
-    top_series_by_kappa: Dict[float, List[np.ndarray]] = {k: [] for k in kappas}
-    status_series_by_kappa: Dict[float, List[np.ndarray]] = {k: [] for k in kappas}
-    norm_series_by_kappa: Dict[float, List[np.ndarray]] = {k: [] for k in kappas}
-
-    role_update_times = build_static_role_update_times(args, horizon=int(args.num_steps))
-    total_jobs = len(kappas) * len(seeds)
-    job = 0
-
-    runs_csv = output_dir / f"status_scaling_runs_{args.mode}_g{args.gamma:g}.csv"
-    agg_csv = output_dir / f"status_scaling_aggregate_{args.mode}_g{args.gamma:g}.csv"
-    role_diag_csv = output_dir / f"status_scaling_role_update_diagnostics_{args.mode}_g{args.gamma:g}.csv"
-
-    top_png = output_dir / f"status_scaling_top_followers_{args.mode}_g{args.gamma:g}.png"
-    status_png = output_dir / f"status_scaling_status_counts_{args.mode}_g{args.gamma:g}.png"
-    welfare_png = output_dir / f"status_scaling_tail_welfare_{args.mode}_g{args.gamma:g}.png"
-    norm_png = output_dir / f"status_scaling_norm_consensus_{args.mode}_g{args.gamma:g}.png"
-    prog_png = output_dir / f"status_scaling_progression_{args.mode}_g{args.gamma:g}.png"
-
+    run_records: List[RunRecord] = []
     for kappa in kappas:
         for seed in seeds:
-            job += 1
+            record = run_single(args, mode=args.mode, kappa=kappa, seed=seed)
+            run_records.append(record)
+            
             print(
-                f"[{job:03d}/{total_jobs:03d}] mode={args.mode} gamma={args.gamma:g} "
-                f"kappa={kappa:g} seed={seed}",
-                flush=True,
+                f"[done] mode={record.mode} gamma={record.gamma:g} kappa={record.kappa:g} seed={record.seed} "
+                f"leader={record.leader_id} top_followers={record.final_top_followers} "
+                f"leader_role={record.leader_role_final} n_status={record.final_status_count} "
+                f"tail_welfare={record.tail_welfare:.4f} "
+                f"optimal={record.is_final_norm_optimal} gap={record.welfare_gap_to_best:.6f}"
             )
 
-            rec, top_series, status_series, norm_series, role_diag_rows = run_single(
-                args=args,
-                mode=args.mode,
-                gamma=args.gamma,
-                kappa=kappa,
-                seed=seed,
-            )
+    aggregate_rows = aggregate(run_records)
+    seed_comparison_rows = build_seed_comparison(run_records)
 
-            all_records.append(rec)
-            top_series_by_kappa[kappa].append(top_series)
-            status_series_by_kappa[kappa].append(status_series)
-            norm_series_by_kappa[kappa].append(norm_series)
+    run_csv = output_dir / f"status_scaling_runs_{args.mode}.csv"
+    agg_csv = output_dir / f"status_scaling_aggregate_{args.mode}.csv"
+    seed_cmp_csv = output_dir / f"status_scaling_seed_comparison_{args.mode}.csv"
+    write_csv(run_csv, [asdict(r) for r in run_records])
+    write_csv(agg_csv, [asdict(r) for r in aggregate_rows])
+    write_csv(seed_cmp_csv, [asdict(r) for r in seed_comparison_rows])
 
-            print(
-                "    "
-                f"leader={rec.leader_id}, "
-                f"final_top_followers={rec.final_top_followers}, "
-                f"tail_welfare={rec.tail_welfare:.4f}, "
-                f"final_status_count={rec.final_status_count}, "
-                f"final_norm_detected={rec.final_norm_detected}, "
-                f"final_norm_mean_consensus={rec.final_norm_mean_consensus:.4f}",
-                flush=True,
-            )
+    plot_metric(
+        aggregate_rows,
+        field="mean_final_top_followers",
+        ylabel="Mean final top followers",
+        output_file=output_dir / f"status_scaling_final_top_followers_{args.mode}.png",
+    )
+    plot_metric(
+        aggregate_rows,
+        field="mean_time_to_90pct_followers",
+        ylabel="Mean time to 90% followers",
+        output_file=output_dir / f"status_scaling_time_to_90pct_{args.mode}.png",
+    )
+    plot_metric(
+        aggregate_rows,
+        field="mean_leader_switches",
+        ylabel="Mean leader switches",
+        output_file=output_dir / f"status_scaling_leader_switches_{args.mode}.png",
+    )
+    plot_metric(
+        aggregate_rows,
+        field="mean_tail_welfare",
+        ylabel="Mean tail welfare",
+        output_file=output_dir / f"status_scaling_tail_welfare_{args.mode}.png",
+    )
+    plot_metric(
+        aggregate_rows,
+        field="mean_leader_is_status_final",
+        ylabel="P(final leader is STATUS)",
+        output_file=output_dir / f"status_scaling_leader_is_status_{args.mode}.png",
+    )
+    plot_metric(
+        aggregate_rows,
+        field="mean_final_status_count",
+        ylabel="Mean final status count",
+        output_file=output_dir / f"status_scaling_final_status_count_{args.mode}.png",
+    )
+    plot_metric(
+        aggregate_rows,
+        field="mean_tail_status_leader_share",
+        ylabel="Tail share: top leader in STATUS",
+        output_file=output_dir / f"status_scaling_tail_status_leader_share_{args.mode}.png",
+    )
+    plot_metric(
+        aggregate_rows,
+        field="mean_tail_status_agent_share",
+        ylabel="Tail share: all agents in STATUS",
+        output_file=output_dir / f"status_scaling_tail_status_agent_share_{args.mode}.png",
+    )
 
-            if role_diag_rows:
-                summarize_role_update_diagnostics(
-                    output_csv=role_diag_csv,
-                    rows=role_diag_rows,
-                    mode=args.mode,
-                    gamma=args.gamma,
-                    kappa=kappa,
-                    seed=seed,
-                )
-
-    run_rows = [asdict(r) for r in all_records]
-    write_csv(runs_csv, run_rows)
-
-    agg_rows = aggregate(all_records)
-    agg_dict_rows = [asdict(r) for r in agg_rows]
-    write_csv(agg_csv, agg_dict_rows)
-
-    print("-" * 72, flush=True)
-    print(f"Wrote run-level CSV to: {runs_csv}", flush=True)
-    print(f"Wrote aggregate CSV to: {agg_csv}", flush=True)
-    if role_diag_csv.exists():
-        print(f"Wrote role-update diagnostics CSV to: {role_diag_csv}", flush=True)
-
-    filtered_agg_rows = [
-        r for r in agg_rows
-        if r.mode == args.mode and abs(r.gamma - args.gamma) < 1e-12
-    ]
-
-    if filtered_agg_rows:
-        plot_top_followers_curve(
-            mode=args.mode,
-            gamma=args.gamma,
-            aggregate_rows=filtered_agg_rows,
-            output_file=top_png,
-        )
-        print(f"Wrote top-followers plot to: {top_png}", flush=True)
-
-        plot_status_curve(
-            mode=args.mode,
-            gamma=args.gamma,
-            aggregate_rows=filtered_agg_rows,
-            output_file=status_png,
-        )
-        print(f"Wrote status-count plot to: {status_png}", flush=True)
-
-        plot_welfare_curve(
-            mode=args.mode,
-            gamma=args.gamma,
-            aggregate_rows=filtered_agg_rows,
-            output_file=welfare_png,
-        )
-        print(f"Wrote welfare plot to: {welfare_png}", flush=True)
-
-        plot_norm_curve(
-            mode=args.mode,
-            gamma=args.gamma,
-            aggregate_rows=filtered_agg_rows,
-            output_file=norm_png,
-        )
-        print(f"Wrote norm-consensus plot to: {norm_png}", flush=True)
-
-        plot_progression_examples(
-            mode=args.mode,
-            gamma=args.gamma,
-            kappas=kappas,
-            top_series_by_kappa=top_series_by_kappa,
-            status_series_by_kappa=status_series_by_kappa,
-            norm_series_by_kappa=norm_series_by_kappa,
-            output_file=prog_png,
-            sample_interval=max(1, int(args.plot_sample_interval)),
-            role_update_times=role_update_times,
-        )
-        print(f"Wrote progression plot to: {prog_png}", flush=True)
-
-    print("#" * 72, flush=True)
-    print("Done.", flush=True)
-    print("#" * 72, flush=True)
+    print(f"\nWrote per-run CSV: {run_csv}")
+    print(f"Wrote aggregate CSV: {agg_csv}")
+    print(f"Wrote plots to: {output_dir}")
+    print(f"Wrote seed-comparison CSV: {seed_cmp_csv}")
 
 
 if __name__ == "__main__":
     main()
-           

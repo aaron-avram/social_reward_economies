@@ -80,7 +80,7 @@ class SystemConfig:
     # --- Section 8: Time-Scale Aware Stepsizes (Assumptions 5–8) ---
     # Base stepsizes (will be decayed as 1/t)
     alpha_pu_base: float = 0.05      # Policy gradient for personal utility
-    beta_status_base: float = 0.05   # Policy gradient for status
+    beta_status_base: float = 0.1 #0.05   # Policy gradient for status
     eta_v_base: float = 0.1          # Personal benefit estimates v_i(k,t)
     eta_s_base: float = 0.1          # Reputation estimates s_i(k,t)
     eta_J_base: float = 0.05         # Reward estimate updates
@@ -106,17 +106,17 @@ class SystemConfig:
     reward_model: str = "simple_preferred_action"  # "simple_preferred_action", "shared_base_gaussian", or "shared_good_bad_heterogeneous"
     reward_base_mu: float = 0.5
     reward_base_sigma: float = 0.08
-    reward_agent_sigma: float = 0.1
+    reward_agent_sigma: float = 0.03 #0.1
     reward_clip_min: float = 0.01
     reward_clip_max: float = 2.5
     reward_good_value: float = 1.0
     reward_bad_value: float = 0.1
     reward_order_gap: float = 0.02
 
-    reward_consensus_high: float = 0.85
-    reward_consensus_low: float = 0.65
-    reward_welfare_high: float = 0.82
-    reward_welfare_low: float = 0.60
+    reward_consensus_high: float = 0.95
+    reward_consensus_low: float = 0.45
+    reward_welfare_high: float = 1.05
+    reward_welfare_low: float = 0.35
 
     reward_lambda_min: float = 0.55
     reward_lambda_max: float = 0.85
@@ -557,8 +557,18 @@ class MultiAgentSystem:
             'actor_rates': [],
             'roles_history': [],
             'actual_payoffs': [],
-            'social_welfare': [],
+
+            # Old online metric kept for backward compatibility / runtime diagnostics.
+            # This is NOT the paper welfare.
+            'online_active_actor_payoff_sum': [],
+            'social_welfare': [],  # backward-compatible alias; now stores paper followers-only welfare
+
+            # Paper-faithful welfare metrics
+            'paper_welfare_all_agents': [],
+            'paper_welfare_followers_only': [],
+
             'role_update_times': [],
+
             'estimated_reward_pu_history': [],
             'estimated_reward_rep_history': [],
             'estimated_reward_status_history': [],
@@ -1317,6 +1327,17 @@ class MultiAgentSystem:
 
         followers = [len(a.state.followers) for a in self.agents]
         self.results["follower_counts"][-1] = followers
+        current_leader = self._current_opinion_leader_id()
+        welfare_all = self.compute_paper_welfare_all_agents(leader_id=current_leader)
+        welfare_followers = self.compute_paper_welfare_followers_only(leader_id=current_leader)
+
+        if self.results.get("paper_welfare_all_agents"):
+            self.results["paper_welfare_all_agents"][-1] = float(welfare_all)
+        if self.results.get("paper_welfare_followers_only"):
+            self.results["paper_welfare_followers_only"][-1] = float(welfare_followers)
+        if self.results.get("social_welfare"):
+            self.results["social_welfare"][-1] = float(welfare_followers)
+
         if self.results.get("status_counts"):
             self.results["status_counts"][-1] = sum(
                 1 for a in self.agents if a.state.role == AgentRole.STATUS
@@ -1784,6 +1805,95 @@ class MultiAgentSystem:
         """Return the actor's own realized payoff u_i(s, x_i)."""
         return self.compute_observer_utility(agent_id, state, action)
     
+    def _state_probabilities(self) -> np.ndarray:
+        """
+        Paper uses p(s). In the current simulator, states are sampled uniformly,
+        so we use the uniform distribution unless an explicit state distribution
+        is later added to SystemConfig.
+        """
+        return np.ones(self.config.num_states, dtype=float) / float(self.config.num_states)
+
+    def _get_norm_policy_from_agent(self, leader_id: int, state: int) -> np.ndarray:
+        """
+        Return the common-norm policy π(.|s) induced by the selected opinion leader.
+        This uses the leader's role-consistent current behavior.
+        """
+        leader = self.agents[int(leader_id)]
+        return leader.get_current_policy(state)
+
+    def _current_opinion_leader_id(self) -> int:
+        follower_counts = [len(a.state.followers) for a in self.agents]
+        if len(follower_counts) == 0:
+            return 0
+        return int(np.argmax(follower_counts))
+
+    def compute_paper_welfare_all_agents(self, leader_id: Optional[int] = None) -> float:
+        """
+        Paper-style welfare from Section 2.2.7:
+
+            W_all(π) = Σ_i θ(μ_{p,i}) U_i(π),
+
+        where
+            U_i(π) = Σ_s p(s) Σ_x π(x|s) u_i(s,x).
+
+        Here π is taken to be the current common norm induced by the selected
+        leader's role-consistent policy.
+        """
+        if leader_id is None:
+            leader_id = self._current_opinion_leader_id()
+
+        p_s = self._state_probabilities()
+        total_welfare = 0.0
+
+        for i, agent in enumerate(self.agents):
+            theta_participant = 1.0 - np.exp(-float(agent.state.participant_interaction_rate))
+
+            U_i = 0.0
+            for s in range(self.config.num_states):
+                pi_s = self._get_norm_policy_from_agent(leader_id, s)
+                state_value = 0.0
+                for x in range(self.config.num_actions):
+                    u_i_sx = self.compute_observer_utility(i, s, x)
+                    state_value += float(pi_s[x]) * float(u_i_sx)
+                U_i += float(p_s[s]) * state_value
+
+            total_welfare += theta_participant * U_i
+
+        return float(total_welfare)
+
+    def compute_paper_welfare_followers_only(self, leader_id: Optional[int] = None) -> float:
+        """
+        Paper Definition 5.2 welfare:
+
+            W_followers(π) = Σ_{i != k*} θ(μ_{p,i}) U_i(π),
+
+        where k* is the opinion leader and π is the common norm induced by k*.
+        """
+        if leader_id is None:
+            leader_id = self._current_opinion_leader_id()
+
+        p_s = self._state_probabilities()
+        total_welfare = 0.0
+
+        for i, agent in enumerate(self.agents):
+            if i == int(leader_id):
+                continue
+
+            theta_participant = 1.0 - np.exp(-float(agent.state.participant_interaction_rate))
+
+            U_i = 0.0
+            for s in range(self.config.num_states):
+                pi_s = self._get_norm_policy_from_agent(leader_id, s)
+                state_value = 0.0
+                for x in range(self.config.num_actions):
+                    u_i_sx = self.compute_observer_utility(i, s, x)
+                    state_value += float(pi_s[x]) * float(u_i_sx)
+                U_i += float(p_s[s]) * state_value
+
+            total_welfare += theta_participant * U_i
+
+        return float(total_welfare)
+    
     def step(self):
         """
         Execute one time step following Sections 6–7
@@ -1858,16 +1968,19 @@ class MultiAgentSystem:
             state, action = actions[agent_id]
             payoff = this_step_payoffs[agent_id]
 
-            # [STATUS-1] Keep status-reward estimates current for any agent that currently has
-            # followers. Step-2 role selection compares kappa * J^s_i against J^pu_i,
-            # so J^s_i must be learned even before the agent enters STATUS role.
+            # [STATUS-1 FIXED] Status reward should come from followers' utility for THIS
+            # leader action, not from followers' own actor payoffs.
             social_support_sum = 0.0
             if len(agent.state.followers) > 0:
-                followers_payoffs = [
-                    this_step_payoffs.get(f, 0.0) for f in agent.state.followers
-                    if f in active_participant_ids  # Only active participants provide support
+                follower_supports = [
+                    float(observed_utility_matrix[f, agent_id])
+                    for f in agent.state.followers
+                    # if f in active_participant_ids   # only active participants count as support
                 ]
-                social_support_sum = sum(followers_payoffs)
+                social_support_sum = float(sum(follower_supports))
+
+                # Keep J^s_i current even before the agent formally switches into STATUS,
+                # so Step-2 can compare kappa * J^s_i against J^pu_i.
                 if agent.state.role != AgentRole.STATUS:
                     agent.state.estimated_reward_status += eta_J_t * (
                         social_support_sum - agent.state.estimated_reward_status
@@ -2282,7 +2395,25 @@ class MultiAgentSystem:
         self.results['follower_counts'].append(followers)
         self.results['actor_counts'].append(num_actors)
         self.results['participant_counts'].append(num_participants)
-        self.results['social_welfare'].append(sum(this_step_payoffs.values()))
+
+        current_leader = self._current_opinion_leader_id()
+
+        # Runtime throughput metric: realized self-payoffs of active actors only.
+        # Useful diagnostically, but NOT the paper welfare.
+        online_payoff_sum = float(sum(this_step_payoffs.values()))
+        self.results['online_active_actor_payoff_sum'].append(online_payoff_sum)
+
+        # Paper-faithful welfare metrics.
+        welfare_all = self.compute_paper_welfare_all_agents(leader_id=current_leader)
+        welfare_followers = self.compute_paper_welfare_followers_only(leader_id=current_leader)
+
+        self.results['paper_welfare_all_agents'].append(float(welfare_all))
+        self.results['paper_welfare_followers_only'].append(float(welfare_followers))
+
+        # Backward-compatible alias so old harnesses reading "social_welfare"
+        # now get the paper followers-only welfare instead of active-actor throughput.
+        self.results['social_welfare'].append(float(welfare_followers))
+
         if role_updated:
             self.results['role_update_times'].append(int(self.time_step))
 
@@ -2316,6 +2447,12 @@ class MultiAgentSystem:
             )
 
         collect_compact_histories = (mode == "full") or self._compact_debug_histories_enabled
+
+        # Even in light mode, keep the minimal history needed by Experiment C.
+        self.results['role_label_history'].append(
+            [str(a.state.role.value) for a in self.agents]
+        )
+
         if collect_compact_histories:
             self.results['estimated_reward_pu_history'].append(
                 [float(a.state.estimated_reward_pu) for a in self.agents]
@@ -2328,9 +2465,6 @@ class MultiAgentSystem:
             )
             self.results['actor_interaction_rate_history'].append(
                 [float(a.state.actor_interaction_rate) for a in self.agents]
-            )
-            self.results['role_label_history'].append(
-                [str(a.state.role.value) for a in self.agents]
             )
 
             selected_rep = []
@@ -2488,11 +2622,26 @@ class MultiAgentSystem:
         ax6.grid(True, alpha=0.3)
         
         # 7. Social Welfare
+        # 7. Paper Welfare
         ax7 = fig.add_subplot(gs[2, 1])
-        ax7.plot(self.results['social_welfare'], linewidth=2, color='darkgreen')
-        ax7.set_title('Social Welfare Over Time', fontsize=11, fontweight='bold')
+        if len(self.results.get('paper_welfare_followers_only', [])) > 0:
+            ax7.plot(
+                self.results['paper_welfare_followers_only'],
+                linewidth=2,
+                color='darkgreen',
+                label='Followers-only paper welfare'
+            )
+        if len(self.results.get('paper_welfare_all_agents', [])) > 0:
+            ax7.plot(
+                self.results['paper_welfare_all_agents'],
+                linewidth=1.8,
+                color='steelblue',
+                label='All-agents paper welfare'
+            )
+        ax7.set_title('Paper Welfare Over Time', fontsize=11, fontweight='bold')
         ax7.set_xlabel('Timestep')
-        ax7.set_ylabel('Total Payoff')
+        ax7.set_ylabel('Expected Welfare')
+        ax7.legend(fontsize=8, loc='best')
         ax7.grid(True, alpha=0.3)
         
         # 8. Final Role Distribution
