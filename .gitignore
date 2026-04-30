@@ -13,6 +13,28 @@ __pycache__/
 # Legacy / archived directories
 baseline_debug_reputation_interaction_2026-02-19/
 
+# Paper preprints, LaTeX sources, and transcriptions (not published here)
+doc/*.pdf
+doc/*.tex
+doc/report
+doc/*.txt
+doc/*transcription*
+
+# Agent audit, context, and working notes
+doc/exp_B_exp_D_report_outline.md
+doc/exp_B_exp_D_results.md
+doc/exp_B_exp_D_summary_2026_04_09.md
+doc/exp_d_gamma_sweep_findings.md
+doc/expB_multi_leader_debug_audit.md
+doc/expB_stalled_seed_audit.md
+doc/expB_toy_debug_audit.md
+doc/follow_hysteresis_audit_report.md
+doc/results_figures_plan.md
+
+# Superseded legacy docs
+doc/bug_report_feb20.md
+doc/readme_by_peter.md
+
 # Experiment artifacts
 .coverage
 experiments/outputs/

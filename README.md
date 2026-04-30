@@ -4,6 +4,16 @@ Extends work done in https://github.com/DeathByThermodynamics/orchard-action-mar
 
 ---
 
+## Paper
+
+This repository implements and replicates experiments from the report:
+
+> **Norm Emergence and Rupture in a Simulated Social Reward Economy**
+
+The paper "Learning Common Norms in Multi-Agent Systems", the ROP course final report, and related outputs (figures and tables) are not included in this repository. They are kept out of version control because the manuscript is not yet published and the outputs are a part of coursework submissions.
+
+---
+
 ## Experiment A (Paper §4.1): Personal Utility Baseline
 
 Script: `experiments/pu_scaling.py`
