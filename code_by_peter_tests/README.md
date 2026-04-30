@@ -1,22 +1,26 @@
 # code_by_peter Test Suite
 
-This suite validates bug-report fixes implemented in:
+Validates all bug fixes implemented in `src/code_debugged.py` relative to `src/code_old.py`.
 
-- `/Users/xia/social_reward_economies/src/code_debugged.py`
+## Files
+
+- `test_code_debugged.py` — 187 tests across 5 sections (see below)
+- `_shared.py` — shared module loader used by all tests
 
 ## Coverage
 
-- Active-set sampling via `theta(mu)=1-exp(-mu)` for actors and participants
-- Reputation leader selection excludes self
-- Reputation update follows Eq. (9) additive form (`avg + delta_v`)
-- Step-1 role-switch criterion (no extra `max_rep >= B_i` gate)
-- Bug 1 bootstrap behavior (non-followers can switch based on observed reputation)
-- Bug 5 redirect behavior (avoid indirect follower chains)
-- Bug 4 removal (no extra Phase-5 pairwise gossip pass)
+All 14 bugs documented in `doc/BUGS.md` are covered:
+
+| Section | Bugs covered |
+|---|---|
+| Gossip Oracles and Reputation Learning | REP-1, REP-3, REP-4, REP-5 |
+| Interaction Rates, Status, and Role Switching | IR-1, REP-1, REP-2, REP-4, REP-5, REP-6, REP-7, ROLE-1–5, STATUS-1 |
+| Async Role Switching and Scheduler | ROLE-2, ROLE-3, ROLE-4, REP-6 |
+| Perturbation and Recovery | experiment D harness; config parsing; seed selection |
+| Additional Gossip, Role, and Estimate Tests | REP-1, REP-4, REP-5, ROLE-1–5, STATUS-1 |
 
 ## Run
 
 ```bash
-cd /Users/xia/social_reward_economies
-pytest -q code_by_peter_tests
+pytest -q code_by_peter_tests/
 ```

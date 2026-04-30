@@ -12,6 +12,7 @@ __pycache__/
 
 # Legacy / archived directories
 baseline_debug_reputation_interaction_2026-02-19/
+gossip_test/
 single-reward-economy/model/
 single-reward-economy/personal_utility/
 single-reward-economy/experiments_results/
