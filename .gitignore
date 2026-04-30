@@ -12,6 +12,9 @@ __pycache__/
 
 # Legacy / archived directories
 baseline_debug_reputation_interaction_2026-02-19/
+single-reward-economy/model/
+single-reward-economy/personal_utility/
+single-reward-economy/experiments_results/
 
 # Paper preprints, LaTeX sources, and transcriptions (not published here)
 doc/*.pdf
@@ -37,6 +40,9 @@ doc/readme_by_peter.md
 
 # macOS metadata
 .DS_Store
+
+# One-off debug analysis scripts
+analyze_debug_logs.py
 
 # agent config and planning files
 CLAUDE.md
