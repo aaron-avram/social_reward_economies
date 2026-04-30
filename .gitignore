@@ -35,6 +35,17 @@ doc/results_figures_plan.md
 doc/bug_report_feb20.md
 doc/readme_by_peter.md
 
+# macOS metadata
+.DS_Store
+
+# agent config and planning files
+CLAUDE.md
+.claude/
+experiments/EXPERIMENT_B_REPLICATION_PLAN.md
+experiments/EXPERIMENT_D_REPLICATION_PLAN.md
+single-reward-economy/PLAN_IMPLEMENTATION_SUMMARY.md
+single-reward-economy/norm/norm_audit_report.md
+
 # Experiment artifacts
 .coverage
 experiments/outputs/
