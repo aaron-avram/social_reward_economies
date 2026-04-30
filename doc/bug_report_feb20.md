@@ -1,4 +1,8 @@
-# Bug Report
+# Bug Report (February 2026 — Historical)
+
+> **This is a historical document.** The canonical bug catalog with all 15 bugs,
+> code snippets, and test coverage is in [`doc/BUGS.md`](BUGS.md).
+> This file covers only the first 5 bugs identified (IR-1, REP-1, REP-2, REP-3, ROLE-1–3).
 
 This report summarizes the issues found in the baseline implementation and the corresponding corrections in the debugged implementation.
 

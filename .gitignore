@@ -10,6 +10,9 @@ __pycache__/
 *.npy
 *.npz
 
+# Legacy / archived directories
+baseline_debug_reputation_interaction_2026-02-19/
+
 # Experiment artifacts
 .coverage
 experiments/outputs/
