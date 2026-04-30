@@ -4,6 +4,72 @@ Extends work done in https://github.com/DeathByThermodynamics/orchard-action-mar
 
 ---
 
+## Repository Structure
+
+```
+.
+├── src/
+│   ├── code_debugged.py          # current simulator; all experiments run against this
+│   └── code_old.py               # pre-fix baseline; kept for doc/BUGS.md reference
+├── experiments/                  # experiment runners (A–D) and shared utilities
+├── code_by_peter_tests/          # test suite for code_debugged.py (see Tests below)
+├── doc/
+│   ├── BUGS.md                   # canonical 14-bug report: code_old.py → code_debugged.py
+│   └── approach_by_peter.md      # guide to the code structure for new readers
+└── single-reward-economy/        # legacy reference subtree; not on the active pipeline
+    ├── norm/                     # Alex He-Mo's original implementation with audit comments
+    ├── reputation_tests/         # staged debugging tests for old reputation/gossip logic
+    ├── reputation_toy_experiment/ # minimal sandbox for old γ-scaling and Eq. 12 reasoning
+    └── reputation_scaling/       # earlier simplified Experiment-B-style runner
+```
+
+The following directories are gitignored (local only): `single-reward-economy/model/` (Alex He-Mo's original files, superseded by `norm/`), `single-reward-economy/personal_utility/` (superseded by `experiments/pu_scaling.py`), `single-reward-economy/experiments_results/` (archival outputs), `gossip_test/` (early standalone gossip experiments), and `baseline_debug_reputation_interaction_2026-02-19/` (historical bug tests against `code_old.py`).
+
+---
+
+## Source Code
+
+The active simulator is `src/code_debugged.py` — a single file implementing the full multi-agent model. The two main entry points for callers are `SystemConfig` (a dataclass holding all simulation parameters) and `MultiAgentSystem` (which runs the simulation via repeated calls to `step()`). Detailed in-code annotations will be added separately.
+
+`experiments/experiments.py` is an earlier consolidated runner that invokes all four experiments from a single script. It is superseded by the individual per-experiment scripts but kept for reference.
+
+`experiments/make_final_result_figures.py` is a post-processing script that reads the CSV outputs produced by the experiment runners and generates publication figures.
+
+---
+
+## Experiment Call Stacks
+
+All four experiment scripts share the same call structure:
+
+```
+python3 experiments/<script>.py [args]
+  → main()           # parses args, iterates over parameter grid and seeds
+    → run_single()   # one (parameters, seed) combination
+      → make_config() → SystemConfig
+      → MultiAgentSystem(config)
+      → for t in range(num_steps): system.step()
+      → _finalize_results(system) → metrics dict
+    → writes CSV and plots to --output-dir
+```
+
+Experiment-specific notes:
+
+**Experiment A** (`pu_scaling.py`): γ=0, κ=0. `main()` sweeps `num_states` and `reward_model`.
+
+**Experiment B** (`reputation_scaling.py`): κ=0 fixed; `main()` sweeps γ across seeds.
+
+**Experiment C** (`status_scaling.py`): γ fixed; `main()` sweeps κ across seeds.
+
+**Experiment D** (`perturbation_recovery.py`): γ and κ fixed. `run_single()` runs three sequential phases rather than a single loop: (1) `system.step()` until leader convergence is detected, (2) `apply_force_bad_action_perturbation()` injected each step for `perturb_duration` steps, (3) `system.step()` for `post_window` steps to measure recovery.
+
+---
+
+## Tests
+
+`code_by_peter_tests/` contains 187 tests covering all 14 bugs documented in `doc/BUGS.md`. The suite is kept as a record of the debugging process and as a regression guard against changes to `code_debugged.py`. It is not expected to be extended as the simulator evolves; future development should modify `src/code_debugged.py` directly.
+
+---
+
 ## Paper
 
 This repository implements and replicates experiments from the report:
