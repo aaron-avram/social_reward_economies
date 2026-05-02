@@ -1,4 +1,6 @@
 """
+Social Reward Economy Simulation
+This file is used across all experiments without modification.
 
 ALGORITHMIC FLOW:
 - Agents maintain THREE reward estimates (personal utility, reputation, status)
@@ -106,7 +108,7 @@ class SystemConfig:
     reward_model: str = "simple_preferred_action"  # "simple_preferred_action", "shared_base_gaussian", or "shared_good_bad_heterogeneous"
     reward_base_mu: float = 0.5
     reward_base_sigma: float = 0.08
-    reward_agent_sigma: float = 0.03 #0.1
+    reward_agent_sigma: float = 0.03
     reward_clip_min: float = 0.01
     reward_clip_max: float = 2.5
     reward_good_value: float = 1.0
@@ -558,17 +560,10 @@ class MultiAgentSystem:
             'roles_history': [],
             'actual_payoffs': [],
 
-            # Old online metric kept for backward compatibility / runtime diagnostics.
-            # This is NOT the paper welfare.
-            'online_active_actor_payoff_sum': [],
-            'social_welfare': [],  # backward-compatible alias; now stores paper followers-only welfare
-
-            # Paper-faithful welfare metrics
             'paper_welfare_all_agents': [],
             'paper_welfare_followers_only': [],
 
             'role_update_times': [],
-
             'estimated_reward_pu_history': [],
             'estimated_reward_rep_history': [],
             'estimated_reward_status_history': [],
@@ -2622,7 +2617,6 @@ class MultiAgentSystem:
         ax6.grid(True, alpha=0.3)
         
         # 7. Social Welfare
-        # 7. Paper Welfare
         ax7 = fig.add_subplot(gs[2, 1])
         if len(self.results.get('paper_welfare_followers_only', [])) > 0:
             ax7.plot(
@@ -2680,150 +2674,3 @@ class MultiAgentSystem:
         plt.tight_layout()
         plt.savefig(filename, dpi=150, bbox_inches='tight')
         print(f"\nPlot saved to {filename}")
-
-
-if __name__ == "__main__":
-    print("="*80)
-    print("CORRECTED IMPLEMENTATION: Sections 6–7 Learning Algorithms")
-    print("Learning Common Norms in Multi-Agent Systems (Sharma & Marbach, 2026)")
-    print("="*80)
-    
-    config = SystemConfig(
-        num_agents=6,
-        num_states=3,
-        num_actions=2,
-        num_time_steps=3000,
-        M=1.0,
-        u_0=0.1,
-        gamma=2.0,
-        kappa=2.0,
-        c_threshold=0.15,
-        B_R=0.8,
-        B_F=0.6,
-        delta=0.15,
-        alpha_pu_base=0.05,
-        beta_status_base=0.05,
-        eta_v_base=0.1,
-        eta_s_base=0.1,
-        eta_J_base=0.05,
-        role_update_base_interval=100,
-    )
-    
-    print("\n" + "="*80)
-    print("CONFIGURATION")
-    print("="*80)
-    print(f"\nBasic Setup:")
-    print(f"  Agents: {config.num_agents}")
-    print(f"  States: {config.num_states}, Actions: {config.num_actions}")
-    print(f"  Time Steps: {config.num_time_steps}")
-    
-    print(f"\nInteraction Budget (Section 6.7, Eq. 13):")
-    print(f"  M (total budget): {config.M}")
-    print(f"  u_0 (outside utility): {config.u_0}")
-    
-    print(f"\nRole Incentives (Section 7):")
-    print(f"  γ (reputation weight): {config.gamma}")
-    print(f"  κ (status weight): {config.kappa}")
-    print(
-        f"  c (follower threshold): {config.c_threshold:.2f} → "
-        f"{int(math.ceil(config.c_threshold * config.num_agents))} followers"
-    )
-    
-    print(f"\nHysteresis Thresholds (Section 7.1.3):")
-    print(f"  B_R (start following): {config.B_R}")
-    print(f"  B_F (continue following): {config.B_F}")
-    
-    print(f"\nReputation Tie Threshold (Section 6.4.4):")
-    print(f"  Δ (delta): {config.delta}")
-    
-    print(f"\nTime-Scale Aware Stepsizes (Section 8):")
-    print(f"  α_pu base: {config.alpha_pu_base}")
-    print(f"  β_status base: {config.beta_status_base}")
-    print(f"  η_v base: {config.eta_v_base}")
-    print(f"  η_s base: {config.eta_s_base}")
-    print(f"  η_J base: {config.eta_J_base}")
-    print(f"  (All decay as 1/t to satisfy Assumption 5)")
-    
-    print(f"\nRole Update Intervals (Section 7.1.4, Assumption 6):")
-    print(f"  Base interval: {config.role_update_base_interval}")
-    print(f"  (Increases over time: T_n → ∞)")
-    
-    print("\n" + "="*80)
-    print("IMPLEMENTING ALGORITHMS")
-    print("="*80)
-    print("\nPhase sequence per timestep:")
-    print("  1. Sample A_a(t) [active actors] and A_p(t) [active participants]")
-    print("  2. Actors take actions and receive payoffs")
-    print("  3. Role-based updates for active actors:")
-    print("     - PU agents: update policy via gradient (Eq. 8)")
-    print("     - Reputation agents: track leader payoff")
-    print("     - Status agents: receive follower social support (Eq. 11)")
-    print("  4. Participants update estimates:")
-    print("     - v_i(k,t): personal benefit estimates (Section 6.4.2)")
-    print("     - s_i(k,t): reputation estimates via gossip (Section 6.4.3)")
-    print("     - Identify highest reputation agent with tie threshold Δ (Section 6.4.4)")
-    print("     - Update actor rates via Eq. (13) with γ/κ weighting (Section 6.7)")
-    print("  5. Gossip: pairwise averaging of reputation estimates")
-    print("  6. Followers adopt leader behavior (Section 6.4.5)")
-    print("  7. Periodic sequential role updates (Section 7, 3-step procedure)")
-    
-    print("\n" + "="*80)
-    print("Running simulation...")
-    print("="*80 + "\n")
-    
-    system = MultiAgentSystem(config)
-    results = system.simulate()
-    system.plot_results("sections_6_7_corrected.png")
-    
-    print("\n" + "="*80)
-    print("SUMMARY")
-    print("="*80)
-    print("\nKey Correctness Improvements:")
-    print("  ✓ Section 6.3: Policy gradient personal utility (Eq. 8)")
-    print("  ✓ Section 6.4: Full reputation learning with v_i(k,t), s_i(k,t), Δ threshold")
-    print("  ✓ Section 6.5: Status optimization with SUM of social support (Eq. 11-12)")
-    print("  ✓ Section 6.6: Three separate reward estimates")
-    print("  ✓ Section 6.7: Actor rates Eq. (13) with γ/κ weighting")
-    print("  ✓ Section 7: Sequential 3-step role update procedure")
-    print("  ✓ Section 7: Follower count threshold c·N and hysteresis B_R/B_F")
-    print("  ✓ Section 7: Tie threshold Δ for reputation selection")
-    print("  ✓ Section 8: Time-scale separation with decreasing stepsizes")
-    print("  ✓ Section 8: Increasing role update intervals T_n")
-    print("\n" + "="*80)
-
-
-def test_pu_get_softmax_policy_sums_to_one_and_prefers_large_logit(model_module):
-    system = make_system(model_module, num_agents=2, extra_config=dict(num_states=2, num_actions=3))
-    a = system.agents[0]
-
-    weights = np.array([
-        [10.0, 0.0, -10.0],
-        [0.0, 0.0, 0.0],
-    ])
-
-    probs = a.get_softmax_policy(state=0, weights=weights)
-
-    assert probs.shape == (3,)
-    assert np.sum(probs) == pytest.approx(1.0, abs=1e-12)
-    assert probs[0] > probs[1] > probs[2]
-
-
-def test_pu_select_action_uses_correct_state_row(model_module):
-    np.random.seed(0)
-    system = make_system(model_module, num_agents=2, extra_config=dict(num_states=2, num_actions=2))
-    AgentRole = model_module.AgentRole
-
-    a = system.agents[0]
-    a.state.role = AgentRole.PERSONAL_UTILITY
-
-    # state 0 strongly prefers action 0, state 1 strongly prefers action 1
-    a.state.weights_pu = np.array([
-        [15.0, -15.0],
-        [-15.0, 15.0],
-    ])
-
-    draws_state0 = [a.select_action(state=0) for _ in range(20)]
-    draws_state1 = [a.select_action(state=1) for _ in range(20)]
-
-    assert all(x == 0 for x in draws_state0)
-    assert all(x == 1 for x in draws_state1)

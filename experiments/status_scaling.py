@@ -1,19 +1,17 @@
 """
-Phase-3 status scaling harness (Experiment C family).
+Experiment C: Status Scaling (kappa sweep with fixed gamma)
 
-This runner performs kappa sweeps with gamma fixed, collects
-per-run metrics, aggregates across seeds, and writes plots/CSVs.
+This script runs the main Experiment C in the paper:
+- gamma is fixed (reputation strength)
+- kappa is varied (status incentive strength)
 
-Example:
-    python3 experiments/status_scaling.py \
-      --mode static \
-      --gamma 5 \
-      --kappas "0,0.01,0.02,0.05,0.1" \
-      --num-agents 100 \
-      --num-states 5 \
-      --num-actions 3 \
-      --num-steps 50000 \
-      --seeds 20
+Goals:
+1. Study how status incentives affect leader formation
+2. Measure whether status leads to welfare improvements
+3. Check whether emergent norms are welfare-optimal
+
+This experiment evaluates whether adding status incentives 
+helps or harms collective welfare compared to reputation-only.
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-
+import pandas as pd
 import itertools
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +39,7 @@ if str(ROOT) not in sys.path:
 from src.code_debugged import MultiAgentSystem, SystemConfig  # noqa: E402
 
 
+# Output records
 @dataclass
 class RunRecord:
     mode: str
@@ -128,6 +127,7 @@ class SeedComparisonRecord:
     is_final_norm_optimal: int
 
 
+# Command-line configuration
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Status scaling kappa sweep harness.")
     parser.add_argument("--mode", choices=["static", "async"], required=True)
@@ -251,6 +251,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Small parsing helpers
 def parse_kappas(kappa_text: str) -> List[float]:
     parts = [p.strip() for p in kappa_text.split(",") if p.strip()]
     return [float(x) for x in parts]
@@ -312,6 +313,7 @@ def resolve_seeds(args: argparse.Namespace) -> List[int]:
     return list(range(int(args.seed_start), int(args.seed_start) + int(args.seeds)))
 
 
+# System configuration for Experiment C
 def make_config(args: argparse.Namespace, kappa: float, mode: str) -> SystemConfig:
     role_interval = args.role_update_base_interval
     role_s0 = int(args.role_update_s0)
@@ -372,6 +374,7 @@ def make_config(args: argparse.Namespace, kappa: float, mode: str) -> SystemConf
     )
 
 
+# Result extraction helpers 
 def _finalize_results(system: MultiAgentSystem) -> Dict:
     final_roles = [a.state.role for a in system.agents]
     final_followers = [len(a.state.followers) for a in system.agents]
@@ -539,6 +542,8 @@ def _final_norm_optimality_check(system: MultiAgentSystem, leader_id: int) -> Di
 def _norm_to_str(norm: Sequence[int]) -> str:
     return "".join(str(int(x)) for x in norm)
 
+
+# Single simulation run
 def run_single(args: argparse.Namespace, mode: str, kappa: float, seed: int) -> RunRecord:
     np.random.seed(seed)
     config = make_config(args, kappa=kappa, mode=mode)
@@ -649,6 +654,7 @@ def run_single(args: argparse.Namespace, mode: str, kappa: float, seed: int) -> 
     )
 
 
+# Aggregation and saving
 def _mean_std_ci(values: Sequence[float]) -> Tuple[float, float, float]:
     arr = np.asarray(list(values), dtype=float)
     if arr.size == 0:
@@ -762,6 +768,7 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
         writer.writerows(rows)
 
 
+# Plotting helpers
 def plot_metric(aggregate_rows: Sequence[AggregateRecord], field: str, ylabel: str, output_file: Path) -> None:
     kappas = np.array([r.kappa for r in aggregate_rows], dtype=float)
     means = np.array([getattr(r, field) for r in aggregate_rows], dtype=float)
@@ -774,6 +781,144 @@ def plot_metric(aggregate_rows: Sequence[AggregateRecord], field: str, ylabel: s
     plt.tight_layout()
     plt.savefig(output_file, dpi=180)
     plt.close()
+
+
+def _errorbar_plot(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    yerr: str,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    out_path: Path,
+    ylim=None,
+):
+    plt.figure(figsize=(7, 4.6))
+    plt.errorbar(
+        df[x],
+        df[y],
+        yerr=df[yerr],
+        marker="o",
+        capsize=4,
+        linewidth=1.8,
+    )
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    if ylim is not None:
+        plt.ylim(*ylim)
+    plt.grid(alpha=0.25)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close()
+
+
+def _find_col(df: pd.DataFrame, candidates: list[str]) -> str:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise KeyError(f"Missing column among {candidates}")
+
+
+def generate_expC_report_figures(
+    run_records: Sequence[RunRecord],
+    aggregate_rows: Sequence[AggregateRecord],
+    output_dir: Path,
+) -> None:
+    """
+    Generate final report figures for Experiment C.
+
+    Outputs:
+    - expC_leader_is_status_vs_kappa.png
+    - expC_tail_welfare_vs_kappa.png
+    - expC_welfare_gap_vs_kappa.png
+    - expC_optimal_norm_probability_vs_kappa.png
+    """
+
+    fig_dir = output_dir.parent / "final_report_figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    # Convert to DataFrame
+    runs_df = pd.DataFrame([asdict(r) for r in run_records])
+    agg_df = pd.DataFrame([asdict(r) for r in aggregate_rows])
+
+    agg_df = agg_df.sort_values("kappa")
+    runs_df = runs_df.sort_values("kappa")
+
+    # C1: leader is status
+    _errorbar_plot(
+        df=agg_df,
+        x="kappa",
+        y=_find_col(agg_df, ["mean_leader_is_status_final"]),
+        yerr=_find_col(agg_df, ["ci95_leader_is_status_final"]),
+        title="Final leader is STATUS vs $\\kappa$",
+        xlabel="$\\kappa$",
+        ylabel="Probability final leader is STATUS",
+        out_path=fig_dir / "expC_leader_is_status_vs_kappa.png",
+        ylim=(-0.05, 1.05),
+    )
+
+    # C2: tail welfare
+    _errorbar_plot(
+        df=agg_df,
+        x="kappa",
+        y=_find_col(agg_df, ["mean_tail_welfare"]),
+        yerr=_find_col(agg_df, ["ci95_tail_welfare"]),
+        title="Tail welfare vs $\\kappa$",
+        xlabel="$\\kappa$",
+        ylabel="Mean tail welfare",
+        out_path=fig_dir / "expC_tail_welfare_vs_kappa.png",
+    )
+
+    if "mean_welfare_gap_to_best" in agg_df.columns:
+        gap_df = agg_df
+        y = "mean_welfare_gap_to_best"
+        ci = "ci95_welfare_gap_to_best"
+    else:
+        grouped = runs_df.groupby("kappa")["welfare_gap_to_best"]
+        gap_df = grouped.agg(["mean", "std", "count"]).reset_index()
+        gap_df["ci95"] = 1.96 * gap_df["std"].fillna(0) / np.sqrt(gap_df["count"])
+        y = "mean"
+        ci = "ci95"
+
+    _errorbar_plot(
+        df=gap_df,
+        x="kappa",
+        y=y,
+        yerr=ci,
+        title="Welfare gap to best norm vs $\\kappa$",
+        xlabel="$\\kappa$",
+        ylabel="Mean welfare gap",
+        out_path=fig_dir / "expC_welfare_gap_vs_kappa.png",
+    )
+
+    # C4: optimal norm probability
+    if "mean_is_final_norm_optimal" in agg_df.columns:
+        opt_df = agg_df
+        y = "mean_is_final_norm_optimal"
+        ci = "ci95_is_final_norm_optimal"
+    else:
+        grouped = runs_df.groupby("kappa")["is_final_norm_optimal"]
+        opt_df = grouped.agg(["mean", "std", "count"]).reset_index()
+        opt_df["ci95"] = 1.96 * opt_df["std"].fillna(0) / np.sqrt(opt_df["count"])
+        y = "mean"
+        ci = "ci95"
+
+    _errorbar_plot(
+        df=opt_df,
+        x="kappa",
+        y=y,
+        yerr=ci,
+        title="Probability final norm is optimal vs $\\kappa$",
+        xlabel="$\\kappa$",
+        ylabel="Probability optimal",
+        out_path=fig_dir / "expC_optimal_norm_probability_vs_kappa.png",
+        ylim=(-0.05, 1.05),
+    )
+
+    print(f"[✓] Report figures saved to {fig_dir}")
 
 
 def main() -> None:
@@ -857,6 +1002,8 @@ def main() -> None:
         output_file=output_dir / f"status_scaling_tail_status_agent_share_{args.mode}.png",
     )
 
+    generate_expC_report_figures(run_records, aggregate_rows, output_dir)
+    
     print(f"\nWrote per-run CSV: {run_csv}")
     print(f"Wrote aggregate CSV: {agg_csv}")
     print(f"Wrote plots to: {output_dir}")

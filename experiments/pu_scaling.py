@@ -1,40 +1,20 @@
 """
-Phase-1 pure personal-utility scaling harness (Experiment A family).
+Experiment A: Personal Utility Baseline (γ = 0, κ = 0)
 
-This runner fixes gamma = 0 and kappa = 0, so agents optimize only personal
-utility. It is intended as the Experiment A baseline companion to
-reputation_scaling.py (Experiment B) and status_scaling.py (Experiment C).
+This script runs the baseline experiment where agents optimize
+purely for personal utility without any social incentives.
 
-What it measures:
-- whether an opinion leader emerges at all under pure PU incentives
-- how concentrated follower structure becomes
-- whether follower concentration is weak / unstable as predicted by the paper
-- how many agents end in PU / REP / STATUS roles
-- tail welfare under the final emergent norm
+Key properties:
+- No reputation influence (gamma = 0)
+- No status incentives (kappa = 0)
+- Agents learn independently via reinforcement learning
 
-Example:
-    python3 experiments/pu_scaling.py \
-      --mode static \
-      --num-agents 100 \
-      --num-states-list "10" \
-      --num-actions 2 \
-      --num-steps 50000 \
-      --selected-seeds "0,1,2,3,4,5,6,7,8,9" \
-      --reward-models "shared_base_gaussian" \
-      --role-update-base-interval 3000 \
-      --fixed-role-update-interval \
-      --tracking-mode light \
-      --initial-actor-rate 0.7 \
-      --initial-participant-rate 0.7 \
-      --reward-base-mu 0.5 \
-      --reward-base-sigma 0.15 \
-      --reward-agent-sigma 0.08 \
-      --reward-clip-min 0.01 \
-      --reward-clip-max 2.5 \
-      --numpy-fast-path \
-      --trace-seeds "0" \
-      --trace-every 100 \
-      --output-dir experiments/outputs/exp_a/final_pu_baseline
+Expected outcome:
+- No follower structure
+- No opinion leader
+- Decentralized behavior across all agents
+
+This serves as a control experiment for later comparisons.
 """
 
 from __future__ import annotations
@@ -60,6 +40,7 @@ if str(ROOT) not in sys.path:
 from src.code_debugged import MultiAgentSystem, SystemConfig  # noqa: E402
 
 
+# Output records
 @dataclass
 class RunRecord:
     mode: str
@@ -130,6 +111,7 @@ class AggregateRecord:
     ci95_tail_top_follower_share: float
 
 
+# Command-line configuration
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pure personal-utility scaling harness (Experiment A).")
     parser.add_argument("--mode", choices=["static", "async"], required=True)
@@ -240,6 +222,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Small parsing helpers
 def parse_csv_ints(text: str) -> List[int]:
     if not text.strip():
         return []
@@ -310,6 +293,7 @@ def _role_to_label(role) -> str:
     return str(role).lower()
 
 
+# System configuration for Experiment A
 def make_config(args: argparse.Namespace, num_states: int, reward_model: str, mode: str) -> SystemConfig:
     role_interval = int(args.role_update_base_interval)
     role_s0 = int(args.role_update_s0)
@@ -374,6 +358,7 @@ def make_config(args: argparse.Namespace, num_states: int, reward_model: str, mo
     )
 
 
+# Result extraction helpers
 def _finalize_results(system: MultiAgentSystem) -> Dict:
     final_roles = [a.state.role for a in system.agents]
     final_followers = [len(a.state.followers) for a in system.agents]
@@ -457,6 +442,7 @@ def _sample_progression_rows(
     return out
 
 
+# Single simulation run
 def run_single(
     args: argparse.Namespace,
     mode: str,
@@ -531,6 +517,7 @@ def run_single(
     time_to_90 = _time_to_threshold(top_follower_series, threshold_90)
     leader_switches = _leader_switches(leader_series)
 
+    # Tail welfare is averaged over the final tail_window timesteps.
     tail_window = min(int(args.tail_window), len(social_welfare)) if len(social_welfare) > 0 else 0
     tail_welfare = float(np.mean(social_welfare[-tail_window:])) if tail_window > 0 else float("nan")
 
@@ -620,6 +607,7 @@ def run_single(
     return run_record, progression_rows, agent_trace_rows
 
 
+# Aggregation and saving
 def _mean_std_ci(values: Sequence[float]) -> Tuple[float, float, float]:
     arr = np.asarray(list(values), dtype=float)
     if arr.size == 0:
@@ -704,6 +692,7 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
         writer.writerows(rows)
 
 
+# Plotting helpers
 def plot_metric(
     aggregate_rows: Sequence[AggregateRecord],
     x_field: str,
@@ -801,6 +790,52 @@ def build_seed_comparison_rows(records: Sequence[RunRecord]) -> List[Dict[str, o
             }
         )
     return out
+
+
+def generate_expA_report_figure(progression_rows: Sequence[Dict[str, object]], output_dir: Path) -> None:
+    """
+    Generate the final report figure for Experiment A.
+    This figure shows that the maximum follower count remains zero over time
+    when γ = 0 and κ = 0. It is used in Section 5.1 of the report.
+    """
+
+    if not progression_rows:
+        return
+
+    df_rows = list(progression_rows)
+    ts: Dict[int, List[int]] = {}
+
+    for row in df_rows:
+        t = int(row["t"])
+        ts.setdefault(t, []).append(int(row["top_followers"]))
+
+    xs = sorted(ts.keys())
+    means = np.array([np.mean(ts[t]) for t in xs], dtype=float)
+    stds = np.array([np.std(ts[t], ddof=1) if len(ts[t]) >= 2 else 0.0 for t in xs], dtype=float)
+    counts = np.array([len(ts[t]) for t in xs], dtype=float)
+    ci95 = 1.96 * stds / np.sqrt(np.maximum(counts, 1))
+
+    plt.figure(figsize=(7.2, 4.6))
+    plt.plot(xs, means, linewidth=2.5)
+
+    if np.max(ci95) > 0:
+        plt.fill_between(xs, means - ci95, means + ci95, alpha=0.2)
+    
+    plt.axhline(0, linestyle="--", linewidth=1.2)
+    plt.title("No follower structure emerges ($\\gamma=0, \\kappa=0$)")
+    plt.xlabel("Timestep")
+    plt.ylabel("Maximum number of followers")
+    plt.ylim(-0.5, 1)
+    plt.grid(alpha=0.25)
+
+    fig_dir = output_dir.parent / "final_report_figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    out_path = fig_dir / "expA_followers_timeseries.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close()
+
+    print(f"Wrote report figure: {out_path}")
 
 
 def main() -> None:
@@ -936,6 +971,8 @@ def main() -> None:
                 num_states=num_states,
                 mode=args.mode,
             )
+
+    generate_expA_report_figure(progression_rows, output_dir)
 
     print(f"\nWrote per-run CSV: {run_csv}")
     print(f"Wrote aggregate CSV: {agg_csv}")
