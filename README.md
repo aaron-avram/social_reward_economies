@@ -11,7 +11,11 @@ Extends work done in https://github.com/DeathByThermodynamics/orchard-action-mar
 ├── src/
 │   ├── code_debugged.py          # current simulator; all experiments run against this
 │   └── code_old.py               # pre-fix baseline; kept for doc/BUGS.md reference
-├── experiments/                  # experiment runners (A–D) and shared utilities
+├── experiments/                  # experiment runners (A–D)
+│   ├── pu_scaling.py             # Experiment A
+│   ├── reputation_scaling.py     # Experiment B
+│   ├── status_scaling.py         # Experiment C
+│   └── perturbation_recovery.py  # Experiment D
 ├── code_by_peter_tests/          # test suite for code_debugged.py (see Tests below)
 ├── doc/
 │   ├── BUGS.md                   # canonical 14-bug report: code_old.py → code_debugged.py
@@ -30,10 +34,6 @@ The following directories are gitignored (local only): `single-reward-economy/mo
 ## Source Code
 
 The active simulator is `src/code_debugged.py` — a single file implementing the full multi-agent model. The two main entry points for callers are `SystemConfig` (a dataclass holding all simulation parameters) and `MultiAgentSystem` (which runs the simulation via repeated calls to `step()`). Detailed in-code annotations will be added separately.
-
-`experiments/experiments.py` is an earlier consolidated runner that invokes all four experiments from a single script. It is superseded by the individual per-experiment scripts but kept for reference.
-
-`experiments/make_final_result_figures.py` is a post-processing script that reads the CSV outputs produced by the experiment runners and generates publication figures.
 
 ---
 
@@ -237,6 +237,9 @@ python3 experiments/status_scaling.py \
 | A | 2 | actions per state |
 | γ | 5 | fixed; strong reputation ensures leader emerges |
 | δ | 1e-6 | tie-breaking threshold |
+| B_R | 0.8 | follow threshold |
+| B_F | 0.6 | unfollow threshold |
+| c | 0.1 | status entry threshold; leader needs at least 10% followers |
 | role update interval | 3,000 steps | fixed |
 | total steps | 50,000 | |
 | seeds | 0–9 | 10 seeds |
