@@ -12,7 +12,7 @@ ALGORITHMIC FLOW:
 
 BUG FIX ID MAP (grouped):
 - IR-1: Active actor/participant sampling must use θ(μ)=1-exp(-μ)
-- REP-1: Highest-reputation selection must exclude self (C\{i})
+- REP-1: Highest-reputation selection must exclude self (C\\{i})
 - REP-2: Reputation update must follow Eq. (9): avg reputation + Δv
 - REP-3: Remove extra per-step pairwise gossip pass
 - REP-4: Personal-benefit estimates v_i(k,t) must update for all agents each step
@@ -2396,21 +2396,21 @@ class MultiAgentSystem:
         # Runtime throughput metric: realized self-payoffs of active actors only.
         # Useful diagnostically, but NOT the paper welfare.
         online_payoff_sum = float(sum(this_step_payoffs.values()))
-        self.results['online_active_actor_payoff_sum'].append(online_payoff_sum)
+        self.results.setdefault('online_active_actor_payoff_sum', []).append(online_payoff_sum)
 
         # Paper-faithful welfare metrics.
         welfare_all = self.compute_paper_welfare_all_agents(leader_id=current_leader)
         welfare_followers = self.compute_paper_welfare_followers_only(leader_id=current_leader)
 
-        self.results['paper_welfare_all_agents'].append(float(welfare_all))
-        self.results['paper_welfare_followers_only'].append(float(welfare_followers))
+        self.results.setdefault('paper_welfare_all_agents', []).append(float(welfare_all))
+        self.results.setdefault('paper_welfare_followers_only', []).append(float(welfare_followers))
 
         # Backward-compatible alias so old harnesses reading "social_welfare"
         # now get the paper followers-only welfare instead of active-actor throughput.
-        self.results['social_welfare'].append(float(welfare_followers))
+        self.results.setdefault('social_welfare', []).append(float(welfare_followers))
 
         if role_updated:
-            self.results['role_update_times'].append(int(self.time_step))
+            self.results.setdefault('role_update_times', []).append(int(self.time_step))
 
         self.results.setdefault('status_counts', []).append(
             sum(1 for a in self.agents if a.state.role == AgentRole.STATUS)
@@ -2449,16 +2449,16 @@ class MultiAgentSystem:
         )
 
         if collect_compact_histories:
-            self.results['estimated_reward_pu_history'].append(
+            self.results.setdefault('estimated_reward_pu_history', []).append(
                 [float(a.state.estimated_reward_pu) for a in self.agents]
             )
-            self.results['estimated_reward_rep_history'].append(
+            self.results.setdefault('estimated_reward_rep_history', []).append(
                 [float(a.state.estimated_reward_rep) for a in self.agents]
             )
-            self.results['estimated_reward_status_history'].append(
+            self.results.setdefault('estimated_reward_status_history', []).append(
                 [float(a.state.estimated_reward_status) for a in self.agents]
             )
-            self.results['actor_interaction_rate_history'].append(
+            self.results.setdefault('actor_interaction_rate_history', []).append(
                 [float(a.state.actor_interaction_rate) for a in self.agents]
             )
 
@@ -2477,10 +2477,10 @@ class MultiAgentSystem:
                 selected_rep.append(rep_val)
                 weighted_selected_rep.append(float(self.config.gamma) * rep_val)
 
-            self.results['selected_reputation_history'].append(selected_rep)
-            self.results['weighted_selected_reputation_history'].append(weighted_selected_rep)
-            self.results['highest_rep_agent_history'].append(highest_rep_agents)
-            self.results['following_history'].append(following_ids)
+            self.results.setdefault('selected_reputation_history', []).append(selected_rep)
+            self.results.setdefault('weighted_selected_reputation_history', []).append(weighted_selected_rep)
+            self.results.setdefault('highest_rep_agent_history', []).append(highest_rep_agents)
+            self.results.setdefault('following_history', []).append(following_ids)
             self._record_small_n_trace_snapshot()
 
         if mode == "light":
@@ -2495,10 +2495,10 @@ class MultiAgentSystem:
             i: np.mean(a.state.payoff_history) if a.state.payoff_history else 0.0
             for i, a in enumerate(self.agents)
         }
-        self.results['expected_utilities'].append(utils)
-        self.results['actor_rates'].append([a.state.actor_interaction_rate for a in self.agents])
-        self.results['roles_history'].append([a.state.role for a in self.agents])
-        self.results['actual_payoffs'].append(this_step_payoffs)
+        self.results.setdefault('expected_utilities', []).append(utils)
+        self.results.setdefault('actor_rates', []).append([a.state.actor_interaction_rate for a in self.agents])
+        self.results.setdefault('roles_history', []).append([a.state.role for a in self.agents])
+        self.results.setdefault('actual_payoffs', []).append(this_step_payoffs)
 
     def simulate(self) -> Dict:
         """Run the full simulation"""
