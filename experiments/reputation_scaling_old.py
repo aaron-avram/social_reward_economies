@@ -50,6 +50,7 @@ class RunRecord:
     time_to_90pct_followers: int
     leader_switches: int
     tail_welfare: float
+    consensus_step: int
 
 
 @dataclass
@@ -79,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reputation scaling gamma sweep harness.")
     parser.add_argument("--mode", choices=["static", "async"], required=True)
     parser.add_argument("--gammas", type=str, default="0,1,1.25,1.5,1.75,2,3,5")
+    parser.add_argument("--kappas", type=str, default="0,1,1.25,1.5,1.75,2,3,5")
     parser.add_argument("--num-agents", type=int, default=100)
     parser.add_argument("--num-states", type=int, default=3)
     parser.add_argument("--num-actions", type=int, default=2)
@@ -91,7 +93,6 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional explicit comma-separated seed list (e.g. \"2,7,9\"). Overrides --seeds/--seed-start.",
     )
-    parser.add_argument("--kappa", type=float, default=0.0)
     parser.add_argument("--delta", type=float, default=0.15)
     parser.add_argument(
         "--actor-rate-driver-mode",
@@ -218,6 +219,10 @@ def parse_gammas(gamma_text: str) -> List[float]:
     parts = [p.strip() for p in gamma_text.split(",") if p.strip()]
     return [float(x) for x in parts]
 
+def parse_kappas(kappa_text: str) -> List[float]:
+    parts = [p.strip() for p in kappa_text.split(",") if p.strip()]
+    return [float(x) for x in parts]
+
 
 def parse_selected_seeds(seed_text: str) -> List[int]:
     if not seed_text.strip():
@@ -287,7 +292,7 @@ def resolve_seeds(args: argparse.Namespace) -> List[int]:
     return list(range(int(args.seed_start), int(args.seed_start) + int(args.seeds)))
 
 
-def make_config(args: argparse.Namespace, gamma: float, mode: str) -> SystemConfig:
+def make_config(args: argparse.Namespace, gamma: float, kappa: float, mode: str) -> SystemConfig:
     # Keep defaults aligned with experiments/experiments.py unless explicitly overridden.
     role_interval = args.role_update_base_interval
     role_s0 = int(args.role_update_s0)
@@ -317,7 +322,7 @@ def make_config(args: argparse.Namespace, gamma: float, mode: str) -> SystemConf
         actor_rate_driver_mode=actor_rate_driver_mode,
         actor_rate_status_override_min_followers=actor_rate_status_override_min_followers,
         gamma=gamma,
-        kappa=args.kappa,
+        kappa=kappa,
         c_threshold=0.1,
         B_R=0.3,
         B_F=1_000_000.0,  # Disable hysteresis in Experiment B family; only Experiment D uses it.
@@ -359,6 +364,7 @@ def _finalize_results(system: MultiAgentSystem) -> Dict:
     results["final_roles"] = final_roles
     results["final_followers"] = final_followers
     results["opinion_leader"] = opinion_leader
+
     return results
 
 
@@ -722,6 +728,7 @@ def run_single(
     args: argparse.Namespace,
     mode: str,
     gamma: float,
+    kappa: float,
     seed: int,
 ) -> Tuple[
     RunRecord,
@@ -733,7 +740,7 @@ def run_single(
     Optional[Dict[str, List[dict]]],
 ]:
     np.random.seed(seed)
-    config = make_config(args, gamma=gamma, mode=mode)
+    config = make_config(args, gamma=gamma, kappa=kappa, mode=mode)
     system = MultiAgentSystem(config)
     async_debug_enabled = bool(mode == "async" and args.async_decision_audit)
     if async_debug_enabled:
@@ -749,6 +756,8 @@ def run_single(
 
     scheduler_rows: List[Dict[str, object]] = []
     update_counts = np.zeros(args.num_agents, dtype=int)
+
+    consensus_step = None
 
     if mode == "async":
         with redirect_stdout(io.StringIO()):
@@ -823,12 +832,22 @@ def run_single(
                                 "interval_indices": "",
                             }
                         )
+                # check if consensus reached
+                followers_list = [len(a.state.followers) for a in system.agents]
+                if not consensus_step and (len(system.agents) * 0.95 <= max(followers_list)):
+                    consensus_step = _
             results = _finalize_results(system)
+            results["consensus_step"] = consensus_step
     else:
         with redirect_stdout(io.StringIO()):
             for _ in range(args.num_steps):
                 system.step()
+                # check if consensus reached
+                followers_list = [len(a.state.followers) for a in system.agents]
+                if not consensus_step and (len(system.agents) * 0.95 <= max(followers_list)):
+                    consensus_step = _
             results = _finalize_results(system)
+            results["consensus_step"] = consensus_step
 
     follower_counts = np.array(results["follower_counts"], dtype=float)
     top_follower_series = follower_counts.max(axis=1)
@@ -849,6 +868,7 @@ def run_single(
         time_to_90pct_followers=time_to_90,
         leader_switches=int(leader_switches),
         tail_welfare=tail_welfare,
+        consensus_step=results["consensus_step"]
     )
     detailed_trace: Optional[DetailedTrace] = None
     if str(args.tracking_mode).lower() == "full" or small_n_trace_export_enabled:
@@ -2773,6 +2793,7 @@ def plot_paper_style_summary(
 def main() -> None:
     args = parse_args()
     gammas = parse_gammas(args.gammas)
+    kappas = parse_kappas(args.kappas)
     role_t_seq = parse_role_update_T_seq(args.role_update_T_seq)
     role_epochs = parse_role_update_epochs(args.role_update_epochs)
     seeds = resolve_seeds(args)
@@ -2783,6 +2804,7 @@ def main() -> None:
     print("Reputation Scaling Run", flush=True)
     print(f"mode={args.mode}", flush=True)
     print(f"gammas={gammas}", flush=True)
+    print(f"kappas={kappas}", flush=True)
     print(f"num_agents={args.num_agents}, num_states={args.num_states}, num_actions={args.num_actions}", flush=True)
     if seeds:
         if seeds == list(range(seeds[0], seeds[-1] + 1)):
@@ -2792,7 +2814,6 @@ def main() -> None:
         print(f"num_steps={args.num_steps}, seeds={len(seeds)} ({seed_label})", flush=True)
     else:
         print(f"num_steps={args.num_steps}, seeds=0", flush=True)
-    print(f"kappa={args.kappa}", flush=True)
     print(f"delta={args.delta}", flush=True)
     print(
         "actor_rate_driver_mode="
@@ -2879,120 +2900,121 @@ def main() -> None:
     small_n_follow_relationships_csv = output_dir / "expB_toy_follow_relationships_long.csv"
     small_n_trace_requested = bool(getattr(args, "small_n_trace_export", False) and int(args.num_agents) <= 12)
 
-    for gamma in gammas:
-        for seed in seeds:
-            job += 1
-            print(f"[{job:03d}/{total_jobs:03d}] mode={args.mode} gamma={gamma:g} seed={seed}", flush=True)
-            (
-                rec,
-                top_series,
-                leader_series,
-                detailed_trace,
-                async_debug,
-                run_role_update_rows,
-                run_checkpoint_audit_rows,
-            ) = run_single(
-                args=args,
-                mode=args.mode,
-                gamma=gamma,
-                seed=seed,
-            )
-            all_records.append(rec)
-            top_series_by_gamma[gamma].append(top_series)
-            leader_series_by_gamma[gamma].append(leader_series)
-            if detailed_trace is not None:
-                save_trace = (
-                    small_n_trace_requested
-                    or
-                    args.trace_detailed_seeds == "all"
-                    or (args.trace_detailed_seeds == "first" and seed == seeds[0])
-                )
-                if save_trace:
-                    detailed_traces[(gamma, seed)] = detailed_trace
-            if async_debug is not None:
-                gamma_tag = _format_gamma(gamma)
-                scheduler_csv = output_dir / f"reputation_scaling_async_scheduler_g{gamma_tag}_seed{seed}.csv"
-                audit_csv = output_dir / f"reputation_scaling_async_decision_audit_g{gamma_tag}_seed{seed}.csv"
-                focus_csv = output_dir / f"reputation_scaling_async_focus_trace_g{gamma_tag}_seed{seed}.csv"
-                diagnosis_md = output_dir / f"reputation_scaling_async_diagnosis_g{gamma_tag}_seed{seed}.md"
-
-                write_async_scheduler_csv(async_debug["scheduler_rows"], scheduler_csv)
-                write_csv(audit_csv, async_debug["decision_audit_rows"])
-                if async_debug["trace_bundle"] is not None:
-                    write_async_focus_trace_csv(
-                        async_debug["trace_bundle"],
-                        async_debug["decision_audit_rows"],
-                        async_debug["focus_agents"],
-                        focus_csv,
-                    )
-                write_async_diagnosis_markdown(
-                    output_file=diagnosis_md,
-                    diagnosis=async_debug["diagnosis"],
-                    focus_agents=async_debug["focus_agents"],
-                )
-                async_diagnosis_rows.append(dict(async_debug["diagnosis"]))
-            if run_role_update_rows is not None:
-                enriched_rows = enrich_role_update_diagnostic_rows(
+    for gamma, kappa in zip(gammas, kappas):
+            for seed in seeds:
+                job += 1
+                print(f"[{job:03d}/{total_jobs:03d}] mode={args.mode} gamma={gamma:g} kappa={kappa:g} seed={seed}", flush=True)
+                (
+                    rec,
+                    top_series,
+                    leader_series,
+                    detailed_trace,
+                    async_debug,
+                    run_role_update_rows,
+                    run_checkpoint_audit_rows,
+                ) = run_single(
+                    args=args,
                     mode=args.mode,
                     gamma=gamma,
+                    kappa=kappa,
                     seed=seed,
-                    rows=run_role_update_rows,
                 )
-                role_update_diagnostic_rows.extend(enriched_rows)
-                role_update_diagnostic_summaries.append(
-                    summarize_role_update_diagnostics(
+                all_records.append(rec)
+                top_series_by_gamma[gamma].append(top_series)
+                leader_series_by_gamma[gamma].append(leader_series)
+                if detailed_trace is not None:
+                    save_trace = (
+                        small_n_trace_requested
+                        or
+                        args.trace_detailed_seeds == "all"
+                        or (args.trace_detailed_seeds == "first" and seed == seeds[0])
+                    )
+                    if save_trace:
+                        detailed_traces[(gamma, seed)] = detailed_trace
+                if async_debug is not None:
+                    gamma_tag = _format_gamma(gamma)
+                    scheduler_csv = output_dir / f"reputation_scaling_async_scheduler_g{gamma_tag}_seed{seed}.csv"
+                    audit_csv = output_dir / f"reputation_scaling_async_decision_audit_g{gamma_tag}_seed{seed}.csv"
+                    focus_csv = output_dir / f"reputation_scaling_async_focus_trace_g{gamma_tag}_seed{seed}.csv"
+                    diagnosis_md = output_dir / f"reputation_scaling_async_diagnosis_g{gamma_tag}_seed{seed}.md"
+
+                    write_async_scheduler_csv(async_debug["scheduler_rows"], scheduler_csv)
+                    write_csv(audit_csv, async_debug["decision_audit_rows"])
+                    if async_debug["trace_bundle"] is not None:
+                        write_async_focus_trace_csv(
+                            async_debug["trace_bundle"],
+                            async_debug["decision_audit_rows"],
+                            async_debug["focus_agents"],
+                            focus_csv,
+                        )
+                    write_async_diagnosis_markdown(
+                        output_file=diagnosis_md,
+                        diagnosis=async_debug["diagnosis"],
+                        focus_agents=async_debug["focus_agents"],
+                    )
+                    async_diagnosis_rows.append(dict(async_debug["diagnosis"]))
+                if run_role_update_rows is not None:
+                    enriched_rows = enrich_role_update_diagnostic_rows(
                         mode=args.mode,
                         gamma=gamma,
                         seed=seed,
-                        num_agents=args.num_agents,
-                        record=rec,
-                        top_follower_series=top_series,
-                        rows=enriched_rows,
+                        rows=run_role_update_rows,
                     )
-                )
-            if run_checkpoint_audit_rows is not None:
-                true_reputation_checkpoint_rows.extend(
-                    enrich_checkpoint_rows(
-                        mode=args.mode,
-                        gamma=gamma,
-                        seed=seed,
-                        rows=run_checkpoint_audit_rows.get("true_reputation_checkpoints", []),
+                    role_update_diagnostic_rows.extend(enriched_rows)
+                    role_update_diagnostic_summaries.append(
+                        summarize_role_update_diagnostics(
+                            mode=args.mode,
+                            gamma=gamma,
+                            seed=seed,
+                            num_agents=args.num_agents,
+                            record=rec,
+                            top_follower_series=top_series,
+                            rows=enriched_rows,
+                        )
                     )
-                )
-                estimate_consensus_checkpoint_rows.extend(
-                    enrich_checkpoint_rows(
-                        mode=args.mode,
-                        gamma=gamma,
-                        seed=seed,
-                        rows=run_checkpoint_audit_rows.get("estimate_consensus_checkpoints", []),
+                if run_checkpoint_audit_rows is not None:
+                    true_reputation_checkpoint_rows.extend(
+                        enrich_checkpoint_rows(
+                            mode=args.mode,
+                            gamma=gamma,
+                            seed=seed,
+                            rows=run_checkpoint_audit_rows.get("true_reputation_checkpoints", []),
+                        )
                     )
-                )
-                rate_audit_checkpoint_rows.extend(
-                    enrich_checkpoint_rows(
-                        mode=args.mode,
-                        gamma=gamma,
-                        seed=seed,
-                        rows=run_checkpoint_audit_rows.get("rate_audit_checkpoints", []),
+                    estimate_consensus_checkpoint_rows.extend(
+                        enrich_checkpoint_rows(
+                            mode=args.mode,
+                            gamma=gamma,
+                            seed=seed,
+                            rows=run_checkpoint_audit_rows.get("estimate_consensus_checkpoints", []),
+                        )
                     )
+                    rate_audit_checkpoint_rows.extend(
+                        enrich_checkpoint_rows(
+                            mode=args.mode,
+                            gamma=gamma,
+                            seed=seed,
+                            rows=run_checkpoint_audit_rows.get("rate_audit_checkpoints", []),
+                        )
+                    )
+                # Incremental checkpoint for long sweeps.
+                write_csv(runs_csv, [asdict(r) for r in all_records])
+                if role_update_diagnostic_rows:
+                    write_csv(role_diag_csv, role_update_diagnostic_rows)
+                if role_update_diagnostic_summaries:
+                    write_csv(role_summary_csv, role_update_diagnostic_summaries)
+                if true_reputation_checkpoint_rows:
+                    write_csv(true_reputation_csv, true_reputation_checkpoint_rows)
+                if estimate_consensus_checkpoint_rows:
+                    write_csv(estimate_consensus_csv, estimate_consensus_checkpoint_rows)
+                if rate_audit_checkpoint_rows:
+                    write_csv(rate_audit_csv, rate_audit_checkpoint_rows)
+                rank_alignment_rows = summarize_rank_alignment_checkpoints(
+                    true_rows=true_reputation_checkpoint_rows,
+                    estimate_rows=estimate_consensus_checkpoint_rows,
                 )
-            # Incremental checkpoint for long sweeps.
-            write_csv(runs_csv, [asdict(r) for r in all_records])
-            if role_update_diagnostic_rows:
-                write_csv(role_diag_csv, role_update_diagnostic_rows)
-            if role_update_diagnostic_summaries:
-                write_csv(role_summary_csv, role_update_diagnostic_summaries)
-            if true_reputation_checkpoint_rows:
-                write_csv(true_reputation_csv, true_reputation_checkpoint_rows)
-            if estimate_consensus_checkpoint_rows:
-                write_csv(estimate_consensus_csv, estimate_consensus_checkpoint_rows)
-            if rate_audit_checkpoint_rows:
-                write_csv(rate_audit_csv, rate_audit_checkpoint_rows)
-            rank_alignment_rows = summarize_rank_alignment_checkpoints(
-                true_rows=true_reputation_checkpoint_rows,
-                estimate_rows=estimate_consensus_checkpoint_rows,
-            )
-            if rank_alignment_rows:
-                write_csv(rank_alignment_csv, rank_alignment_rows)
+                if rank_alignment_rows:
+                    write_csv(rank_alignment_csv, rank_alignment_rows)
 
     agg_records = aggregate(all_records)
 
