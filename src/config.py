@@ -55,13 +55,12 @@ def _unwrap(x):
     if isinstance(x, list):  return [_unwrap(v) for v in x]
     return x
 
+@dataclass(frozen=True)
+class Dimensions:
+    num_agents: int = 6
+    num_states: int = 3
+    num_actions: int = 2
 
-@dataclass
-class SystemConfig:
-    ...
-
-    def to_dict(self) -> dict:
-        return {"schema_version": SCHEMA_VERSION, **_unwrap(asdict(self))}
 
 @dataclass(frozen=True)
 class Stepsize:
@@ -167,6 +166,7 @@ class RuntimeParams:
     tracking_mode: TrackingMode = TrackingMode.FULL
     use_numpy_fast_path: bool = False  # Enable vectorized reputation updates for large-N sweeps
     force_all_active_debug: bool = False  # Debug override: force A_a(t)=A_p(t)=C every step
+    num_time_steps: int = 2000
 
 @dataclass
 class ScheduleParams:
@@ -180,17 +180,12 @@ class ScheduleParams:
 class SystemConfig:
     """Section 6–7 configuration with all required parameters"""
 
+    dimensions: Dimensions = field(default_factory=Dimensions)
     algorithm: AlgorithmParams = field(default_factory=AlgorithmParams)
     reward: RewardParams = field(default_factory=RewardParams)
     stepsizes: StepsizeParams = field(default_factory=StepsizeParams)
     runtime: RuntimeParams = field(default_factory=RuntimeParams)
     schedule: ScheduleParams = field(default_factory=ScheduleParams)
-    
-    # Basic setup
-    num_agents: int = 6
-    num_states: int = 3
-    num_actions: int = 2
-    num_time_steps: int = 2000
 
     def to_dict(self) -> dict:
         return {"schema_version": SCHEMA_VERSION, **_unwrap(asdict(self))}
