@@ -46,6 +46,8 @@ class AgentRole(Enum):
 @dataclass
 class SystemConfig:
     """Section 6–7 configuration with all required parameters"""
+
+    seed: int = 0
     
     # Basic setup
     num_agents: int = 6
@@ -129,8 +131,8 @@ class AgentState:
     """Complete agent state for Sections 6–7"""
     
     # --- Policy weights ---
-    weights_pu: np.ndarray = field(default_factory=lambda: np.random.randn(3, 2) * 0.1)
-    weights_status: np.ndarray = field(default_factory=lambda: np.random.randn(3, 2) * 0.1)
+    weights_pu: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
+    weights_status: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
     
     # --- Role and follower relationships ---
     role: AgentRole = AgentRole.PERSONAL_UTILITY
@@ -161,6 +163,19 @@ class AgentState:
     
     # Flag to track if agent was following before (for hysteresis)
     was_following: bool = False
+
+class RngBundle:
+    """
+    One independent stream per consumer, so a change in one cannot perturb the draw sequence of another.
+    """
+
+    def __init__(self, seed: int):
+        init, activation, action, tiebreak, order = np.random.SeedSequence(seed).spawn(5)
+        self.init = np.random.default_rng(init)
+        self.activation = np.random.default_rng(activation)
+        self.action = np.random.default_rng(action)
+        self.tiebreak = np.random.default_rng(tiebreak)
+        self.order = np.random.default_rng(order)
 
 
 class Agent:
@@ -506,6 +521,9 @@ class MultiAgentSystem:
     
     def __init__(self, config: SystemConfig):
         self.config = config
+
+        self.rng = RngBundle(config.seed)
+
         if self.config.reward_model not in {
             "simple_preferred_action",
             "shared_base_gaussian",
@@ -634,14 +652,14 @@ class MultiAgentSystem:
         - For each agent i, draw r_i(s,a) ~ Normal(m(s,a), sigma_agent).
         - Clip to a positive range to avoid sign-related artifacts in PU baselines.
         """
-        base = np.random.normal(
+        base = self.rng.init.normal(
             loc=self.config.reward_base_mu,
             scale=self.config.reward_base_sigma,
             size=(self.config.num_states, self.config.num_actions),
         )
         base = np.clip(base, self.config.reward_clip_min, self.config.reward_clip_max)
 
-        tables = np.random.normal(
+        tables = self.rng.init.normal(
             loc=base[np.newaxis, :, :],
             scale=self.config.reward_agent_sigma,
             size=(self.config.num_agents, self.config.num_states, self.config.num_actions),
@@ -671,11 +689,11 @@ class MultiAgentSystem:
         num_actions = int(self.config.num_actions)
         num_agents = int(self.config.num_agents)
 
-        good_actions = np.random.randint(0, num_actions, size=num_states, dtype=int)
+        good_actions = self.rng.init.randint(0, num_actions, size=num_states, dtype=int)
         base = np.full((num_states, num_actions), float(self.config.reward_bad_value), dtype=float)
         base[np.arange(num_states), good_actions] = float(self.config.reward_good_value)
 
-        tables = np.random.normal(
+        tables = self.rng.init.normal(
             loc=base[np.newaxis, :, :],
             scale=float(self.config.reward_agent_sigma),
             size=(num_agents, num_states, num_actions),
@@ -719,7 +737,7 @@ class MultiAgentSystem:
 
         tables = np.zeros((num_agents, num_states, num_actions), dtype=float)
 
-        lambda_vals = np.random.uniform(
+        lambda_vals = self.rng.init.uniform(
             self.config.reward_lambda_min,
             self.config.reward_lambda_max,
             size=num_agents,
@@ -730,17 +748,17 @@ class MultiAgentSystem:
 
         for s in range(num_states):
             # action 0 = consensus-easy, action 1 = welfare-better
-            C[s, 0] = np.random.normal(self.config.reward_consensus_high, 0.02)
-            C[s, 1] = np.random.normal(self.config.reward_consensus_low, 0.02)
+            C[s, 0] = self.rng.init.normal(self.config.reward_consensus_high, 0.02)
+            C[s, 1] = self.rng.init.normal(self.config.reward_consensus_low, 0.02)
 
-            W[s, 0] = np.random.normal(self.config.reward_welfare_low, 0.02)
-            W[s, 1] = np.random.normal(self.config.reward_welfare_high, 0.02)
+            W[s, 0] = self.rng.init.normal(self.config.reward_welfare_low, 0.02)
+            W[s, 1] = self.rng.init.normal(self.config.reward_welfare_high, 0.02)
 
         for i in range(num_agents):
             lam = lambda_vals[i]
             for s in range(num_states):
                 base = lam * C[s, :] + (1.0 - lam) * W[s, :]
-                vals = np.random.normal(
+                vals = self.rng.init.normal(
                     loc=base,
                     scale=self.config.reward_agent_sigma,
                     size=num_actions,
@@ -1917,7 +1935,7 @@ class MultiAgentSystem:
             active_actors = set()
             for agent in self.agents:
                 actor_prob = 1.0 - np.exp(-agent.state.actor_interaction_rate)
-                if np.random.random() < actor_prob:
+                if self.rng.activation.random() < actor_prob:
                     active_actors.add(agent.agent_id)
         
         # [IR-1] Activation probability must be θ(μ)=1-exp(-μ).
@@ -1929,7 +1947,7 @@ class MultiAgentSystem:
             active_participants = []
             for agent in self.agents:
                 participant_prob = 1.0 - np.exp(-agent.state.participant_interaction_rate)
-                if np.random.random() < participant_prob:
+                if self.rng.activation.random() < participant_prob:
                     active_participants.append(agent)
         
         active_participant_ids = {a.agent_id for a in active_participants}
@@ -1943,7 +1961,7 @@ class MultiAgentSystem:
         observed_utility_matrix = np.zeros((self.config.num_agents, self.config.num_agents), dtype=float)
         for agent_id in active_actors:
             agent = self.agents[agent_id]
-            state = np.random.randint(self.config.num_states)
+            state = self.rng.action.randint(self.config.num_states)
             action = agent.select_action(state)
             actions[agent_id] = (state, action)
             # [REP-7] Reputation learning in Section 6.4.2 is observer-specific:
